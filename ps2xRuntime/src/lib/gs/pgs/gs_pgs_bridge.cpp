@@ -39,25 +39,38 @@ namespace ps2x::pgs
 {
     namespace
     {
+        // Deterministic mode (PS2X_DETERMINISTIC=1, see ps2_test_harness.cpp): SIGNAL / FINISH / LABEL reach the
+        // guest when the register write passes through the bridge (deterministicSignal), not when the GPU thread
+        // reports it, whose timing depends on the host.
+        bool deterministicMode()
+        {
+            static const bool on = []()
+            {
+                const char *value = std::getenv("PS2X_DETERMINISTIC");
+                return value && std::atoi(value) != 0;
+            }();
+            return on;
+        }
+
         class SignalForwarder final : public ParallelGS::SignalInterface
         {
         public:
             SignalSink *sink = nullptr;
             bool on_signal(uint64_t payload) override
             {
-                if (sink)
+                if (sink && !deterministicMode())
                     sink->signal(payload);
                 return false;
             }
             bool on_finish(uint64_t payload) override
             {
-                if (sink)
+                if (sink && !deterministicMode())
                     sink->finish(payload);
                 return false;
             }
             bool on_label(uint64_t payload) override
             {
-                if (sink)
+                if (sink && !deterministicMode())
                     sink->label(payload);
                 return false;
             }
@@ -201,9 +214,22 @@ namespace ps2x::pgs
                 ++g_frameStats.bigPrims;
         }
 
+        void deterministicSignal(uint32_t reg, uint64_t value)
+        {
+            if (!deterministicMode() || !g_state || !g_state->signals.sink)
+                return;
+            if (reg == 0x60u)
+                g_state->signals.sink->signal(value);
+            else if (reg == 0x61u)
+                g_state->signals.sink->finish(value);
+            else if (reg == 0x62u)
+                g_state->signals.sink->label(value);
+        }
+
         void noteRegister(uint32_t reg, uint64_t value)
         {
             auto &sh = g_shadow;
+            deterministicSignal(reg, value);
             switch (reg)
             {
             case 0x00: // PRIM
@@ -597,6 +623,7 @@ namespace ps2x::pgs
         if (!g_state)
             return;
         bindThread();
+        deterministicSignal(reg & 0xFFu, value);
         g_state->gs->write_register(static_cast<ParallelGS::RegisterAddr>(reg & 0xFFu), value);
     }
 

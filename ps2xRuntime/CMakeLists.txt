@@ -563,6 +563,10 @@ if(MSVC)
     # A PDB for the exe (link step only, the generated code is not recompiled) so the hang watchdog in
     # ps2_test_harness.cpp can print function names. The GS bridge and paraLLEl-GS also get line info.
     target_link_options(ps2EntryRunner PRIVATE /DEBUG:FULL /OPT:REF /OPT:NOICF)
+    # 64 MiB stack reserve (default 1 MiB) for every thread created without an explicit size, the game thread
+    # included: each guest call is a nested host call, and Rayman's recursive AI evaluator overflowed 1 MiB
+    # right after the language menu. Reserve only; pages are committed as they are touched.
+    target_link_options(ps2EntryRunner PRIVATE /STACK:67108864)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC

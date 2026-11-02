@@ -846,6 +846,14 @@ namespace ps2x::iop::detail
             using Clock = std::chrono::steady_clock;
             constexpr uint64_t kMaxLag = kIopClockHz / 10u;
             constexpr uint64_t kMaxPerCall = kIopClockHz / 500u; // 2 ms
+            // Deterministic mode (PS2X_DETERMINISTIC=1, see ps2_test_harness.cpp): IOP time follows EE cycles only.
+            static const bool deterministic = []()
+            {
+                const char *value = std::getenv("PS2X_DETERMINISTIC");
+                return value && std::atoi(value) != 0;
+            }();
+            if (deterministic)
+                return 0;
             const Clock::time_point now = Clock::now();
             const uint64_t projected = totalCycles + planned;
             if (!wallStarted)

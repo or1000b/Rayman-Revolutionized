@@ -58,7 +58,8 @@
 - **EE**: recompiled C++ on a cooperative scheduler (`Kernel/EeScheduler.cpp`).
   - Game-specific high-level replacements live in `ps2xRuntime/src/main.cpp`, under `installGameHle` for SLES-50044:
     - `0x14BEC8`: the engine's "wait N ms" helper, replaced by a real-time wait that advances guest time.
-    - `0x1DF7F0`: the AI behaviour-tree evaluator, wrapped by a NULL-tree guard (see open issues).
+    - `0x1DF7F0`: the AI behaviour-tree evaluator, wrapped by a NULL-tree guard (probably obsolete, see issue 4).
+    - `0x1DF760`: AI node dispatch, wrapped by a tracer that keeps the last 64 nodes and reports a node pointer below 1 MiB (`[rayman-ai] node pointer ...`, plus scheduler / branch / dispatch history).
 - **IOP** (`ps2xIOP`): an R3000 interpreter that runs the game's real IRX modules.
   - EE->IOP RPC is synchronous (`IopRpcBridge::handleRpc`).
   - IOP->EE RPC is implemented in `services/iop_rpc.cpp` (sifcmd 15/16/18) and `Kernel/Syscalls/RPC.cpp` (`SifRegisterRpc` reads cfunc/cbuf/qd from `$8-$10`; queue-walk fallback).
@@ -92,6 +93,11 @@
 - `[rayman-ai] NULL behaviour tree ...`: logged by the 0x1DF7F0 guard.
 - **Hang watchdog** (`ps2_test_harness.cpp`, always on, `PS2X_WATCHDOG_SEC`, default 15): when the window thread draws no frame for that long, every thread's native stack is written to the log as `[watchdog]` lines (function names + file:line from the PDB). Read the `GameThread` and main-thread stacks first.
   - It only sees a stuck *window* thread. A stuck game thread with a live window shows as `gameFps=0` in `[threads]` lines instead.
+- **Crash report** (`ps2_test_harness.cpp`, vectored exception handler): `[crash] first-chance exception ...` with the faulting thread's native stack. The game thread keeps 256 KiB of stack in reserve (`SetThreadStackGuarantee`) so this works after a stack overflow too. If a process dies with no report, read Windows' Application log (event 1000: module + offset) and resolve the offset with dbghelp and the exe's PDB.
+- **Exe stack size** is 64 MiB (`/STACK`, link only). Guest calls are nested host calls.
+- `[guest-recursion]` (`dispatchGuestBranch`): guest call depth 4000 reached; prints the outermost and innermost guest frames (target, caller, a0-a3, sp, ra), dumps EE RAM to `out\crash_ee_ram.bin` and stops cleanly.
+- `ps2xDumpSchedulerTrace()` (EeScheduler.cpp, `[sched-trace]`): last 64 scheduler-level dispatches (thread, invocation depth, pc/ra/sp/v0/a1) = thread switches, interrupt handlers, resumes after an unwind.
+- `ps2xDumpBranchTrace()` (ps2_runtime.cpp, `[branch-trace]`): last 64 `dispatchGuestBranch` calls of the thread and how each ended (K checkpoint, J jump to scheduler, M missing, T returned, F unwound).
 - GPU driver resets (TDR) show up in the Windows System log as `nvlddmkm` event 153; Granite then spins forever in `vkResetCommandPool`. Check with `Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nvlddmkm'}`.
 
 ## Status and open issues (2026-11-02, evening)
@@ -101,16 +107,13 @@
 2. **Sound: not audible yet.**
    - UBISOUND reads the disc fine (`iopcd host=5 fail=0`) and the SPU2 has 48 active voices, but `peak` stays ~130 of 32767 (about -48 dB) and there are no further CD reads in the menus (no music stream).
    - Long-term plan: replace the IOP + SPU2 emulation with a native implementation of UBISOUND's command set.
-3. **After choosing a language (memory card check), results differ between runs.**
-   - Sometimes: `[guest-branch:missing-target]` jump to `0x1fffa90` (a stack address; `ra` was overwritten with a pointer into the stack) inside the AI evaluator (trace ... `0x1df760 -> 0x1df3e0 -> 0x1f2540`). The main thread stops; the window keeps drawing the last picture.
-   - Other times: no crash, the game polls `sceMcGetInfo` every frame (no save on the card, `GetDir 'BESLES-50044*'` finds nothing).
-   - Same input, different result: timing-dependent. Probably related to issue 4. A deterministic mode would make it reproducible.
-4. **AI crash (guarded, root cause unknown).**
-   - `0x1DF8D8` (rule loop) calls `0x1DF7F0` with a NULL tree.
-   - The evaluator then walks address 0 upward as nodes until `0x1DF310` jumps through a missing entry of the 590-entry function table at 0x382E48.
-   - Related code: node dispatch `0x1DF760` (by node type byte +7, table 0x3813B8); comport helpers `0x2009A0` and `0x200DD0` (array of 0x68-byte entries, tree pointer at +0x60).
-   - Seen in JAIL_10 and in the SKI_60 attract demo. In the dump, the mind's comport array was all zeros while the rule table held a valid tree. The data probably changed after the bad call (initialisation order or a use-after-free?).
-   - Next step: a write watch on those addresses.
+3. **Fixed (2026-11-02): the AI crashes were a runtime bug in `dispatchGuestBranch`, not game data.**
+   - After a call returned, `dispatchGuestBranch` treated `ctx->pc == entryPc` as "the callee returned without touching pc". With recursion (`f -> ... -> f`), a checkpoint taken just before the inner call to `f` leaves exactly that pc pending, so the *outer* call to `f` looked finished: the caller went on with garbage registers and skipped epilogues (stack not popped).
+   - Rayman's AI evaluator is recursive (`0x1DF760` node dispatch -> `0x1DF3E0`/`0x1DF310` -> `0x1F2540`/`0x1F1D80` -> `0x1DF760`). Symptoms, depending on where the checkpoint fell: a node pointer of `0xB` (the next node's type byte left in `v0`) and an endless walk through zeroed low memory (host stack overflow), or `ra` loaded from the wrong stack slot (jump to `0x1fffa90`), or the old "NULL behaviour tree" (issue 4 below).
+   - Fix: a thread-local "yield pending" flag in `ps2_runtime.cpp`, set when a branch hands control to the scheduler (checkpoint `K` or jump `J`) and cleared by `EeScheduler::run` before it re-enters guest code (`ps2xGuestYieldReset`). While set, every host frame returns false.
+   - Found with the deterministic mode: the crash became 100% reproducible, then `[guest-recursion]`, `[rayman-ai]`, `[sched-trace]` and `[branch-trace]` pinned it down (see Diagnostics).
+4. **The NULL-tree guard at 0x1DF7F0 is probably obsolete** (same bug as 3). It is still installed; it logs `[rayman-ai] NULL behaviour tree` if it ever fires. If JAIL_10 / SKI_60 run clean without it, remove it.
+   - Background, kept for reference: node layout 8 bytes = 32-bit param, depth byte at +6, type byte at +7; node dispatch table 0x3813B8 (type 0 -> 0x1DF310 "function", 2 -> 0x1DF3E0); function tables 0x382E48 (590 entries) and 0x382EC0; comport helpers `0x2009A0`, `0x200DD0` (0x68-byte entries, tree pointer at +0x60).
 5. **Performance**: levels ran 7-15 FPS on the CPU renderer (GS drain waits plus the VU1 interpreter). Menu loading looks slow mostly because of the game's own waits.
 
 ## Roadmap (agreed with the user)
@@ -137,7 +140,12 @@
   - `PS2X_TEST_MODE=1`: the watchdog also ends the process (exit code 3); the window opens without focus.
   - To run the game by hand with these, set them in the shell first. In `cmd`, a comma ends an argument: pass scripts through environment variables, not `%1`.
 - Timing: PRESS START is up by tick ~250; Start at 600 reaches the language menu by ~700.
-- Still to do: a deterministic mode: today time comes partly from the wall clock (the 0x14BEC8 helper and the IOP floor). In tests, time must come only from guest cycles, so the same input gives the same result.
+- **Deterministic mode** (`PS2X_DETERMINISTIC=1`, on by default in run_tests): the same input gives the same run, down to the EE cycle.
+  - EeScheduler: due events run one at a time in guest-cycle order; the idle wait picks the next event by cycles. The host clock only paces.
+  - IOP: no wall-clock top-up (`wallClockDeficit` returns 0). GS SIGNAL / FINISH / LABEL reach the guest when the register passes the bridge, not from paraLLEl-GS's waiter thread.
+  - Harness: pad script, frame budget and shots count guest VSyncs; real keyboard / gamepad input is ignored in test mode; every 60 VSyncs `[det] vsync=N cycle=C ee=<EE RAM hash>`.
+  - Check type `deterministic` runs a scenario twice and reports the first differing fingerprint.
+  - Use it for any "sometimes" bug: make it reproducible first, then instrument.
 - Small unit tests:
   - An IOP harness that loads the real IRX modules and runs UBISOUND's init RPC. It existed only in the previous assistant's sandbox; recreate it under `ps2xTest` if useful.
   - SPU2 decoder tests.

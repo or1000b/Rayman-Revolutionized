@@ -115,6 +115,46 @@ if (-not $NoBuild) {
 else { $buildOk = $true }
 
 # ---- 2. Scenarios ---------------------------------------------------------------------------------
+# One unattended game run. Returns the exit code ('timeout' if it had to be killed); the checkpoint
+# pictures end up in $shotDir. Deterministic mode is on unless the scenario says "deterministic": false.
+function Invoke-GameRun($sc, $log, $shotDir) {
+    Get-ChildItem $OutDir -Filter 'test_shot_*.bmp' | Remove-Item -Force
+    $env:PS2X_TEST_MODE = '1'
+    $env:PS2X_TEST_INPUT = $sc.input
+    $env:PS2X_TEST_FRAMES = [string]$sc.frames
+    $env:PS2X_TEST_SHOTS = (@($sc.shots) -join ',')
+    $env:PS2X_WATCHDOG_SEC = '15'
+    $env:PS2X_DETERMINISTIC = '1'
+    if ($sc.PSObject.Properties['deterministic'] -and -not $sc.deterministic) { $env:PS2X_DETERMINISTIC = '0' }
+    if ($sc.renderer -eq 'cpu') { $env:PS2X_GS_RENDERER = 'cpu' } else { Remove-Item Env:PS2X_GS_RENDERER -ErrorAction SilentlyContinue }
+
+    # The game paces itself to ~60 frames per second; allow 3x plus start-up before giving up.
+    $timeoutSec = [int]($sc.frames / 60 * 3) + 120
+    $started = Get-Date
+    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"`"$Exe`" `"$Elf`" > `"$log`" 2>&1`"" `
+        -WorkingDirectory $Root -WindowStyle Minimized -PassThru
+    $finished = $proc.WaitForExit($timeoutSec * 1000)
+    if (-not $finished) {
+        & taskkill.exe /T /F /PID $proc.Id | Out-Null
+        $code = 'timeout'
+    }
+    else {
+        $proc.WaitForExit()
+        $code = $proc.ExitCode
+    }
+    $seconds = [math]::Round(((Get-Date) - $started).TotalSeconds)
+    Write-Host "  run took $seconds s, exit code $code, log $log"
+    New-Item -ItemType Directory -Force $shotDir | Out-Null
+    Get-ChildItem $OutDir -Filter 'test_shot_*.bmp' | Move-Item -Destination $shotDir -Force
+    return $code
+}
+
+# The "[det] vsync=N cycle=C ee=H" fingerprints of a deterministic run.
+function Get-DetLines($log) {
+    if (-not (Test-Path $log)) { return @() }
+    return @(Get-Content $log | ForEach-Object { if ($_ -match '\[det\] (vsync=\d+ cycle=\d+ ee=[0-9a-f]+)') { $Matches[1] } })
+}
+
 $spec = Get-Content (Join-Path $Root 'tests\scenarios.json') -Raw | ConvertFrom-Json
 if ($buildOk) {
     foreach ($sc in $spec.scenarios) {
@@ -123,33 +163,8 @@ if ($buildOk) {
         $dir = Join-Path $TestsOut $sc.name
         if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
         New-Item -ItemType Directory -Force $dir | Out-Null
-        Get-ChildItem $OutDir -Filter 'test_shot_*.bmp' | Remove-Item -Force
         $log = Join-Path $dir 'run.log'
-
-        $env:PS2X_TEST_MODE = '1'
-        $env:PS2X_TEST_INPUT = $sc.input
-        $env:PS2X_TEST_FRAMES = [string]$sc.frames
-        $env:PS2X_TEST_SHOTS = (@($sc.shots) -join ',')
-        $env:PS2X_WATCHDOG_SEC = '15'
-        if ($sc.renderer -eq 'cpu') { $env:PS2X_GS_RENDERER = 'cpu' } else { Remove-Item Env:PS2X_GS_RENDERER -ErrorAction SilentlyContinue }
-
-        # The game paces itself to ~60 window frames per second; allow 3x plus start-up before giving up.
-        $timeoutSec = [int]($sc.frames / 60 * 3) + 120
-        $started = Get-Date
-        $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"`"$Exe`" `"$Elf`" > `"$log`" 2>&1`"" `
-            -WorkingDirectory $Root -WindowStyle Minimized -PassThru
-        $finished = $proc.WaitForExit($timeoutSec * 1000)
-        if (-not $finished) {
-            & taskkill.exe /T /F /PID $proc.Id | Out-Null
-            $exitCode = 'timeout'
-        }
-        else {
-            $proc.WaitForExit()
-            $exitCode = $proc.ExitCode
-        }
-        $seconds = [math]::Round(((Get-Date) - $started).TotalSeconds)
-        Write-Host "  run took $seconds s, exit code $exitCode, log $log"
-        Get-ChildItem $OutDir -Filter 'test_shot_*.bmp' | Move-Item -Destination $dir -Force
+        $exitCode = Invoke-GameRun $sc $log $dir
 
         $lines = @()
         if (Test-Path $log) { $lines = Get-Content $log }
@@ -219,6 +234,25 @@ if ($buildOk) {
                     $peak = 0
                     if ($sel.Count) { $peak = ($sel | Measure-Object -Property Peak -Maximum).Maximum }
                     Write-CheckResult $sc.name $check ($peak -ge $check.min) "max spu2 peak $peak after tick $($check.after_tick) (min $($check.min), full scale 32767)"
+                }
+                'deterministic' {
+                    # Run the same scenario again and compare the per-second state fingerprints.
+                    Write-Host '  second run for the determinism check'
+                    $log2 = Join-Path $dir 'run2.log'
+                    $exit2 = Invoke-GameRun $sc $log2 (Join-Path $dir 'run2')
+                    $a = Get-DetLines $log
+                    $b = Get-DetLines $log2
+                    if ($a.Count -eq 0) { Write-CheckResult $sc.name $check $false 'no [det] lines (is PS2X_DETERMINISTIC on?)'; break }
+                    $n = [math]::Min($a.Count, $b.Count)
+                    $split = -1
+                    for ($i = 0; $i -lt $n; $i++) { if ($a[$i] -ne $b[$i]) { $split = $i; break } }
+                    if ($split -ge 0) {
+                        Write-CheckResult $sc.name $check $false ("runs split at fingerprint $($split + 1) of $n`n  run 1: $($a[$split])`n  run 2: $($b[$split])")
+                    }
+                    elseif ($a.Count -ne $b.Count) {
+                        Write-CheckResult $sc.name $check $false "same for $n fingerprints, then one run stopped early ($($a.Count) vs $($b.Count); run 2 exit $exit2)"
+                    }
+                    else { Write-CheckResult $sc.name $check $true "$n fingerprints identical (last: $($a[$n - 1]))" }
                 }
                 default { Add-Result $sc.name $check.type 'FAIL' "unknown check type '$($check.type)'" }
             }

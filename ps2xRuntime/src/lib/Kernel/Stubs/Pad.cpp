@@ -6,6 +6,7 @@
 #include <string>
 
 extern "C" uint16_t ps2xTestPadButtons(int port); // ps2_test_harness.cpp (scripted input for unattended runs)
+extern "C" bool ps2xTestMode();                  // ps2_test_harness.cpp: unattended run, ignore real input
 // --- Rayman debug: log the first calls of each libpad entry point to stderr ---
 namespace
 {
@@ -324,7 +325,7 @@ namespace ps2_stubs
             if (!useOverride)
             {
                 uint8_t backendData[32]{};
-                if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
+                if (!ps2xTestMode() && runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
                 {
                     state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
                     state.rx = backendData[4];
@@ -333,7 +334,7 @@ namespace ps2_stubs
                     state.ly = backendData[7];
                     usedBackend = true;
                 }
-                else
+                else if (!ps2xTestMode())
                 {
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);

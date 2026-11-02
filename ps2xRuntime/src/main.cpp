@@ -293,6 +293,54 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
+    // 0x1DF760 dispatches one AI node (a0 = actor context, a1 = node pointer, node type byte at a1+7) and returns the
+    // next node. Bug hunt: a node pointer in low memory (< 1 MiB, no game data lives there) means a tree was read from
+    // memory that was still zero. Keep the last nodes dispatched and print them, with their bytes, when that happens.
+    constexpr uint32_t kRaymanNodeDispatchAddr = 0x001DF760u;
+    extern "C" void ps2xDumpSchedulerTrace(); // Kernel/EeScheduler.cpp
+    extern "C" void ps2xDumpBranchTrace();    // ps2_runtime.cpp
+    PS2Runtime::RecompiledFunction g_raymanNodeDispatch = nullptr;
+
+    struct RaymanNodeTrace
+    {
+        uint32_t ra, actor, node, type;
+    };
+    RaymanNodeTrace g_raymanNodeRing[64];
+    uint32_t g_raymanNodeRingPos = 0u;
+
+    void raymanNodeDispatchTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t node = getRegU32(ctx, 5);
+        if (node < 0x00100000u)
+        {
+            static bool s_reported = false;
+            if (!s_reported)
+            {
+                s_reported = true;
+                std::fprintf(stderr, "[rayman-ai] node pointer 0x%x (low memory) from ra=0x%x actor=0x%x; last nodes, oldest first:\n",
+                             node, getRegU32(ctx, 31), getRegU32(ctx, 4));
+                for (uint32_t i = 0; i < 64u; ++i)
+                {
+                    const RaymanNodeTrace &t = g_raymanNodeRing[(g_raymanNodeRingPos + i) % 64u];
+                    if (t.node == 0u && t.ra == 0u)
+                        continue;
+                    std::fprintf(stderr, "[rayman-ai]   ra=0x%06x actor=0x%x node=0x%08x type=%u bytes[-8..+8]=%08x %08x | %08x %08x\n",
+                                 t.ra, t.actor, t.node, t.type, readGuest32(rdram, t.node - 8u), readGuest32(rdram, t.node - 4u),
+                                 readGuest32(rdram, t.node), readGuest32(rdram, t.node + 4u));
+                }
+                ps2xDumpSchedulerTrace();
+                ps2xDumpBranchTrace();
+                ps2xDumpCrashContext();
+            }
+        }
+        RaymanNodeTrace &slot = g_raymanNodeRing[g_raymanNodeRingPos++ % 64u];
+        slot.ra = getRegU32(ctx, 31);
+        slot.actor = getRegU32(ctx, 4);
+        slot.node = node;
+        slot.type = node >= 0x00100000u ? (readGuest32(rdram, node + 4u) >> 24) : 0xFFu;
+        g_raymanNodeDispatch(rdram, ctx, runtime);
+    }
+
     void installGameHle(PS2Runtime &runtime, const std::string &gameId)
     {
         if (gameId != "SLES-50044")
@@ -324,6 +372,16 @@ namespace
             g_raymanEvalTree = runtime.lookupFunction(kRaymanEvalTreeAddr);
             if (g_raymanEvalTree && runtime.registerFunction(kRaymanEvalTreeAddr, &raymanEvalTreeGuard))
                 std::cerr << "[hle] Rayman: AI tree NULL guard installed at 0x1DF7F0" << std::endl;
+        }
+
+        uint32_t dispatchEntryWord = 0u;
+        std::memcpy(&dispatchEntryWord, rdram + kRaymanNodeDispatchAddr, sizeof(dispatchEntryWord));
+        // addiu sp,sp,-0x10
+        if (dispatchEntryWord == 0x27BDFFF0u && runtime.hasFunction(kRaymanNodeDispatchAddr))
+        {
+            g_raymanNodeDispatch = runtime.lookupFunction(kRaymanNodeDispatchAddr);
+            if (g_raymanNodeDispatch && runtime.registerFunction(kRaymanNodeDispatchAddr, &raymanNodeDispatchTrace))
+                std::cerr << "[hle] Rayman: AI node trace installed at 0x1DF760" << std::endl;
         }
     }
 

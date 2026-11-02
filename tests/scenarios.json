@@ -3,6 +3,7 @@
     "Unattended game runs for run_tests.ps1. Each scenario is one run of ps2EntryRunner.exe.",
     "input: pad script 'tick:button[:holdTicks],...' (tick = window frame, ~60 per second).",
     "shots: window frames whose picture is saved; checks of type 'shot' refer to them.",
+    "Runs are deterministic (PS2X_DETERMINISTIC=1: guest time from guest cycles only; ticks in input/frames/shots are guest VSyncs) unless a scenario sets \"deterministic\": false.",
     "known_fail: the check is expected to fail for a known reason; it is reported but does not fail the run.",
     "Golden pictures live in tests/golden/ (game content: never committed, see .gitignore)."
   ],
@@ -22,6 +23,7 @@
         { "type": "shot", "tick": 1400, "min_variance": 300, "golden": "boot_language_menu.bmp", "max_diff": 20, "label": "language menu" },
         { "type": "fps", "after_tick": 1100, "min": 20, "label": "menu frame rate" },
         { "type": "iopcd", "min_host": 1, "max_fail": 0, "label": "UBISOUND reads the disc through the host reader" },
+        { "type": "deterministic", "label": "two runs with the same input end in the same state (EE RAM hash per second)" },
         { "type": "audio_peak", "after_tick": 600, "min": 2000, "label": "sound is audible",
           "known_fail": "SPU2 output is near silent (peak ~130); see CLAUDE.md, Sound" }
       ]
@@ -33,13 +35,15 @@
       "input": "600:start:10,1300:cross:10",
       "frames": 2400,
       "shots": [2300],
-      "_note": "picture at 2300 shows MAIN MENU when the run does not crash",
+      "_note": "Regression test for the dispatchGuestBranch recursion bug (fixed 2026-11-02): before it, this run crashed in the AI evaluator every time in deterministic mode.",
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
-        { "type": "log_absent", "pattern": "\\[guest-branch:missing-target\\]", "label": "no bad indirect branch in game code",
-          "known_fail": "INTERMITTENT (1 of 3 runs on 2026-11-02): AI evaluator jumps to a stack address after the memory card check (CLAUDE.md issue 3). FIXED? here does not mean fixed." },
-        { "type": "fps", "after_tick": 2000, "min": 20, "label": "game still renders after the language choice",
-          "known_fail": "same intermittent crash: the main thread stops" }
+        { "type": "log_absent", "pattern": "\\[guest-recursion\\]", "label": "no runaway recursion in game code" },
+        { "type": "log_absent", "pattern": "\\[guest-branch:missing-target\\]", "label": "no bad indirect branch in game code" },
+        { "type": "log_absent", "pattern": "\\[rayman-ai\\]", "label": "AI trees stay valid (no NULL / low-memory nodes)" },
+        { "type": "shot", "tick": 2300, "min_variance": 300, "golden": "english_main_menu.bmp", "max_diff": 20, "label": "MAIN MENU" },
+        { "type": "fps", "after_tick": 2000, "min": 20, "label": "game still renders after the language choice" },
+        { "type": "deterministic", "label": "two runs with the same input end in the same state" }
       ]
     }
   ]

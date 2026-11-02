@@ -38,6 +38,7 @@ extern "C" int ps2xSpu2StatsLine(char *buffer, int size);
 extern "C" void ps2xTestHarnessStart();          // ps2_test_harness.cpp
 extern "C" bool ps2xTestHarnessTick(uint64_t tick);
 extern "C" void ps2xTestHarnessExiting();
+extern "C" void ps2xTestThreadStackGuarantee();
 extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels);
 void ps2xInstallIopToEeRpcHooks(PS2Runtime *runtime);       // Kernel/Syscalls/RPC.cpp
 void ps2xInstallIopCdReader(bool install);                  // Kernel/Stubs/CD.cpp
@@ -1465,6 +1466,47 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// Bug hunt: the last guest branches of this thread and how each ended. outcome: K = checkpoint (host stack
+// unwinds to the scheduler), J = jump handed to the scheduler, M = missing function, T = call returned to the
+// fall-through, F = call ended elsewhere (unwinds), ? = still running. Printed by game reports (main.cpp).
+namespace
+{
+    struct BranchTraceEntry
+    {
+        uint32_t target, source, a1Before, pcAfter, v0After;
+        int kind;
+        char outcome;
+    };
+    thread_local BranchTraceEntry t_branchTrace[64];
+    thread_local uint32_t t_branchTracePos = 0u;
+
+    // Set when a branch hands control to the scheduler (checkpoint or a jump out of the function): every host
+    // frame must now return false until the scheduler resumes the guest. Without it, a call whose target equals the
+    // pending pc (recursion: f -> ... -> f hits a checkpoint while about to call f again) looked like
+    // "callee returned without touching pc" and resumed after the call with garbage registers.
+    thread_local bool t_guestYieldPending = false;
+}
+
+// Scheduler (EeScheduler::run): about to (re)enter guest code at the root of the host stack.
+extern "C" void ps2xGuestYieldReset()
+{
+    t_guestYieldPending = false;
+}
+
+extern "C" void ps2xDumpBranchTrace()
+{
+    std::fprintf(stderr, "[branch-trace] last 64 guest branches of this thread, oldest first:\n");
+    for (uint32_t i = 0; i < 64u; ++i)
+    {
+        const BranchTraceEntry &e = t_branchTrace[(t_branchTracePos + i) % 64u];
+        if (e.target == 0u && e.source == 0u)
+            continue;
+        std::fprintf(stderr, "[branch-trace]   0x%06x -> 0x%06x kind=%d a1=0x%x => %c pc=0x%x v0=0x%x\n", e.source, e.target,
+                     e.kind, e.a1Before, e.outcome, e.pcAfter, e.v0After);
+    }
+    std::fflush(stderr);
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1476,16 +1518,35 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
+    BranchTraceEntry &trace = t_branchTrace[t_branchTracePos++ % 64u];
+    trace = BranchTraceEntry{targetPc, sourcePc, getRegU32(ctx, 5), 0u, 0u, static_cast<int>(kind), '?'};
+    struct BranchTraceClose
+    {
+        BranchTraceEntry &entry;
+        R5900Context *context;
+        ~BranchTraceClose()
+        {
+            entry.pcAfter = context->pc;
+            entry.v0After = getRegU32(context, 2);
+        }
+    } traceClose{trace, ctx};
+
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        trace.outcome = 'K';
+        t_guestYieldPending = true;
         return false;
     }
 
     if (!isCall)
     {
+        trace.outcome = 'J';
+        // Returns only pass through here with PS2X_STRICT_RETURN_DIAGNOSTICS; they are not hand-offs.
+        if (kind != GuestBranchKind::Return)
+            t_guestYieldPending = true;
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
@@ -1517,12 +1578,62 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
+    // Runaway guest recursion guard. Each guest call is a nested host call, so a guest walk that never ends (Rayman's
+    // AI evaluator on an uninitialised, all-zero tree) overflows the host stack and kills the process with no report.
+    // Real guest call chains stay well below this depth.
+    struct GuestCallFrame
+    {
+        uint32_t target, source, a0, a1, a2, a3, sp, ra;
+    };
+    constexpr uint32_t kMaxGuestCallDepth = 4000u;
+    static thread_local uint32_t t_guestCallDepth = 0u;
+    static thread_local GuestCallFrame t_guestCallFrames[kMaxGuestCallDepth];
+    if (t_guestCallDepth >= kMaxGuestCallDepth)
+    {
+        static std::atomic<bool> s_reported{false};
+        if (!s_reported.exchange(true))
+        {
+            std::fprintf(stderr, "[guest-recursion] guest call depth %u reached, calling 0x%x from 0x%x; outermost and innermost frames:\n",
+                         t_guestCallDepth, targetPc, sourcePc);
+            for (uint32_t i = 0; i < kMaxGuestCallDepth; ++i)
+            {
+                if (i == 24u && kMaxGuestCallDepth > 48u)
+                {
+                    std::fprintf(stderr, "[guest-recursion]   ...\n");
+                    i = kMaxGuestCallDepth - 24u;
+                }
+                const GuestCallFrame &f = t_guestCallFrames[i];
+                std::fprintf(stderr, "[guest-recursion]   #%u call 0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x sp=%x ra=%x\n", i,
+                             f.target, f.source, f.a0, f.a1, f.a2, f.a3, f.sp, f.ra);
+            }
+            if (FILE *dump = std::fopen("out/crash_ee_ram.bin", "wb"))
+            {
+                std::fwrite(rdram, 1u, PS2_RAM_SIZE, dump);
+                std::fclose(dump);
+                std::fprintf(stderr, "[guest-recursion] EE RAM written to out/crash_ee_ram.bin\n");
+            }
+            std::fflush(stderr);
+        }
+        requestStop();
+        return false;
+    }
+    t_guestCallFrames[t_guestCallDepth] = GuestCallFrame{targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5),
+                                                         getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 29),
+                                                         getRegU32(ctx, 31)};
+    // A destructor, because guest thread switches unwind the host stack with an exception (ee_scheduler.h).
+    struct DepthScope
+    {
+        DepthScope() { ++t_guestCallDepth; }
+        ~DepthScope() { --t_guestCallDepth; }
+    } depthScope;
+
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
 
-    if (isStopRequested() || ctx->pc == 0u)
+    if (isStopRequested() || ctx->pc == 0u || t_guestYieldPending)
     {
+        trace.outcome = 'F';
         return false;
     }
 
@@ -1531,6 +1642,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         ctx->pc = fallthroughPc;
     }
 
+    trace.outcome = (ctx->pc == fallthroughPc) ? 'T' : 'F';
     return ctx->pc == fallthroughPc;
 }
 
@@ -2490,6 +2602,7 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ps2xTestThreadStackGuarantee();
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);

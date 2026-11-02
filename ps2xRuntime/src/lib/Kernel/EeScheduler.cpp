@@ -13,6 +13,17 @@
 #include <mutex>
 #include <unordered_map>
 
+// Scheduler-level dispatches (thread, invocation depth, pc/ra/sp/v0/a1), oldest first: shows thread switches and
+// interrupt handlers between two points of a guest function. Used by game bug hunts (main.cpp).
+extern "C" void ps2xDumpSchedulerTrace();
+// ps2_runtime.cpp: clears the "unwinding to the scheduler" flag before guest code runs again at the stack root.
+extern "C" void ps2xGuestYieldReset();
+
+// ps2_test_harness.cpp. Deterministic mode (PS2X_DETERMINISTIC=1): which event comes next and in what
+// order events run is decided by guest cycles only; the host clock is used only to pace (wait).
+extern "C" bool ps2xDeterministic();
+extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uint8_t *rdram, uint32_t ramBytes);
+
 namespace
 {
     // Device time (EE timers + the interpreted IOP) used to be advanced on every guest
@@ -34,6 +45,7 @@ namespace
         uint32_t ra;
         uint32_t sp;
         uint32_t v0;
+        uint32_t a1;
     };
     constexpr size_t kDispatchTraceSize = 64;
     DispatchTraceEntry g_dispatchTrace[kDispatchTraceSize]{};
@@ -49,6 +61,7 @@ namespace
         e.ra = static_cast<uint32_t>(_mm_extract_epi32(c.r[31], 0));
         e.sp = static_cast<uint32_t>(_mm_extract_epi32(c.r[29], 0));
         e.v0 = static_cast<uint32_t>(_mm_extract_epi32(c.r[2], 0));
+        e.a1 = static_cast<uint32_t>(_mm_extract_epi32(c.r[5], 0));
         g_dispatchTraceNext = (g_dispatchTraceNext + 1) % kDispatchTraceSize;
         ++g_dispatchTraceCount;
     }
@@ -413,6 +426,7 @@ void EeScheduler::run()
             g_watchSp = static_cast<uint32_t>(_mm_extract_epi32(context.r[29], 0));
             checkStackWatch(m_rdram, "before", g_watchThread, g_watchPc, g_watchRa, g_watchSp);
             m_guestExecuting.store(true, std::memory_order_release);
+            ps2xGuestYieldReset();
             function(m_rdram, &context, &m_runtime);
             checkStackWatch(m_rdram, "after", g_watchThread, g_watchPc, g_watchRa, g_watchSp);
             m_guestExecuting.store(false, std::memory_order_release);
@@ -2012,6 +2026,67 @@ void EeScheduler::processPendingEvents()
 
 void EeScheduler::processDueDeadlines()
 {
+    if (ps2xDeterministic())
+    {
+        // One event at a time, in guest-cycle order (then type, id, sequence). Each still waits for its host
+        // time so the game runs at normal speed, but the host clock no longer decides the order.
+        const auto earlier = [](const ScheduledEvent &left, const ScheduledEvent &right)
+        {
+            if (left.deadlineCycle != right.deadlineCycle)
+                return left.deadlineCycle < right.deadlineCycle;
+            if (left.event.type != right.event.type)
+                return left.event.type < right.event.type;
+            if (left.event.id != right.event.id)
+                return left.event.id < right.event.id;
+            return left.sequence < right.sequence;
+        };
+        for (;;)
+        {
+            ScheduledEvent next{};
+            {
+                std::unique_lock lock(m_eventMutex);
+                auto best = m_deadlines.end();
+                for (auto it = m_deadlines.begin(); it != m_deadlines.end(); ++it)
+                {
+                    if (it->deadlineCycle <= m_eeCycle && (best == m_deadlines.end() || earlier(*it, *best)))
+                        best = it;
+                }
+                if (best == m_deadlines.end())
+                {
+                    updateNextDeadline();
+                    return;
+                }
+                if (std::chrono::steady_clock::now() < best->hostDeadline)
+                {
+                    const auto pace = best->hostDeadline;
+                    m_eventCv.wait_until(lock, pace, [this]()
+                                         { return !m_events.empty() ||
+                                                  m_stopRequested.load(std::memory_order_acquire); });
+                    if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+                    {
+                        updateNextDeadline();
+                        return;
+                    }
+                    // The vector may not have changed (only this thread schedules), but look again to be safe.
+                    continue;
+                }
+                next = *best;
+                m_deadlines.erase(best);
+                updateNextDeadline();
+            }
+            if (next.event.type == EeEventType::VBlankStart)
+            {
+                scheduleEvent(next.deadlineCycle + kVBlankDurationCycles,
+                              next.hostDeadline + kVBlankDuration,
+                              EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                scheduleEvent(next.deadlineCycle + kVBlankPeriodCycles,
+                              next.hostDeadline + kVBlankPeriod,
+                              EeEvent{EeEventType::VBlankStart, 0, 0});
+            }
+            processEvent(next.event);
+        }
+    }
+
     for (;;)
     {
         std::vector<ScheduledEvent> due;
@@ -2125,6 +2200,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         }
         m_vsyncFlagAddress = 0u;
         m_vsyncTickAddress = 0u;
+        ps2xTestOnGuestVSync(m_vsyncTick, m_eeCycle, m_rdram, PS2_RAM_SIZE);
         completeVSync(m_vsyncTick);
         if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
         {
@@ -2279,7 +2355,16 @@ void EeScheduler::waitForEvent()
     if (hasTimerDeadline)
     {
         const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
-        if (timerHostDeadline < hostDeadline)
+        if (ps2xDeterministic())
+        {
+            // Whichever comes first in guest cycles, not on the host clock.
+            if (m_deadlines.empty() || m_eeCycle + timerCycles < deadlineCycle)
+            {
+                deadlineCycle = m_eeCycle + timerCycles;
+                hostDeadline = timerHostDeadline;
+            }
+        }
+        else if (timerHostDeadline < hostDeadline)
         {
             deadlineCycle = m_eeCycle + timerCycles;
             hostDeadline = timerHostDeadline;
@@ -2393,4 +2478,19 @@ void EeScheduler::publishIdleDebugContext()
     {
         publishDebugContext(selected->activeContext());
     }
+}
+
+extern "C" void ps2xDumpSchedulerTrace()
+{
+    std::fprintf(stderr, "[sched-trace] last %zu scheduler dispatches (of %llu), oldest first:\n", kDispatchTraceSize,
+                 static_cast<unsigned long long>(g_dispatchTraceCount));
+    for (size_t i = 0; i < kDispatchTraceSize; ++i)
+    {
+        const DispatchTraceEntry &e = g_dispatchTrace[(g_dispatchTraceNext + i) % kDispatchTraceSize];
+        if (e.pc == 0 && e.ra == 0 && e.sp == 0)
+            continue;
+        std::fprintf(stderr, "[sched-trace]   t%d d%d pc=0x%08X ra=0x%08X sp=0x%08X v0=0x%08X a1=0x%08X\n",
+                     e.thread, e.depth, e.pc, e.ra, e.sp, e.v0, e.a1);
+    }
+    std::fflush(stderr);
 }
