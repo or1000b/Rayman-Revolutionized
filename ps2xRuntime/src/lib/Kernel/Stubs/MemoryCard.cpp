@@ -556,7 +556,7 @@ namespace ps2_stubs
         }
 
         RUNTIME_LOG("[MC] Chdir port=" << port << " '" << requestedDir
-                                       << "' -> result=" << result << " cwd='" << currentDir << "'");
+                                       << "' -> result=" << result << " cwd='" << currentDir << "'" << std::endl);
         writeMcCString(rdram, currentDirAddr, currentDir);
         setReturnS32(ctx, 0);
     }
@@ -843,7 +843,7 @@ namespace ps2_stubs
             setMcCommandResultLocked(kMcCmdGetDir, result);
         }
         RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
-                                        << "' maxent=" << maxEntries << " -> result=" << result);
+                                        << "' maxent=" << maxEntries << " -> result=" << result << std::endl);
         setReturnS32(ctx, 0);
     }
 
@@ -907,7 +907,7 @@ namespace ps2_stubs
 
         RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
                                          << " free=" << freeBlocks << " format=" << format
-                                         << " result=" << result);
+                                         << " result=" << result << std::endl);
         setReturnS32(ctx, 0);
     }
 
@@ -1213,7 +1213,7 @@ namespace ps2_stubs
             return;
         }
 
-        RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result);
+        RUNTIME_LOG("[MC] Sync cmd=" << cmd << " result=" << result << std::endl);
 
         if (cmdPtr != 0u)
         {

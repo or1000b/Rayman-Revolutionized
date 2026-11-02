@@ -37,7 +37,10 @@
   cmd /c "call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul && cmake --build out\game --target ps2EntryRunner"
   ```
   Get VSPATH from `vswhere -latest -property installationPath`.
-- The game runs until its window is closed. For automated runs there is no exit-after-N-frames option yet; adding one is part of the test plan below.
+- The game runs until its window is closed, unless `PS2X_TEST_FRAMES` is set (see Test automation).
+- **Every link takes ~9 minutes** (LTCG, `/GL` + `/LTCG` from `cmake/ReleaseMode.cmake`), even for a one-line change. Turning LTCG off would recompile all generated code, so it stays. Batch changes before building.
+- The exe gets a PDB (`/DEBUG:FULL /OPT:REF /OPT:NOICF`, link step only), so stack dumps show function names. The GS bridge and paraLLEl-GS are compiled with `/Z7` for line numbers.
+- paraLLEl-GS is patched at configure time by `ps2xRuntime/cmake/PatchParallelGs.cmake` (idempotent string replace with a marker; fails loudly if the anchor disappears).
 - The first build after the GPU renderer was added downloads Granite and paraLLEl-GS with FetchContent (git, pinned commits). This needs network access.
 
 ## Hard rules (learned the hard way)
@@ -73,7 +76,10 @@
   - The CPU renderer (`gs_cpu_backend.cpp`).
   - The GPU renderer, paraLLEl-GS (Vulkan compute, LGPL-3.0). It sits behind the bridge in `gs/pgs/gs_pgs_bridge.{h,cpp}`, which is its own static library so Granite headers and defines never reach generated code.
   - `PS2X_GS_RENDERER=cpu` (environment variable) forces the CPU renderer.
-  - The bridge serialises every call with one mutex, reassembles split GIF packets per path (paraLLEl-GS spins forever on a piece shorter than one loop), synthesises SMODE1 (the BIOS normally writes it), and converts the libgraph stubs' DISPLAY values from pixel units (MAGH = 0, DW = width - 1) to video clocks.
+  - The bridge serialises every call with one mutex, reassembles split PACKED/REGLIST GIF packets per path (paraLLEl-GS spins forever on a piece shorter than one loop), synthesises SMODE1 (the BIOS normally writes it), and converts the libgraph stubs' DISPLAY values from pixel units (MAGH = 0, DW = width - 1) to video clocks.
+  - Partial **IMAGE** packets are *not* kept pending: they are re-tagged to the qwords present and sent at once. The VIF (`ps2_vif1_interpreter.cpp`, DIRECT continuation) re-tags the rest of an image as a new IMAGE packet, so a pending old tag would swallow the new tag as pixels and shift the whole path (texture data parsed as GS registers, 4096x4096 prims, GPU driver reset).
+  - The bridge walks every packet it forwards (`analyzeGif`) and keeps per-frame stats (kicks, prims, TEX0/CLUT loads, uploads, largest prim) plus `[pgs-gif] anomaly` lines for out-of-range values. `PS2X_PGS_TRACE=1` prints one line per frame.
+- **Window**: raylib with `FLAG_WINDOW_ALWAYS_RUN`. Without it raylib parks the window thread in `glfwWaitEvents` while minimised, which also stops GS scanout.
 - **VU1**: an interpreter (`vu/`). It costs about 29% of a frame in levels. AOT compilation like rac-rs (`vu1gen.py`) is a candidate, but a native renderer would remove most of it.
 
 ## Diagnostics already built in
@@ -84,23 +90,28 @@
 - `out\pgs_frame.bmp`: a GPU frame about every 5 s. Look at it instead of asking the user to describe the screen.
 - F11 in game: one frame of GS commands to `out\gscapture.bin`.
 - `[rayman-ai] NULL behaviour tree ...`: logged by the 0x1DF7F0 guard.
+- **Hang watchdog** (`ps2_test_harness.cpp`, always on, `PS2X_WATCHDOG_SEC`, default 15): when the window thread draws no frame for that long, every thread's native stack is written to the log as `[watchdog]` lines (function names + file:line from the PDB). Read the `GameThread` and main-thread stacks first.
+  - It only sees a stuck *window* thread. A stuck game thread with a live window shows as `gameFps=0` in `[threads]` lines instead.
+- GPU driver resets (TDR) show up in the Windows System log as `nvlddmkm` event 153; Granite then spins forever in `vkResetCommandPool`. Check with `Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nvlddmkm'}`.
 
-## Status and open issues (2026-11-02)
-1. **GPU renderer (r11), waiting for a test run.** Before r11:
-   - The picture was squeezed to the left (DISPLAY units).
-   - After pressing Enter the game hung inside paraLLEl-GS (GS=100%, frames=0). Causes were two threads racing on it and split GIF packets.
-   - Both are fixed in r11. Verify with the log and `pgs_frame.bmp`.
-2. **Sound**:
-   - Sound streams through UBISOUND's CD reads, which now work (`iopcd host=N fail=0`).
-   - The music has not been confirmed audible yet. `peak` in the spu2 stats was still low, and there are underruns when the EE stalls.
+## Status and open issues (2026-11-02, evening)
+1. **GPU renderer: works through the language menu (verified 2026-11-02 by run_tests).**
+   - Full-width 640x512 picture; PRESS START and LANGUAGE CHOICE draw correctly, ~30 game FPS (CPU renderer: ~2.8).
+   - The hang after Enter had two causes, both fixed: a paraLLEl-GS CPU-side loop (`compute_page_rect` block range underflow, patched) and the IMAGE re-tag desync in the bridge (above).
+2. **Sound: not audible yet.**
+   - UBISOUND reads the disc fine (`iopcd host=5 fail=0`) and the SPU2 has 48 active voices, but `peak` stays ~130 of 32767 (about -48 dB) and there are no further CD reads in the menus (no music stream).
    - Long-term plan: replace the IOP + SPU2 emulation with a native implementation of UBISOUND's command set.
-3. **AI crash (guarded, root cause unknown).**
+3. **After choosing a language (memory card check), results differ between runs.**
+   - Sometimes: `[guest-branch:missing-target]` jump to `0x1fffa90` (a stack address; `ra` was overwritten with a pointer into the stack) inside the AI evaluator (trace ... `0x1df760 -> 0x1df3e0 -> 0x1f2540`). The main thread stops; the window keeps drawing the last picture.
+   - Other times: no crash, the game polls `sceMcGetInfo` every frame (no save on the card, `GetDir 'BESLES-50044*'` finds nothing).
+   - Same input, different result: timing-dependent. Probably related to issue 4. A deterministic mode would make it reproducible.
+4. **AI crash (guarded, root cause unknown).**
    - `0x1DF8D8` (rule loop) calls `0x1DF7F0` with a NULL tree.
    - The evaluator then walks address 0 upward as nodes until `0x1DF310` jumps through a missing entry of the 590-entry function table at 0x382E48.
    - Related code: node dispatch `0x1DF760` (by node type byte +7, table 0x3813B8); comport helpers `0x2009A0` and `0x200DD0` (array of 0x68-byte entries, tree pointer at +0x60).
    - Seen in JAIL_10 and in the SKI_60 attract demo. In the dump, the mind's comport array was all zeros while the rule table held a valid tree. The data probably changed after the bad call (initialisation order or a use-after-free?).
    - Next step: a write watch on those addresses.
-4. **Performance**: levels ran 7-15 FPS on the CPU renderer (GS drain waits plus the VU1 interpreter). Menu loading looks slow mostly because of the game's own waits.
+5. **Performance**: levels ran 7-15 FPS on the CPU renderer (GS drain waits plus the VU1 interpreter). Menu loading looks slow mostly because of the game's own waits.
 
 ## Roadmap (agreed with the user)
 1. Stabilise the game logic (crashes, hangs).
@@ -114,14 +125,19 @@
    - High FPS: logic stays at its rate and rendering is interpolated.
    - Ray tracing.
 
-## Test automation plan (not built yet)
-- `run_tests.bat` builds, then runs the game unattended:
-  - Scripted pad input, e.g. Start at frame 300.
-  - Fixed frame budget, then exit.
-  - Watchdog: no new frame for 15 s → dump state and fail.
-  - Checks at checkpoints: menu reached, level loaded, frame not black (pixel variance), audio peak above a threshold, FPS, comparison against golden images.
-  - Writes `out\test_report.txt` with PASS/FAIL.
-- Needs a deterministic mode: today time comes partly from the wall clock (the 0x14BEC8 helper and the IOP floor). In tests, time must come only from guest cycles, so the same input gives the same result.
+## Test automation (built 2026-11-02)
+- `run_tests.bat [-NoBuild] [-Only <scenario>] [-UpdateGolden]` (logic in `run_tests.ps1`, Windows PowerShell 5.1): builds, runs each scenario of `tests\scenarios.json` unattended (minimised window, no focus), checks it, writes `out\test_report.txt`, exit code 0 = no FAIL. No `pause`, so Claude can run it.
+  - Per scenario: `out\tests\<name>\run.log` and the checkpoint pictures.
+  - Check types: `exit_code`, `log_absent` (regex), `shot` (luma variance + mean difference to a golden picture), `fps`, `iopcd`, `audio_peak`.
+  - `known_fail` on a check = expected failure with a known cause: reported as KNOWN-FAIL, does not fail the run; if it passes it shows as `FIXED?`.
+  - Golden pictures: `tests\golden\` (game content, git-ignored). Refresh with `-UpdateGolden` after an intended visual change.
+- Runtime side, `ps2xRuntime/src/lib/ps2_test_harness.cpp`, driven by environment variables:
+  - `PS2X_TEST_INPUT="600:start:10,1300:cross:10"` pad script (tick = window frame, ~60/s; button names in the file).
+  - `PS2X_TEST_FRAMES=N` stop after N window frames. `PS2X_TEST_SHOTS="590,1400"` save `out\test_shot_<tick>.bmp` (works with both renderers).
+  - `PS2X_TEST_MODE=1`: the watchdog also ends the process (exit code 3); the window opens without focus.
+  - To run the game by hand with these, set them in the shell first. In `cmd`, a comma ends an argument: pass scripts through environment variables, not `%1`.
+- Timing: PRESS START is up by tick ~250; Start at 600 reaches the language menu by ~700.
+- Still to do: a deterministic mode: today time comes partly from the wall clock (the 0x14BEC8 helper and the IOP floor). In tests, time must come only from guest cycles, so the same input gives the same result.
 - Small unit tests:
   - An IOP harness that loads the real IRX modules and runs UBISOUND's init RPC. It existed only in the previous assistant's sandbox; recreate it under `ps2xTest` if useful.
   - SPU2 decoder tests.

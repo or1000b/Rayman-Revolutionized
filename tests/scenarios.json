@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Unattended game runs for run_tests.ps1. Each scenario is one run of ps2EntryRunner.exe.",
+    "input: pad script 'tick:button[:holdTicks],...' (tick = window frame, ~60 per second).",
+    "shots: window frames whose picture is saved; checks of type 'shot' refer to them.",
+    "known_fail: the check is expected to fail for a known reason; it is reported but does not fail the run.",
+    "Golden pictures live in tests/golden/ (game content: never committed, see .gitignore)."
+  ],
+  "scenarios": [
+    {
+      "name": "boot_to_language_menu",
+      "description": "Boot, PRESS START, the language menu draws on the GPU renderer.",
+      "renderer": "gpu",
+      "input": "600:start:10",
+      "frames": 1500,
+      "shots": [590, 1400],
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "log_absent", "pattern": "\\[guest-branch:missing-target\\]", "label": "no bad indirect branch in game code" },
+        { "type": "log_absent", "pattern": "\\[pgs-gif\\] anomaly", "label": "GIF stream stays in step (no garbage registers)" },
+        { "type": "shot", "tick": 590, "min_variance": 1000, "golden": "boot_press_start.bmp", "max_diff": 6, "label": "PRESS START screen" },
+        { "type": "shot", "tick": 1400, "min_variance": 300, "golden": "boot_language_menu.bmp", "max_diff": 20, "label": "language menu" },
+        { "type": "fps", "after_tick": 1100, "min": 20, "label": "menu frame rate" },
+        { "type": "iopcd", "min_host": 1, "max_fail": 0, "label": "UBISOUND reads the disc through the host reader" },
+        { "type": "audio_peak", "after_tick": 600, "min": 2000, "label": "sound is audible",
+          "known_fail": "SPU2 output is near silent (peak ~130); see CLAUDE.md, Sound" }
+      ]
+    },
+    {
+      "name": "choose_english",
+      "description": "Pick ENGLISH in the language menu; the game checks the memory card and goes on to the MAIN MENU.",
+      "renderer": "gpu",
+      "input": "600:start:10,1300:cross:10",
+      "frames": 2400,
+      "shots": [2300],
+      "_note": "picture at 2300 shows MAIN MENU when the run does not crash",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "log_absent", "pattern": "\\[guest-branch:missing-target\\]", "label": "no bad indirect branch in game code",
+          "known_fail": "INTERMITTENT (1 of 3 runs on 2026-11-02): AI evaluator jumps to a stack address after the memory card check (CLAUDE.md issue 3). FIXED? here does not mean fixed." },
+        { "type": "fps", "after_tick": 2000, "min": 20, "label": "game still renders after the language choice",
+          "known_fail": "same intermittent crash: the main thread stops" }
+      ]
+    }
+  ]
+}
