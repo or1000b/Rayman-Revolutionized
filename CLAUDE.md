@@ -119,6 +119,11 @@
 4. **The NULL-tree guard at 0x1DF7F0 is probably obsolete** (same bug as 3). It is still installed; it logs `[rayman-ai] NULL behaviour tree` if it ever fires. If JAIL_10 / SKI_60 run clean without it, remove it.
    - Background, kept for reference: node layout 8 bytes = 32-bit param, depth byte at +6, type byte at +7; node dispatch table 0x3813B8 (type 0 -> 0x1DF310 "function", 2 -> 0x1DF3E0); function tables 0x382E48 (590 entries) and 0x382EC0; comport helpers `0x2009A0`, `0x200DD0` (0x68-byte entries, tree pointer at +0x60).
 5. **Performance**: levels ran 7-15 FPS on the CPU renderer (GS drain waits plus the VU1 interpreter). Menu loading looks slow mostly because of the game's own waits.
+6. **3D polygons look messy** (reported by the user, 2026-11-02). Not investigated yet.
+   - The 3D background of the language and main menus already shows it: diagonal streaks and a stretched look (`tests/golden/boot_language_menu.bmp`, `english_main_menu.bmp`). The CPU renderer shows similar streaks, so the cause is probably before the GS: VU1 microprograms (interpreter), VIF unpacking, or the GIF packets they build, not paraLLEl-GS.
+   - First steps: compare one frame's GIF stream on both renderers; check VU1 output vertices (positions, ST/Q) against what the RenderWare skin/clip microcode should produce.
+7. **Black screen after the opening cutscenes** (reported by the user, 2026-11-02). Path: MAIN MENU, NEW GAME, create a save, the intro cutscenes play, then only black. Not investigated yet.
+   - First step: a run_tests scenario that scripts this path (deterministic), then look at `[threads]` (is the EE alive, gameFps, CD reads), `[prof]`, the watchdog and the pictures to tell a hang, a missing load or a render problem apart.
 
 ## Roadmap (agreed with the user)
 1. Stabilise the game logic (crashes, hangs).
