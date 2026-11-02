@@ -104,9 +104,13 @@
 1. **GPU renderer: works through the language menu (verified 2026-11-02 by run_tests).**
    - Full-width 640x512 picture; PRESS START and LANGUAGE CHOICE draw correctly, ~30 game FPS (CPU renderer: ~2.8).
    - The hang after Enter had two causes, both fixed: a paraLLEl-GS CPU-side loop (`compute_page_rect` block range underflow, patched) and the IMAGE re-tag desync in the bridge (above).
-2. **Sound: not audible yet.**
-   - UBISOUND reads the disc fine (`iopcd host=5 fail=0`) and the SPU2 has 48 active voices, but `peak` stays ~130 of 32767 (about -48 dB) and there are no further CD reads in the menus (no music stream).
-   - Long-term plan: replace the IOP + SPU2 emulation with a native implementation of UBISOUND's command set.
+2. **Sound: not audible yet. Cause narrowed down (2026-11-02): UBISOUND gives voices start address 0.**
+   - UBISOUND reads the disc fine (`iopcd host=5 fail=0`), and the bank data reaches SPU RAM (PIO through the data port, not DMA: `dma=0K`, ~270K register writes at load). `[spu2-dump]` shows SPU RAM words 0x8000-0x50000 filled.
+   - When a sound plays, UBISOUND writes SSA = 0 (`[spu2-kon] core1 ... raw-ssa=0000:0000`) with sensible pitch and volume, so the voice plays from address 0 into the silent loop at 0x2800. The mixer, volumes and routing are fine (core1 mvol/avol 32767, mmix 0ffc).
+   - So UBISOUND does not know where its bank lies in SPU RAM (bank base 0). Next: find where UBISOUND takes the bank's SPU address from (its ee2i load-bank command from the EE, its SPU allocator, or the return of a LIBSD transfer call) and why it is 0 here.
+   - Core0 voices 0-23 (SSA 0x2808 + n*0x400, pitch 0x0759, volume 0) look like the stream buffers; no stream has started yet in the menus (no CD reads after load).
+   - Tools: `PS2X_SPU2_DUMP_AT="700,2300"` (guest VSyncs) prints the full mixer state; the first 40 key-ons are logged as `[spu2-kon]`.
+   - Long-term plan unchanged: replace the IOP + SPU2 emulation with a native implementation of UBISOUND's command set.
 3. **Fixed (2026-11-02): the AI crashes were a runtime bug in `dispatchGuestBranch`, not game data.**
    - After a call returned, `dispatchGuestBranch` treated `ctx->pc == entryPc` as "the callee returned without touching pc". With recursion (`f -> ... -> f`), a checkpoint taken just before the inner call to `f` leaves exactly that pc pending, so the *outer* call to `f` looked finished: the caller went on with garbage registers and skipped epilogues (stack not popped).
    - Rayman's AI evaluator is recursive (`0x1DF760` node dispatch -> `0x1DF3E0`/`0x1DF310` -> `0x1F2540`/`0x1F1D80` -> `0x1DF760`). Symptoms, depending on where the checkpoint fell: a node pointer of `0xB` (the next node's type byte left in `v0`) and an endless walk through zeroed low memory (host stack overflow), or `ra` loaded from the wrong stack slot (jump to `0x1fffa90`), or the old "NULL behaviour tree" (issue 4 below).

@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <vector>
@@ -52,6 +53,38 @@ namespace ps2x::iop::detail
             return n;
         }
         int32_t outputVolume() const { return std::max(m_cores[1].mvolL, m_cores[1].mvolR); }
+
+        // Bug hunt (sound): the whole mixer state, per core and per active voice, plus where SPU RAM holds data.
+        void debugDump(std::FILE *out) const
+        {
+            for (uint32_t c = 0; c < 2u; ++c)
+            {
+                const Core &core = m_cores[c];
+                std::fprintf(out, "[spu2-dump] core%u mmix=%04x vmixl=%06x vmixr=%06x mvol=%d/%d avol=%d/%d bvol=%d/%d attr=%04x admas=%04x tsa=%05x irqa=%05x endx=%06x\n",
+                             c, core.mmix, core.vmixl, core.vmixr, core.mvolL, core.mvolR, core.avolL, core.avolR, core.bvolL,
+                             core.bvolR, core.attr, core.admas, core.tsa, core.irqa, core.endx);
+                for (uint32_t i = 0; i < kVoices; ++i)
+                {
+                    const Voice &v = core.voices[i];
+                    if (!v.active && v.ssa == 0u)
+                        continue;
+                    std::fprintf(out, "[spu2-dump]   v%02u %s ssa=%05x nax=%05x lsa=%05x pitch=%04x adsr=%04x/%04x phase=%d env=%d vol=%d/%d (reg %04x/%04x) cur=%d\n",
+                                 i, v.active ? "ON " : "off", v.ssa, v.nax, v.lsa, v.pitch, v.adsr1, v.adsr2, v.phase, v.envelope,
+                                 v.volL, v.volR, v.volLReg, v.volRReg, v.cur);
+                }
+            }
+            // Non-zero words per 64 KiB block (32768 words) of SPU RAM.
+            std::fprintf(out, "[spu2-dump] RAM non-zero words per 64 KiB block:");
+            for (uint32_t block = 0; block < kRamWords / 32768u; ++block)
+            {
+                uint32_t n = 0;
+                for (uint32_t w = 0; w < 32768u; ++w)
+                    n += m_ram[block * 32768u + w] != 0u ? 1u : 0u;
+                std::fprintf(out, " %u", n);
+            }
+            std::fprintf(out, "\n");
+            std::fflush(out);
+        }
         uint16_t routing(uint32_t coreIndex) const { return m_cores[coreIndex & 1u].mmix; }
 
         void reset()
@@ -413,6 +446,21 @@ namespace ps2x::iop::detail
 
         void keyOn(Core &core, uint32_t mask)
         {
+            // Bug hunt (sound): the first key-ons with the voice setup they start from.
+            static uint32_t s_keyOnLogs = 0u;
+            if (s_keyOnLogs < 40u && mask != 0u)
+            {
+                ++s_keyOnLogs;
+                const uint32_t coreIndex = &core == &m_cores[1] ? 1u : 0u;
+                std::fprintf(stderr, "[spu2-kon] core%u mask=%06x", coreIndex, mask);
+                for (uint32_t i = 0; i < kVoices; ++i)
+                    if ((mask & (1u << i)) != 0u)
+                        std::fprintf(stderr, " v%u(ssa=%05x pitch=%04x vol=%04x/%04x raw-ssa=%04x:%04x)", i, core.voices[i].ssa,
+                                     core.voices[i].pitch, core.voices[i].volLReg, core.voices[i].volRReg,
+                                     m_regs[(coreIndex * 0x400u + 0x1C0u + i * 0xCu) >> 1],
+                                     m_regs[(coreIndex * 0x400u + 0x1C2u + i * 0xCu) >> 1]);
+                std::fprintf(stderr, "\n");
+            }
             for (uint32_t i = 0; i < kVoices; ++i)
             {
                 if ((mask & (1u << i)) == 0u)

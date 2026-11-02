@@ -38,6 +38,7 @@
 #endif
 
 extern "C" void ps2xDumpCrashContext(); // ps2_runtime.cpp: last guest function, dispatch history
+extern "C" void ps2xSpu2DebugDump();    // ps2xIOP iop_memory.cpp: SPU2 mixer state
 
 namespace
 {
@@ -498,6 +499,31 @@ extern "C" bool ps2xDeterministic()
 extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uint8_t *rdram, uint32_t ramBytes)
 {
     g_guestVsync.store(vsync, std::memory_order_relaxed);
+
+    // PS2X_SPU2_DUMP_AT="1200,2300": full SPU2 state at those guest VSyncs (this thread also runs the IOP).
+    static const std::vector<uint64_t> spu2DumpAt = []()
+    {
+        std::vector<uint64_t> at;
+        if (const char *list = std::getenv("PS2X_SPU2_DUMP_AT"))
+        {
+            for (const char *p = list; *p;)
+            {
+                char *end = nullptr;
+                const uint64_t value = std::strtoull(p, &end, 10);
+                if (end == p)
+                    break;
+                at.push_back(value);
+                p = (*end == ',') ? end + 1 : end;
+            }
+        }
+        return at;
+    }();
+    if (std::find(spu2DumpAt.begin(), spu2DumpAt.end(), vsync) != spu2DumpAt.end())
+    {
+        std::fprintf(stderr, "[spu2-dump] guest vsync %llu\n", static_cast<unsigned long long>(vsync));
+        ps2xSpu2DebugDump();
+    }
+
     if (!ps2xDeterministic() || !rdram || (vsync % 60u) != 0u)
         return;
     // 64-bit multiply-xor over the whole of EE RAM: ~5 ms for 32 MiB, once a second.

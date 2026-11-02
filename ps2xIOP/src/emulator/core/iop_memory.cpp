@@ -98,9 +98,13 @@ namespace ps2x::iop::detail
         return events;
     }
 
+    // The SPU2 of the (single) IOP, for ps2xSpu2DebugDump.
+    const Spu2 *g_debugSpu2 = nullptr;
+
     IopMemory::IopMemory()
         : m_ram(RamSize), m_owned(RamSize), m_scratch(ScratchSize), m_spu2(std::make_unique<Spu2>())
     {
+        g_debugSpu2 = m_spu2.get();
         reset();
     }
 
@@ -568,4 +572,11 @@ extern "C" int ps2xSpu2StatsLine(char *buffer, int size)
                                       mmix >> 16, mmix & 0xFFFFu, static_cast<unsigned>(fill), g_statUnderruns.exchange(0u),
                                       cd[0], cd[1], cd[2], cd[3]);
     return written < 0 ? 0 : std::min(written, size - 1);
+}
+
+// Full SPU2 mixer state to stderr ([spu2-dump] lines). Call on the thread that runs the IOP.
+extern "C" void ps2xSpu2DebugDump()
+{
+    if (ps2x::iop::detail::g_debugSpu2)
+        ps2x::iop::detail::g_debugSpu2->debugDump(stderr);
 }
