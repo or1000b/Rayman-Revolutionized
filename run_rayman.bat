@@ -1,0 +1,9 @@
+@echo off
+cd /d "%~dp0"
+if exist out\run.log move /y out\run.log out\run_prev.log >nul
+echo Starting Rayman Revolution... (log: out\run.log)
+echo F11 = save one frame of graphics commands for Claude (out\gscapture.bin)
+"out\game\ps2xRuntime\ps2EntryRunner.exe" "%CD%\Rayman revolution files\SLES_500.44" > out\run.log 2>&1
+echo.
+echo The game exited (code %ERRORLEVEL%). Tell Claude what you saw - the log is in out\run.log
+pause
