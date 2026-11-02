@@ -30,6 +30,7 @@ namespace ps2x::pgs
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -122,6 +123,258 @@ namespace ps2x::pgs
                 offset += need;
             }
             return offset;
+        }
+
+        // Rayman bring-up: a light walk over every complete GIF packet before paraLLEl-GS sees it.
+        // Counts per scanout what the frame asks of the GPU and logs values that are out of range for
+        // real hardware (they can make a GPU shader run long enough for a driver reset).
+        struct GifStats
+        {
+            uint64_t packets = 0, qwords = 0, imageQwords = 0, kicks = 0, prims = 0;
+            uint64_t tex0 = 0, clutLoads = 0, uploads = 0, localCopies = 0;
+            uint64_t bigPrims = 0, badTex = 0, badTransfers = 0;
+            uint32_t maxPrimW = 0, maxPrimH = 0;
+        };
+        GifStats g_frameStats;  // the frame being built
+        GifStats g_windowStats; // since the last statsLine
+        uint64_t g_anomalyLogs = 0;
+        bool g_traceFrames = false;
+
+        struct GifRegShadow
+        {
+            uint32_t primType = 0;
+            uint32_t ctxt = 0;
+            uint64_t xyoffset[2] = {};
+            uint64_t trxreg = 0;
+            uint64_t bitbltbuf = 0;
+            int32_t vx[3] = {}, vy[3] = {};
+            uint32_t vcount = 0;
+        } g_shadow;
+
+        void logAnomaly(const char *what, uint64_t value)
+        {
+            if (g_anomalyLogs++ < 40u)
+                std::fprintf(stderr, "[pgs-gif] anomaly %s value=%016llx\n", what, static_cast<unsigned long long>(value));
+        }
+
+        void noteVertex(uint32_t x16, uint32_t y16, bool kick)
+        {
+            auto &sh = g_shadow;
+            const uint64_t ofs = sh.xyoffset[sh.ctxt & 1u];
+            const int32_t px = (static_cast<int32_t>(x16) - static_cast<int32_t>(ofs & 0xFFFFu)) >> 4;
+            const int32_t py = (static_cast<int32_t>(y16) - static_cast<int32_t>((ofs >> 32) & 0xFFFFu)) >> 4;
+            sh.vx[0] = sh.vx[1];
+            sh.vy[0] = sh.vy[1];
+            sh.vx[1] = sh.vx[2];
+            sh.vy[1] = sh.vy[2];
+            sh.vx[2] = px;
+            sh.vy[2] = py;
+            ++sh.vcount;
+            if (!kick)
+                return;
+            ++g_frameStats.kicks;
+            uint32_t need = 1u;
+            switch (sh.primType)
+            {
+            case 1: case 2: need = 2u; break;         // line, line strip
+            case 3: case 4: case 5: need = 3u; break; // triangle, strip, fan
+            case 6: need = 2u; break;                 // sprite
+            default: need = 1u; break;                // point
+            }
+            if (sh.vcount < need)
+                return;
+            if (sh.primType == 3u || sh.primType == 1u || sh.primType == 6u)
+                sh.vcount = 0;
+            ++g_frameStats.prims;
+            int32_t minX = sh.vx[2], maxX = sh.vx[2], minY = sh.vy[2], maxY = sh.vy[2];
+            for (uint32_t i = 3u - need; i < 3u; ++i)
+            {
+                minX = std::min(minX, sh.vx[i]);
+                maxX = std::max(maxX, sh.vx[i]);
+                minY = std::min(minY, sh.vy[i]);
+                maxY = std::max(maxY, sh.vy[i]);
+            }
+            const uint32_t w = static_cast<uint32_t>(maxX - minX), h = static_cast<uint32_t>(maxY - minY);
+            g_frameStats.maxPrimW = std::max(g_frameStats.maxPrimW, w);
+            g_frameStats.maxPrimH = std::max(g_frameStats.maxPrimH, h);
+            if (w > 2048u || h > 2048u)
+                ++g_frameStats.bigPrims;
+        }
+
+        void noteRegister(uint32_t reg, uint64_t value)
+        {
+            auto &sh = g_shadow;
+            switch (reg)
+            {
+            case 0x00: // PRIM
+                sh.primType = static_cast<uint32_t>(value & 7u);
+                sh.ctxt = static_cast<uint32_t>((value >> 9) & 1u);
+                sh.vcount = 0;
+                break;
+            case 0x04: case 0x05: // XYZF2 / XYZ2: vertex + kick
+                noteVertex(static_cast<uint32_t>(value & 0xFFFFu), static_cast<uint32_t>((value >> 16) & 0xFFFFu), true);
+                break;
+            case 0x0C: case 0x0D: // XYZF3 / XYZ3: vertex, no kick
+                noteVertex(static_cast<uint32_t>(value & 0xFFFFu), static_cast<uint32_t>((value >> 16) & 0xFFFFu), false);
+                break;
+            case 0x06: case 0x07: // TEX0_1 / TEX0_2
+            {
+                ++g_frameStats.tex0;
+                const uint32_t tw = static_cast<uint32_t>((value >> 26) & 0xFu);
+                const uint32_t th = static_cast<uint32_t>((value >> 30) & 0xFu);
+                if (((value >> 61) & 7u) != 0u)
+                    ++g_frameStats.clutLoads;
+                if (tw > 10u || th > 10u)
+                {
+                    ++g_frameStats.badTex;
+                    logAnomaly("TEX0 TW/TH > 10", value);
+                }
+                break;
+            }
+            case 0x18: case 0x19: // XYOFFSET_1 / _2
+                sh.xyoffset[reg - 0x18] = value;
+                break;
+            case 0x50:
+                sh.bitbltbuf = value;
+                break;
+            case 0x52:
+                sh.trxreg = value;
+                break;
+            case 0x53: // TRXDIR starts a transfer
+            {
+                const uint32_t dir = static_cast<uint32_t>(value & 3u);
+                const uint32_t rrw = static_cast<uint32_t>(sh.trxreg & 0xFFFu);
+                const uint32_t rrh = static_cast<uint32_t>((sh.trxreg >> 32) & 0xFFFu);
+                if (dir == 2u)
+                    ++g_frameStats.localCopies;
+                else
+                    ++g_frameStats.uploads;
+                const uint32_t dbw = static_cast<uint32_t>((sh.bitbltbuf >> 48) & 0x3Fu);
+                if (dir != 3u && (rrw == 0u || rrh == 0u || (dbw == 0u && dir != 1u)))
+                {
+                    ++g_frameStats.badTransfers;
+                    logAnomaly("TRXDIR with empty TRXREG or DBW=0, trxreg", sh.trxreg);
+                    logAnomaly("  ... bitbltbuf", sh.bitbltbuf);
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+
+        void analyzeGif(const uint8_t *data, size_t bytes)
+        {
+            size_t offset = 0u;
+            while (bytes - offset >= 16u)
+            {
+                uint64_t lo = 0u, regs = 0u;
+                std::memcpy(&lo, data + offset, 8u);
+                std::memcpy(&regs, data + offset + 8u, 8u);
+                const size_t packetBytes = gifPacketBytes(data + offset);
+                if (bytes - offset < packetBytes)
+                    break;
+                ++g_frameStats.packets;
+                g_frameStats.qwords += packetBytes / 16u;
+                const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+                const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
+                uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+                if (nreg == 0u)
+                    nreg = 16u;
+                if ((lo >> 46) & 1u) // PRE: the tag's PRIM field goes to PRIM
+                    noteRegister(0x00, (lo >> 47) & 0x7FFu);
+                const uint8_t *body = data + offset + 16u;
+                if (flg == 0u) // PACKED
+                {
+                    for (uint32_t loop = 0; loop < nloop; ++loop)
+                    {
+                        for (uint32_t r = 0; r < nreg; ++r)
+                        {
+                            const uint8_t *q = body + (static_cast<size_t>(loop) * nreg + r) * 16u;
+                            uint64_t qlo = 0u, qhi = 0u;
+                            std::memcpy(&qlo, q, 8u);
+                            std::memcpy(&qhi, q + 8u, 8u);
+                            const uint32_t desc = static_cast<uint32_t>((regs >> (4u * r)) & 0xFu);
+                            switch (desc)
+                            {
+                            case 0x0:
+                                noteRegister(0x00, qlo);
+                                break;
+                            case 0x4: // XYZF2 / XYZ2 packed: X bits 0-15, Y bits 32-47, ADC bit 111
+                            case 0x5:
+                                noteVertex(static_cast<uint32_t>(qlo & 0xFFFFu), static_cast<uint32_t>((qlo >> 32) & 0xFFFFu),
+                                           ((qhi >> 47) & 1u) == 0u);
+                                break;
+                            case 0xC: case 0xD:
+                                noteVertex(static_cast<uint32_t>(qlo & 0xFFFFu), static_cast<uint32_t>((qlo >> 32) & 0xFFFFu), false);
+                                break;
+                            case 0x6: case 0x7:
+                                noteRegister(desc, qlo);
+                                break;
+                            case 0xE: // A+D
+                                noteRegister(static_cast<uint32_t>(qhi & 0xFFu), qlo);
+                                break;
+                            default:
+                                break;
+                            }
+                        }
+                    }
+                }
+                else if (flg == 1u) // REGLIST
+                {
+                    const size_t words = static_cast<size_t>(nloop) * nreg;
+                    for (size_t i = 0; i < words; ++i)
+                    {
+                        uint64_t value = 0u;
+                        std::memcpy(&value, body + i * 8u, 8u);
+                        const uint32_t desc = static_cast<uint32_t>((regs >> (4u * (i % nreg))) & 0xFu);
+                        if (desc <= 0xDu)
+                            noteRegister(desc, value);
+                    }
+                }
+                else
+                {
+                    g_frameStats.imageQwords += nloop;
+                }
+                offset += packetBytes;
+            }
+        }
+
+        void endFrameStats()
+        {
+            auto &f = g_frameStats;
+            auto &w = g_windowStats;
+            if ((g_traceFrames && f.packets) || f.bigPrims || f.badTex || f.badTransfers)
+            {
+                if (g_traceFrames || g_anomalyLogs < 200u)
+                {
+                    ++g_anomalyLogs;
+                    std::fprintf(stderr,
+                                 "[pgs-gif] frame pkts=%llu qw=%llu imageQw=%llu kicks=%llu prims=%llu tex0=%llu clut=%llu "
+                                 "uploads=%llu copies=%llu maxPrim=%ux%u big=%llu badTex=%llu badXfer=%llu\n",
+                                 (unsigned long long)f.packets, (unsigned long long)f.qwords, (unsigned long long)f.imageQwords,
+                                 (unsigned long long)f.kicks, (unsigned long long)f.prims, (unsigned long long)f.tex0,
+                                 (unsigned long long)f.clutLoads, (unsigned long long)f.uploads, (unsigned long long)f.localCopies,
+                                 f.maxPrimW, f.maxPrimH, (unsigned long long)f.bigPrims, (unsigned long long)f.badTex,
+                                 (unsigned long long)f.badTransfers);
+                    std::fflush(stderr);
+                }
+            }
+            w.packets += f.packets;
+            w.qwords += f.qwords;
+            w.imageQwords += f.imageQwords;
+            w.kicks += f.kicks;
+            w.prims += f.prims;
+            w.tex0 += f.tex0;
+            w.clutLoads += f.clutLoads;
+            w.uploads += f.uploads;
+            w.localCopies += f.localCopies;
+            w.bigPrims += f.bigPrims;
+            w.badTex += f.badTex;
+            w.badTransfers += f.badTransfers;
+            w.maxPrimW = std::max(w.maxPrimW, f.maxPrimW);
+            w.maxPrimH = std::max(w.maxPrimH, f.maxPrimH);
+            f = GifStats{};
         }
 
         // The runtime's high-level libgraph stubs (sceGsResetGraph / sceGsSetDefDispEnv) program DISPLAY in
@@ -246,6 +499,8 @@ namespace ps2x::pgs
             return false;
         }
 
+        if (const char *trace = std::getenv("PS2X_PGS_TRACE"))
+            g_traceFrames = std::atoi(trace) != 0;
         state->signals.sink = sink;
         state->gs->set_signal_interface(&state->signals);
         g_state = state.release();
@@ -287,22 +542,53 @@ namespace ps2x::pgs
         const uint32_t index = pathIndex(path);
         std::vector<uint8_t> &pending = g_pendingGif[index];
         const auto *input = static_cast<const uint8_t *>(data);
-        if (pending.empty())
+        std::vector<uint8_t> joined;
+        if (!pending.empty())
         {
-            const size_t complete = completeGifBytes(input, bytes);
-            if (complete != 0u)
-                g_state->gs->gif_transfer(index, input, complete);
-            if (complete < bytes)
-                pending.assign(input + complete, input + bytes);
-            return;
+            joined.swap(pending);
+            joined.insert(joined.end(), input, input + bytes);
+            input = joined.data();
+            bytes = joined.size();
         }
-        pending.insert(pending.end(), input, input + bytes);
-        const size_t complete = completeGifBytes(pending.data(), pending.size());
+        const size_t complete = completeGifBytes(input, bytes);
         if (complete != 0u)
         {
-            g_state->gs->gif_transfer(index, pending.data(), complete);
-            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(complete));
+            analyzeGif(input, complete);
+            g_state->gs->gif_transfer(index, input, complete);
         }
+        if (complete == bytes)
+            return;
+
+        const uint8_t *rest = input + complete;
+        const size_t restBytes = bytes - complete;
+        uint64_t tagLo = 0u;
+        std::memcpy(&tagLo, rest, sizeof(tagLo));
+        const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 3u);
+        if (flg >= 2u)
+        {
+            // A partial IMAGE packet is sent on at once, re-tagged to the qwords present, the way the CPU
+            // renderer treats it. The rest of the image does not arrive raw: the VIF (DIRECT continuation)
+            // re-tags it as a new IMAGE packet. Keeping the old tag pending would read that new tag as pixels
+            // and shift the whole path by a qword, turning texture data into GS register writes.
+            const size_t imageQw = (restBytes - 16u) / 16u;
+            if (imageQw != 0u)
+            {
+                std::vector<uint8_t> partial(rest, rest + 16u + imageQw * 16u);
+                const uint64_t retagged = (tagLo & ~0x7FFFull) | static_cast<uint64_t>(imageQw);
+                std::memcpy(partial.data(), &retagged, sizeof(retagged));
+                analyzeGif(partial.data(), partial.size());
+                g_state->gs->gif_transfer(index, partial.data(), partial.size());
+            }
+            return;
+        }
+        // PACKED / REGLIST: wait for the rest (paraLLEl-GS needs whole loops). A packet that never completes
+        // within 4 MiB means the stream is out of step: drop it rather than parse everything after it as data.
+        if (restBytes > (4u << 20))
+        {
+            logAnomaly("dropped an incomplete GIF packet larger than 4 MiB, tag", tagLo);
+            return;
+        }
+        pending.assign(rest, rest + restBytes);
     }
 
     void writeRegister(uint32_t reg, uint64_t value)
@@ -391,6 +677,7 @@ namespace ps2x::pgs
         info.crtc_offsets = false;
         info.adapt_to_internal_horizontal_resolution = false;
 
+        endFrameStats();
         g_state->gs->flush();
         ParallelGS::ScanoutResult result = g_state->gs->vsync(info);
         if (!result.image)
@@ -449,15 +736,22 @@ namespace ps2x::pgs
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_state)
             return {};
-        char line[384];
+        char line[768];
         const double avg = g_state->scanoutSamples ? g_state->scanoutMs / g_state->scanoutSamples : 0.0;
         std::snprintf(line, sizeof(line),
-                      "pgs: %s frames=%llu gif=%lluK scanout=%ux%u %.2fms pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx",
+                      "pgs: %s frames=%llu gif=%lluK scanout=%ux%u %.2fms pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx"
+                      " | gifstats kicks=%llu prims=%llu tex0=%llu clut=%llu uploads=%llu copies=%llu maxPrim=%ux%u big=%llu badTex=%llu badXfer=%llu",
                       g_state->gpuName.c_str(), static_cast<unsigned long long>(g_state->frames),
                       static_cast<unsigned long long>(g_state->gifBytes / 1024u), g_state->lastWidth, g_state->lastHeight, avg,
                       static_cast<unsigned long long>(g_lastRegs.pmode), static_cast<unsigned long long>(g_lastRegs.smode2),
                       static_cast<unsigned long long>(g_lastRegs.dispfb1), static_cast<unsigned long long>(g_lastRegs.display1),
-                      static_cast<unsigned long long>(g_lastRegs.dispfb2), static_cast<unsigned long long>(g_lastRegs.display2));
+                      static_cast<unsigned long long>(g_lastRegs.dispfb2), static_cast<unsigned long long>(g_lastRegs.display2),
+                      (unsigned long long)g_windowStats.kicks, (unsigned long long)g_windowStats.prims,
+                      (unsigned long long)g_windowStats.tex0, (unsigned long long)g_windowStats.clutLoads,
+                      (unsigned long long)g_windowStats.uploads, (unsigned long long)g_windowStats.localCopies,
+                      g_windowStats.maxPrimW, g_windowStats.maxPrimH, (unsigned long long)g_windowStats.bigPrims,
+                      (unsigned long long)g_windowStats.badTex, (unsigned long long)g_windowStats.badTransfers);
+        g_windowStats = GifStats{};
         g_state->frames = 0;
         g_state->gifBytes = 0;
         g_state->scanoutMs = 0.0;

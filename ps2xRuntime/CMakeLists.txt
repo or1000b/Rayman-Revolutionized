@@ -389,6 +389,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_test_harness.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
@@ -460,6 +461,7 @@ if(PS2X_ENABLE_PARALLEL_GS AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
         SOURCE_SUBDIR ps2x-not-a-cmake-dir
     )
     FetchContent_MakeAvailable(ps2x_granite ps2x_parallel_gs)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchParallelGs.cmake")
 
     # The settings paraLLEl-GS uses for its standalone (library) build.
     set(GRANITE_FAST_MATH OFF CACHE BOOL "" FORCE)
@@ -487,7 +489,8 @@ if(PS2X_ENABLE_PARALLEL_GS AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_link_libraries(ps2x_pgs_bridge PRIVATE parallel-gs)
     target_compile_definitions(ps2x_pgs_bridge PRIVATE PS2X_HAS_PARALLEL_GS=1)
     if(MSVC)
-        target_compile_options(ps2x_pgs_bridge PRIVATE /DNOMINMAX)
+        target_compile_options(ps2x_pgs_bridge PRIVATE /DNOMINMAX /Z7)
+        target_compile_options(parallel-gs PRIVATE /Z7)
     endif()
     message(STATUS "GS renderer: paraLLEl-GS (GPU) enabled")
 else()
@@ -557,6 +560,9 @@ endif()
 
 if(MSVC)
     target_compile_options(ps2EntryRunner PRIVATE /FS)
+    # A PDB for the exe (link step only, the generated code is not recompiled) so the hang watchdog in
+    # ps2_test_harness.cpp can print function names. The GS bridge and paraLLEl-GS also get line info.
+    target_link_options(ps2EntryRunner PRIVATE /DEBUG:FULL /OPT:REF /OPT:NOICF)
 endif()
 
 target_include_directories(ps2_runtime PUBLIC

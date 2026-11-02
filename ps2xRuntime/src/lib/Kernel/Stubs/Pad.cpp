@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <map>
 #include <string>
+
+extern "C" uint16_t ps2xTestPadButtons(int port); // ps2_test_harness.cpp (scripted input for unattended runs)
 // --- Rayman debug: log the first calls of each libpad entry point to stderr ---
 namespace
 {
@@ -336,6 +338,7 @@ namespace ps2_stubs
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
+                state.buttons = static_cast<uint16_t>(state.buttons & ~ps2xTestPadButtons(port));
             }
 
             fillPadStatus(outData, state, portState);

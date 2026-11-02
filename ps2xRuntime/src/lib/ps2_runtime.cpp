@@ -35,6 +35,10 @@ extern "C" void ps2xRequestGsCapture();         // gs_cpu_backend.cpp
 extern "C" int ps2xGsStatsLine(char *buffer, int size);
 extern "C" int ps2xSpu2ReadSamples(int16_t *out, int frames); // ps2xIOP SPU2 output ring
 extern "C" int ps2xSpu2StatsLine(char *buffer, int size);
+extern "C" void ps2xTestHarnessStart();          // ps2_test_harness.cpp
+extern "C" bool ps2xTestHarnessTick(uint64_t tick);
+extern "C" void ps2xTestHarnessExiting();
+extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels);
 void ps2xInstallIopToEeRpcHooks(PS2Runtime *runtime);       // Kernel/Syscalls/RPC.cpp
 void ps2xInstallIopCdReader(bool install);                  // Kernel/Stubs/CD.cpp
 int ps2xIopToEeRpcStatsLine(char *buffer, int size);
@@ -546,6 +550,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
+    ps2xTestHarnessFrame(s_uploadBuffer.data(), std::min<uint32_t>(width, FB_WIDTH), std::min<uint32_t>(height, FB_HEIGHT), FB_WIDTH);
     UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
     outHeight = height;
@@ -818,7 +823,15 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        {
+            // ALWAYS_RUN: raylib otherwise parks the window thread in glfwWaitEvents while minimized, and with it
+            // GS scanout (the EE then blocks on the GS lock). Unattended test runs also leave the focus alone.
+            unsigned int windowFlags = FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN;
+            const char *testMode = std::getenv("PS2X_TEST_MODE");
+            if (testMode && std::atoi(testMode) != 0)
+                windowFlags |= FLAG_WINDOW_UNFOCUSED;
+            SetConfigFlags(windowFlags);
+        }
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -2540,6 +2553,7 @@ void PS2Runtime::run()
     uint32_t fpsFlips = 0;
     double gameFps = 0.0;
     auto fpsWindowStart = std::chrono::steady_clock::now();
+    ps2xTestHarnessStart();
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         {
@@ -2560,6 +2574,11 @@ void PS2Runtime::run()
         }
         {
             tick++;
+            if (ps2xTestHarnessTick(tick))
+            {
+                requestStop();
+                break;
+            }
             // Rayman bring-up: always report where the guest threads are (~every 2 s),
             // even with aggressive logs off. This is what tells us why a screen stays black.
             if ((tick % 120) == 0)
@@ -2667,6 +2686,7 @@ void PS2Runtime::run()
         }
     }
 
+    ps2xTestHarnessExiting();
     requestStop();
     if (gameThread.joinable())
     {
