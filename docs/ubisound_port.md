@@ -85,9 +85,13 @@ reference. Bank loading ("load" module + the SPU2 allocator) is where the bank's
 - Streams (from `[ubi-rpc]`, 2026-11-04): "load" command 6 registers a stream bank of `SOUND\VSC.BF` (in `{lsn, bytes}`, e.g.
   BNK_0.VSC at LSN 0x1e634b, 0x668000 bytes; `SOUND\VSC.DSC` lists the banks with offsets). "play" command 9 (0x103c: class lookup
   0x97cc, then class vtable +0x44) hands the driver one block: in `{class, instance, 0, bytes, lsn, bytes, 0x400}`, out `{class,
-  instance}`. In the menu the EE sends one ~55 KB block about every 2 s. A stream can also start with "play" command 2 carrying the
-  block descriptors (type word `02042256`: two channels), as at the first level's start; there the EE never sends a next block
-  (CLAUDE.md, Sound: background music missing). The IOP reads 9-sector chunks with sceCdRead + sceCdCallback meanwhile.
+  instance}`. A stream starts with "play" command 2 carrying the first two segment descriptors `{bytes, lsn, bytes, 0x400}` (type
+  word `02042256`); the EE sends the next one when the IOP reports a segment end through `io2e` (fn 0x30000, `{0, 4, EE record}`).
+  Menu segments are ~55 KB (~2.6 s), the first level's first segment ~2.2 MB (~40 s). The IOP reads 9-sector chunks with
+  sceCdRead + sceCdCallback into the voice ring buffers.
+- Voices: streams play on core 0 (ring buffers of 0x400 words from SPU2 0x2808, pitch 0x0759 = 22050 Hz, one voice per channel,
+  left / right by volume); bank sounds on core 1. Core 1 hears core 0 through its external input, scaled by core 1's AVOL (set to
+  full by the game). The native mixer must keep this routing.
 
 ### Oracle bugs found and fixed (2026-11-04)
 1. **SSA = 0**: the IOP ran RPC handlers synchronously with a 2M-instruction cap. Load command 2 (1.8 MiB by PIO)

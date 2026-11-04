@@ -4,7 +4,11 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
+
+extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
 // Must match ps2xIOP/src/emulator/services/iop_rpc.h.
 extern "C"
@@ -145,6 +149,26 @@ namespace
         if (posted < 12u)
             std::cerr << "[iop->ee] call sid=0x" << std::hex << sid << " fn=0x" << function << std::dec << " send=" << sendSize
                       << " recv=" << receiveSize << " thread=" << threadId << std::endl;
+        // PS2X_UBI_TRACE=1: every IOP->EE call with its payload (UBISOUND's io2e notifications: stream events ...).
+        static const bool ubiTrace = []()
+        {
+            const char *value = std::getenv("PS2X_UBI_TRACE");
+            return value && std::atoi(value) != 0;
+        }();
+        static std::atomic<uint32_t> s_traced{0u};
+        if (ubiTrace && send && s_traced.fetch_add(1u, std::memory_order_relaxed) < 4000u)
+        {
+            char words[160] = {};
+            int at = 0;
+            for (uint32_t i = 0; i + 4u <= sendSize && i < 32u && at < 150; i += 4u)
+            {
+                uint32_t word = 0u;
+                std::memcpy(&word, send + i, 4u);
+                at += std::snprintf(words + at, sizeof(words) - static_cast<size_t>(at), "%s%08x", i ? "_" : "", word);
+            }
+            std::fprintf(stderr, "[iop->ee] vsync %llu sid=0x%x fn=0x%x send=%u: %s\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), sid, function, sendSize, words);
+        }
         if (threadId > 0)
             (void)runtime->eeScheduler().wakeupThread(threadId, true);
         return 0;

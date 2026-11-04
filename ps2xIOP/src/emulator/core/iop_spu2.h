@@ -705,17 +705,21 @@ namespace ps2x::iop::detail
             }
             const bool admaPlaying = (core.admas & (1u << coreIndex)) != 0u;
 
+            // MMIX dry gates: 0x800/0x400 voices, 0x080/0x040 sound data input (AutoDMA), 0x008/0x004 external input
+            // (core 1: core 0's output). Volumes as on the hardware (PCSX2: ExtVol / InpVol): AVOL scales the external
+            // input, BVOL the sound data input. Swapping them muted core 0 (Rayman's music streams) on core 1, whose
+            // AVOL the game sets to full and BVOL to 0.
             const uint16_t mmix = core.mmix;
             int32_t mixL = 0, mixR = 0;
             if (mmix & 0x800u) mixL += dryL;
             if (mmix & 0x400u) mixR += dryR;
             if (admaPlaying)
             {
-                if (mmix & 0x080u) mixL += (inL * core.avolL) >> 15;
-                if (mmix & 0x040u) mixR += (inR * core.avolR) >> 15;
+                if (mmix & 0x080u) mixL += (inL * core.bvolL) >> 15;
+                if (mmix & 0x040u) mixR += (inR * core.bvolR) >> 15;
             }
-            if (mmix & 0x008u) mixL += (extL * core.bvolL) >> 15;
-            if (mmix & 0x004u) mixR += (extR * core.bvolR) >> 15;
+            if (mmix & 0x008u) mixL += (extL * core.avolL) >> 15;
+            if (mmix & 0x004u) mixR += (extR * core.avolR) >> 15;
 
             outL = (std::clamp(mixL, -32768, 32767) * core.mvolL) >> 15;
             outR = (std::clamp(mixR, -32768, 32767) * core.mvolR) >> 15;

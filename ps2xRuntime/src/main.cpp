@@ -241,10 +241,84 @@ namespace
     uint32_t readGuest32(const uint8_t *rdram, uint32_t address)
     {
         uint32_t value = 0u;
+        if (ps2IsScratchpadAddress(address))
+        {
+            if (const uint8_t *scratch = ps2GetScratchpadHostPtr())
+                std::memcpy(&value, scratch + (ps2ScratchpadOffset(address) & ~3u), sizeof(value));
+            return value;
+        }
         const uint32_t physical = address & 0x01FFFFFFu;
         if (physical <= PS2_RAM_SIZE - 4u)
             std::memcpy(&value, rdram + physical, sizeof(value));
         return value;
+    }
+
+    // EE side of UBISOUND's ADPCM streams (sndeetrans.c). Stream object: +0x0 flags (1 active, 4 playing, 0x20 fade done,
+    // 0x40 stopped), +0x4 "event from the IOP" (handled by 0x168CB8: segment-end callback +0x2C(+0x28), +0x1C next
+    // segment -> +0x18), +0xC / +0x10 IOP class / instance, +0x18 current segment (flags at +0x14, bit 5 = streamed).
+    // 0x169320 fn_bIsPlayingTdstAdpcmData(stream), 0x1697A0 fn_u32PushNextBlockResourceMemTdstAdpcmData(stream, fade,
+    // block) sends play command 9. PS2X_RAYMAN_MUSIC_TRACE=<from vsync> logs every change of an active stream's state from
+    // that guest VSync on (0 = from the start), every push and every IOP event.
+    constexpr uint32_t kRaymanAdpcmIsPlayingAddr = 0x00169320u, kRaymanAdpcmPushAddr = 0x001697A0u,
+                       kRaymanAdpcmEventAddr = 0x00168CB8u;
+    PS2Runtime::RecompiledFunction g_raymanAdpcmIsPlaying = nullptr, g_raymanAdpcmPush = nullptr, g_raymanAdpcmEvent = nullptr;
+
+    void logAdpcmStream(const char *what, const uint8_t *rdram, uint32_t stream, uint32_t ra, uint32_t result)
+    {
+        const uint32_t segment = readGuest32(rdram, stream + 0x18u);
+        std::fprintf(stderr,
+                     "[rayman-music] %s vsync %llu stream 0x%x flags=%x event=%x class/inst=%x/%x seg=0x%x (flags %x) next=0x%x "
+                     "cb=0x%x(0x%x) -> %x ra=0x%x\n",
+                     what, static_cast<unsigned long long>(ps2xGuestVsync()), stream, readGuest32(rdram, stream),
+                     readGuest32(rdram, stream + 4u), readGuest32(rdram, stream + 0xCu), readGuest32(rdram, stream + 0x10u),
+                     segment, segment ? readGuest32(rdram, segment + 0x14u) : 0u, readGuest32(rdram, stream + 0x1Cu),
+                     readGuest32(rdram, stream + 0x2Cu), readGuest32(rdram, stream + 0x28u), result, ra);
+    }
+
+    void raymanAdpcmIsPlayingTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        struct Last
+        {
+            uint32_t stream = 0, flags = 0, event = 0, segment = 0, result = 0;
+        };
+        static Last s_last[16];
+        static uint32_t s_logs = 0u;
+        const uint32_t stream = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        g_raymanAdpcmIsPlaying(rdram, ctx, runtime);
+        const uint32_t result = getRegU32(ctx, 2);
+        static const uint64_t fromVsync = std::strtoull(std::getenv("PS2X_RAYMAN_MUSIC_TRACE"), nullptr, 10);
+        Last &last = s_last[(stream >> 4) & 15u];
+        const Last now{stream, readGuest32(rdram, stream), readGuest32(rdram, stream + 4u), readGuest32(rdram, stream + 0x18u), result};
+        if ((now.flags & 1u) != 0u && ps2xGuestVsync() >= fromVsync &&
+            (now.stream != last.stream || now.flags != last.flags || now.event != last.event || now.segment != last.segment ||
+             now.result != last.result) && s_logs < 2000u)
+        {
+            ++s_logs;
+            last = now;
+            logAdpcmStream("isPlaying", rdram, stream, ra, result);
+        }
+    }
+
+    void raymanAdpcmPushTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u;
+        const uint32_t stream = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        g_raymanAdpcmPush(rdram, ctx, runtime);
+        if (s_logs++ < 1000u)
+            logAdpcmStream("push", rdram, stream, ra, getRegU32(ctx, 2));
+    }
+
+    void raymanAdpcmEventTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u;
+        static const uint64_t fromVsync = std::strtoull(std::getenv("PS2X_RAYMAN_MUSIC_TRACE"), nullptr, 10);
+        const uint32_t stream = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        const bool log = ps2xGuestVsync() >= fromVsync && s_logs++ < 1000u;
+        if (log)
+            logAdpcmStream("event before", rdram, stream, ra, 0u);
+        g_raymanAdpcmEvent(rdram, ctx, runtime);
+        if (log)
+            logAdpcmStream("event after ", rdram, stream, ra, 0u);
     }
 
     // 0x155698 builds the full-screen fade quad (vertex array at 0x36FFC0): f12 = alpha (0-255), f13 = grey level,
@@ -561,10 +635,11 @@ namespace
             const uint32_t result = getRegU32(ctx, 6), word = readGuest32(rdram, node + 4u);
             const uint32_t before0 = readGuest32(rdram, result), before1 = readGuest32(rdram, result + 4u);
             g_raymanNodeDispatch(rdram, ctx, runtime);
-            std::fprintf(stderr, "[rayman-ai-watch] vsync %llu actor 0x%x node 0x%x type %u depth %u param 0x%x | result %08x %08x -> %08x %08x | next 0x%x\n",
+            // Result record at a2 (often in the scratchpad): +0 value, +0xC value type (6 = integer / boolean).
+            std::fprintf(stderr, "[rayman-ai-watch] vsync %llu actor 0x%x node 0x%x type %u depth %u param 0x%x | result@%x %08x %08x -> %08x %08x (kind %u) | next 0x%x\n",
                          static_cast<unsigned long long>(vsync), slot.actor, node, word >> 24, (word >> 16) & 0xFFu,
-                         readGuest32(rdram, node), before0, before1, readGuest32(rdram, result), readGuest32(rdram, result + 4u),
-                         getRegU32(ctx, 2));
+                         readGuest32(rdram, node), result, before0, before1, readGuest32(rdram, result),
+                         readGuest32(rdram, result + 4u), readGuest32(rdram, result + 0xCu) & 0xFFu, getRegU32(ctx, 2));
             return;
         }
         g_raymanNodeDispatch(rdram, ctx, runtime);
@@ -611,6 +686,27 @@ namespace
             g_raymanNodeDispatch = runtime.lookupFunction(kRaymanNodeDispatchAddr);
             if (g_raymanNodeDispatch && runtime.registerFunction(kRaymanNodeDispatchAddr, &raymanNodeDispatchTrace))
                 std::cerr << "[hle] Rayman: AI node trace installed at 0x1DF760" << std::endl;
+        }
+
+        if (std::getenv("PS2X_RAYMAN_MUSIC_TRACE"))
+        {
+            uint32_t words[3] = {};
+            std::memcpy(&words[0], rdram + kRaymanAdpcmIsPlayingAddr, 4u);
+            std::memcpy(&words[1], rdram + kRaymanAdpcmPushAddr, 4u);
+            std::memcpy(&words[2], rdram + kRaymanAdpcmEventAddr, 4u);
+            // addiu sp,sp,-0x90 / -0x80 / -0x30
+            if (words[0] == 0x27BDFF70u && words[1] == 0x27BDFF80u && words[2] == 0x27BDFFD0u &&
+                runtime.hasFunction(kRaymanAdpcmIsPlayingAddr) && runtime.hasFunction(kRaymanAdpcmPushAddr) &&
+                runtime.hasFunction(kRaymanAdpcmEventAddr))
+            {
+                g_raymanAdpcmIsPlaying = runtime.lookupFunction(kRaymanAdpcmIsPlayingAddr);
+                g_raymanAdpcmPush = runtime.lookupFunction(kRaymanAdpcmPushAddr);
+                g_raymanAdpcmEvent = runtime.lookupFunction(kRaymanAdpcmEventAddr);
+                if (runtime.registerFunction(kRaymanAdpcmIsPlayingAddr, &raymanAdpcmIsPlayingTrace) &&
+                    runtime.registerFunction(kRaymanAdpcmPushAddr, &raymanAdpcmPushTrace) &&
+                    runtime.registerFunction(kRaymanAdpcmEventAddr, &raymanAdpcmEventTrace))
+                    std::cerr << "[hle] Rayman: ADPCM stream trace installed at 0x169320 / 0x1697A0 / 0x168CB8" << std::endl;
+            }
         }
 
         uint32_t fadeEntryWord = 0u;

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -45,8 +46,55 @@ namespace ps2x::iop::detail
         std::atomic<int32_t> g_statMvol{0};
         std::atomic<uint32_t> g_statMmix{0};
 
+        // PS2X_AUDIO_WAV=<file>: everything the SPU2 outputs (48 kHz stereo 16-bit), as a WAV file, independent of the
+        // host audio device. The header sizes are rewritten every second of audio, so a killed run still leaves a valid
+        // file. Game content (music, voices): keep it under out/, never commit it.
+        void captureAudio(const std::vector<int16_t> &samples)
+        {
+            static std::FILE *file = []() -> std::FILE *
+            {
+                const char *path = std::getenv("PS2X_AUDIO_WAV");
+                return path ? std::fopen(path, "wb") : nullptr;
+            }();
+            static uint64_t frames = 0u, sinceHeader = 0u;
+            if (!file)
+                return;
+            const auto writeHeader = [&]()
+            {
+                const uint32_t dataBytes = static_cast<uint32_t>(std::min<uint64_t>(frames * 4u, 0xFFFFFFF0u));
+                const uint32_t riffBytes = dataBytes + 36u, fmtBytes = 16u, rate = 48000u, byteRate = 48000u * 4u;
+                const uint16_t format = 1u, channels = 2u, align = 4u, bits = 16u;
+                std::fseek(file, 0, SEEK_SET);
+                std::fwrite("RIFF", 1u, 4u, file);
+                std::fwrite(&riffBytes, 4u, 1u, file);
+                std::fwrite("WAVEfmt ", 1u, 8u, file);
+                std::fwrite(&fmtBytes, 4u, 1u, file);
+                std::fwrite(&format, 2u, 1u, file);
+                std::fwrite(&channels, 2u, 1u, file);
+                std::fwrite(&rate, 4u, 1u, file);
+                std::fwrite(&byteRate, 4u, 1u, file);
+                std::fwrite(&align, 2u, 1u, file);
+                std::fwrite(&bits, 2u, 1u, file);
+                std::fwrite("data", 1u, 4u, file);
+                std::fwrite(&dataBytes, 4u, 1u, file);
+                std::fseek(file, 0, SEEK_END);
+            };
+            if (frames == 0u)
+                writeHeader();
+            std::fwrite(samples.data(), sizeof(int16_t), samples.size(), file);
+            frames += samples.size() / 2u;
+            sinceHeader += samples.size() / 2u;
+            if (sinceHeader >= 48000u)
+            {
+                sinceHeader = 0u;
+                writeHeader();
+                std::fflush(file);
+            }
+        }
+
         void pushAudio(const std::vector<int16_t> &samples)
         {
+            captureAudio(samples);
             const uint64_t frames = samples.size() / 2u;
             uint64_t w = g_audioRing.writeFrame.load(std::memory_order_relaxed);
             const uint64_t r = g_audioRing.readFrame.load(std::memory_order_acquire);

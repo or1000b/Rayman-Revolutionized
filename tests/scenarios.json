@@ -26,7 +26,7 @@
         { "type": "iopcd", "min_host": 1, "max_fail": 0, "label": "UBISOUND reads the disc through the host reader" },
         { "type": "deterministic", "label": "two runs with the same input end in the same state (EE RAM hash per second)" },
         { "type": "log_absent", "pattern": "\\[IOP\\] guest call 0x[0-9a-f]+ did not return", "label": "IOP calls (RPC handlers, callbacks) run to the end" },
-        { "type": "audio_peak", "after_tick": 600, "min": 2000, "label": "sound is audible" }
+        { "type": "audio_peak", "after_tick": 600, "min": 6000, "label": "music and effects are audible (effects alone peak at ~3300: core 0 streams must reach the output)" }
       ]
     },
     {
