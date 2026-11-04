@@ -522,6 +522,113 @@ namespace
         }
     }
 
+    // 0x101BF0(perso): one actor's frame. flags = ((perso+4)->+4)->+0x2C; the AI step 0x101A78 (reflex, then intelligence,
+    // each N frames: (perso+4)->+0 bytes +0xF2 period / +0xF3 counter) is skipped when (flags & 0x1800) == 0x1800, when
+    // flags & 0x10000, or when flags & 0x80000 with bit 7 of byte +0x34. PS2X_RAYMAN_ACTOR_TRACE="fromVsync,toVsync" logs every
+    // actor passing through, with those fields (bug hunt: CLAUDE.md issue 7, Rayman's AI does not run).
+    constexpr uint32_t kRaymanActorFrameAddr = 0x00101BF0u;
+    PS2Runtime::RecompiledFunction g_raymanActorFrame = nullptr;
+
+    // 0x101828: sector change. When the main character's current sector ([[0x252398]+4]+0x20 -> +0) differs from the
+    // previous one (gp-0x74C0), the active-actor lists are swapped, the new list is built from the new sector's activity
+    // (0x1016B0) and every actor left in the old list is deactivated (0x10BA78). Logged with PS2X_RAYMAN_ACTOR_TRACE.
+    constexpr uint32_t kRaymanSectorChangeAddr = 0x00101828u;
+    PS2Runtime::RecompiledFunction g_raymanSectorChange = nullptr;
+
+    void raymanSectorChangeTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u;
+        const uint32_t gp = getRegU32(ctx, 28);
+        const uint32_t before = readGuest32(rdram, gp - 0x74C0u);
+        g_raymanSectorChange(rdram, ctx, runtime);
+        const uint32_t after = readGuest32(rdram, gp - 0x74C0u);
+        if (before != after && s_logs < 200u)
+        {
+            ++s_logs;
+            const uint32_t main = readGuest32(rdram, 0x00252398u), sub = readGuest32(rdram, main + 4u);
+            std::fprintf(stderr, "[rayman-sector] vsync %llu main character 0x%x sector 0x%x -> 0x%x at %.2f %.2f %.2f\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), main, before, after, readGuestF32(rdram, sub + 0x74u),
+                         readGuestF32(rdram, sub + 0x78u), readGuestF32(rdram, sub + 0x7Cu));
+        }
+    }
+
+    // 0x214358(perso): the entrance trigger byte ([perso+4]+0x2A) read by AI function 0x2F. In the first level the
+    // director turns a code from the global perso 0x96BBD8 (105) into "entrance 5"; the marker actor then teleports Rayman
+    // there, out of the intro's sector, and the intro actors are deactivated (CLAUDE.md issue 7).
+    // PS2X_RAYMAN_EXPERIMENT_NO_ENTRANCE=<from vsync> makes the trigger read 0 from that guest VSync on (experiment only:
+    // does the intro then play? Earlier VSyncs matter: the menus use the same byte).
+    constexpr uint32_t kRaymanEntranceByteAddr = 0x00214358u;
+    PS2Runtime::RecompiledFunction g_raymanEntranceByte = nullptr;
+
+    void raymanEntranceByteExperiment(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_raymanEntranceByte(rdram, ctx, runtime);
+        static const uint64_t fromVsync = std::strtoull(std::getenv("PS2X_RAYMAN_EXPERIMENT_NO_ENTRANCE"), nullptr, 10);
+        if (getRegU32(ctx, 2) != 0u && ps2xGuestVsync() >= fromVsync)
+        {
+            static uint32_t s_logs = 0u;
+            if (s_logs++ < 20u)
+                std::fprintf(stderr, "[rayman-experiment] vsync %llu entrance trigger %u of perso 0x%x read as 0\n",
+                             static_cast<unsigned long long>(ps2xGuestVsync()), getRegU32(ctx, 2), getRegU32(ctx, 4));
+            setReturnU32(ctx, 0u);
+        }
+    }
+
+    // 0x1F5910: AI procedures 0xA6-0xA8 (0xA6(n, v): bit n-1 of an actor's flags word, engine+0x2C). With
+    // PS2X_RAYMAN_ACTOR_TRACE, every call is logged with the flags of Rayman (engine 0x9711B0 in the first level) before
+    // and after, the calling actor context and the node.
+    constexpr uint32_t kRaymanProcFlagsAddr = 0x001F5910u;
+    PS2Runtime::RecompiledFunction g_raymanProcFlags = nullptr;
+
+    void raymanProcFlagsTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u;
+        const uint32_t actor = getRegU32(ctx, 4), node = getRegU32(ctx, 5);
+        const uint32_t before = readGuest32(rdram, 0x009711B0u + 0x2Cu);
+        g_raymanProcFlags(rdram, ctx, runtime);
+        const uint32_t after = readGuest32(rdram, 0x009711B0u + 0x2Cu);
+        const uint64_t vsync = ps2xGuestVsync();
+        if ((before != after || (vsync >= 8300u && vsync <= 8400u)) && s_logs < 300u)
+        {
+            ++s_logs;
+            std::fprintf(stderr, "[rayman-flags] vsync %llu proc 0x%x node 0x%x (args %x %x | %x %x) from actor 0x%x: rayman flags %08x -> %08x\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), readGuest32(rdram, node - 8u) & 0xFFFFu, node,
+                         readGuest32(rdram, node), readGuest32(rdram, node + 4u), readGuest32(rdram, node + 8u),
+                         readGuest32(rdram, node + 12u), actor, before, after);
+        }
+    }
+
+    void raymanActorFrameTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const auto window = []()
+        {
+            std::array<unsigned long long, 2> w{0u, 0u};
+            if (const char *text = std::getenv("PS2X_RAYMAN_ACTOR_TRACE"))
+                std::sscanf(text, "%llu,%llu", &w[0], &w[1]);
+            return w;
+        }();
+        const uint64_t vsync = ps2xGuestVsync();
+        if (vsync >= window[0] && vsync <= window[1])
+        {
+            const uint32_t perso = getRegU32(ctx, 4);
+            const uint32_t sub = readGuest32(rdram, perso + 4u);
+            const uint32_t stdGame = readGuest32(rdram, sub), engine = readGuest32(rdram, sub + 4u);
+            const uint32_t flags = readGuest32(rdram, engine + 0x2Cu), byte34 = readGuest32(rdram, engine + 0x34u) & 0xFFu;
+            const uint32_t periods = readGuest32(rdram, stdGame + 0xF0u);
+            // Position: the translation of the perso's matrix at sub+0x74 (x, y, z; Z up).
+            std::fprintf(stderr,
+                         "[rayman-actor] vsync %llu perso 0x%x sub 0x%x std 0x%x (period %u counter %d) engine 0x%x flags %08x byte34 %02x "
+                         "pos %.2f %.2f %.2f brain 0x%x -> AI %s\n",
+                         static_cast<unsigned long long>(vsync), perso, sub, stdGame, (periods >> 16) & 0xFFu,
+                         static_cast<int8_t>(periods >> 24), engine, flags, byte34, readGuestF32(rdram, sub + 0x74u),
+                         readGuestF32(rdram, sub + 0x78u), readGuestF32(rdram, sub + 0x7Cu), readGuest32(rdram, sub + 0xCu),
+                         ((flags & 0x1800u) == 0x1800u || (flags & 0x10000u) != 0u || ((flags & 0x80000u) != 0u && (byte34 & 0x80u) != 0u))
+                             ? "skipped"
+                             : "runs");
+        }
+        g_raymanActorFrame(rdram, ctx, runtime);
+    }
+
     void raymanEvalTreeGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t node = getRegU32(ctx, 5);
@@ -617,16 +724,17 @@ namespace
         slot.node = node;
         slot.type = node >= 0x00100000u ? (readGuest32(rdram, node + 4u) >> 24) : 0xFFu;
 
-        // PS2X_RAYMAN_AI_WATCH="lo,hi,fromVsync,toVsync": log every node in [lo, hi) dispatched between those guest
-        // VSyncs (node, type, depth, param, a2 result buffer before / after, next node). Bug hunt: which branch of a
-        // script runs and what its conditions return (CLAUDE.md issue 7: the camera script that keeps the level black).
+        // PS2X_RAYMAN_AI_WATCH="lo,hi,fromVsync,toVsync[,addr]": log every node in [lo, hi) dispatched between those guest
+        // VSyncs (node, type, depth, param, a2 result buffer before / after, next node, and the 3 floats at addr after the
+        // node, e.g. an actor's position). Bug hunt: which branch of a script runs, what its conditions return, and which
+        // node changes a value (CLAUDE.md issue 7).
         static const auto watch = []()
         {
-            std::array<uint64_t, 4> w{0u, 0u, 0u, 0u};
+            std::array<uint64_t, 5> w{0u, 0u, 0u, 0u, 0u};
             if (const char *text = std::getenv("PS2X_RAYMAN_AI_WATCH"))
-                std::sscanf(text, "%llx,%llx,%llu,%llu", reinterpret_cast<unsigned long long *>(&w[0]),
+                std::sscanf(text, "%llx,%llx,%llu,%llu,%llx", reinterpret_cast<unsigned long long *>(&w[0]),
                             reinterpret_cast<unsigned long long *>(&w[1]), reinterpret_cast<unsigned long long *>(&w[2]),
-                            reinterpret_cast<unsigned long long *>(&w[3]));
+                            reinterpret_cast<unsigned long long *>(&w[3]), reinterpret_cast<unsigned long long *>(&w[4]));
             return w;
         }();
         const uint64_t vsync = watch[1] != 0u ? ps2xGuestVsync() : 0u;
@@ -636,10 +744,14 @@ namespace
             const uint32_t before0 = readGuest32(rdram, result), before1 = readGuest32(rdram, result + 4u);
             g_raymanNodeDispatch(rdram, ctx, runtime);
             // Result record at a2 (often in the scratchpad): +0 value, +0xC value type (6 = integer / boolean).
-            std::fprintf(stderr, "[rayman-ai-watch] vsync %llu actor 0x%x node 0x%x type %u depth %u param 0x%x | result@%x %08x %08x -> %08x %08x (kind %u) | next 0x%x\n",
+            const uint32_t at = static_cast<uint32_t>(watch[4]);
+            std::fprintf(stderr, "[rayman-ai-watch] vsync %llu actor 0x%x node 0x%x type %u depth %u param 0x%x | result@%x %08x %08x -> %08x %08x (kind %u) | next 0x%x | @%x %.2f %.2f %.2f (%08x %08x %08x)\n",
                          static_cast<unsigned long long>(vsync), slot.actor, node, word >> 24, (word >> 16) & 0xFFu,
                          readGuest32(rdram, node), result, before0, before1, readGuest32(rdram, result),
-                         readGuest32(rdram, result + 4u), readGuest32(rdram, result + 0xCu) & 0xFFu, getRegU32(ctx, 2));
+                         readGuest32(rdram, result + 4u), readGuest32(rdram, result + 0xCu) & 0xFFu, getRegU32(ctx, 2), at,
+                         at ? readGuestF32(rdram, at) : 0.0f, at ? readGuestF32(rdram, at + 4u) : 0.0f,
+                         at ? readGuestF32(rdram, at + 8u) : 0.0f, at ? readGuest32(rdram, at) : 0u,
+                         at ? readGuest32(rdram, at + 4u) : 0u, at ? readGuest32(rdram, at + 8u) : 0u);
             return;
         }
         g_raymanNodeDispatch(rdram, ctx, runtime);
@@ -686,6 +798,45 @@ namespace
             g_raymanNodeDispatch = runtime.lookupFunction(kRaymanNodeDispatchAddr);
             if (g_raymanNodeDispatch && runtime.registerFunction(kRaymanNodeDispatchAddr, &raymanNodeDispatchTrace))
                 std::cerr << "[hle] Rayman: AI node trace installed at 0x1DF760" << std::endl;
+        }
+
+        uint32_t entranceWord = 0u;
+        std::memcpy(&entranceWord, rdram + kRaymanEntranceByteAddr, sizeof(entranceWord));
+        // lw v1,4(a0)
+        if (std::getenv("PS2X_RAYMAN_EXPERIMENT_NO_ENTRANCE") && entranceWord == 0x8C830004u &&
+            runtime.hasFunction(kRaymanEntranceByteAddr))
+        {
+            g_raymanEntranceByte = runtime.lookupFunction(kRaymanEntranceByteAddr);
+            if (g_raymanEntranceByte && runtime.registerFunction(kRaymanEntranceByteAddr, &raymanEntranceByteExperiment))
+                std::cerr << "[hle] Rayman: EXPERIMENT entrance trigger forced to 0 at 0x214358" << std::endl;
+        }
+
+        uint32_t actorFrameWord = 0u;
+        std::memcpy(&actorFrameWord, rdram + kRaymanActorFrameAddr, sizeof(actorFrameWord));
+        // addiu sp,sp,-0x20
+        if (std::getenv("PS2X_RAYMAN_ACTOR_TRACE") && actorFrameWord == 0x27BDFFE0u && runtime.hasFunction(kRaymanActorFrameAddr))
+        {
+            g_raymanActorFrame = runtime.lookupFunction(kRaymanActorFrameAddr);
+            if (g_raymanActorFrame && runtime.registerFunction(kRaymanActorFrameAddr, &raymanActorFrameTrace))
+                std::cerr << "[hle] Rayman: actor frame trace installed at 0x101BF0" << std::endl;
+            uint32_t sectorWord = 0u;
+            std::memcpy(&sectorWord, rdram + kRaymanSectorChangeAddr, sizeof(sectorWord));
+            // addiu sp,sp,-0x20
+            if (sectorWord == 0x27BDFFE0u && runtime.hasFunction(kRaymanSectorChangeAddr))
+            {
+                g_raymanSectorChange = runtime.lookupFunction(kRaymanSectorChangeAddr);
+                if (g_raymanSectorChange && runtime.registerFunction(kRaymanSectorChangeAddr, &raymanSectorChangeTrace))
+                    std::cerr << "[hle] Rayman: sector change trace installed at 0x101828" << std::endl;
+            }
+            uint32_t procWord = 0u;
+            std::memcpy(&procWord, rdram + kRaymanProcFlagsAddr, sizeof(procWord));
+            // addiu sp,sp,-0x70
+            if (procWord == 0x27BDFF90u && runtime.hasFunction(kRaymanProcFlagsAddr))
+            {
+                g_raymanProcFlags = runtime.lookupFunction(kRaymanProcFlagsAddr);
+                if (g_raymanProcFlags && runtime.registerFunction(kRaymanProcFlagsAddr, &raymanProcFlagsTrace))
+                    std::cerr << "[hle] Rayman: flag procedure trace installed at 0x1F5910" << std::endl;
+            }
         }
 
         if (std::getenv("PS2X_RAYMAN_MUSIC_TRACE"))
