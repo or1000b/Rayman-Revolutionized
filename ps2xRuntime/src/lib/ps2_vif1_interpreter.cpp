@@ -1,5 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <cstdio>
 #include <cstring>
 
 // ---------------------------------------------------------------------------
@@ -483,7 +484,34 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 uint32_t copyBytes = mpgBytes;
                 if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
+                const bool whole = pos + copyBytes <= sizeBytes;
+                // Bug hunt (Z range): which microcode reaches VU1. RenderWare's 16-bit-Z and 24-bit-Z pipelines differ
+                // at instruction 12 (16-bit: an I-bit pair, lower word 0x46800000).
+                // One line per distinct upload (destination, size, pair 12), plus every dropped one.
+                static uint32_t s_mpgLogs = 0u;
+                static uint64_t s_mpgSeen[256]{};
+                static uint32_t s_mpgSeenCount = 0u;
+                uint32_t lower12 = 0u, upper12 = 0u;
+                if (pos + 13u * 8u <= sizeBytes)
+                {
+                    std::memcpy(&lower12, data + pos + 12u * 8u, 4u);
+                    std::memcpy(&upper12, data + pos + 12u * 8u + 4u, 4u);
+                }
+                const uint64_t key = (static_cast<uint64_t>(destAddr) << 48) ^ (static_cast<uint64_t>(instructionCount) << 36) ^
+                                     (static_cast<uint64_t>(lower12) << 16) ^ upper12;
+                bool seen = false;
+                for (uint32_t k = 0; k < s_mpgSeenCount; ++k)
+                    seen = seen || s_mpgSeen[k] == key;
+                if ((!seen || !whole) && s_mpgLogs < 300u)
+                {
+                    ++s_mpgLogs;
+                    if (!seen && s_mpgSeenCount < 256u)
+                        s_mpgSeen[s_mpgSeenCount++] = key;
+                    std::fprintf(stderr, "[vif1-mpg] dest=%#x instructions=%u bytes available=%u of %u%s pair12=%08x %08x\n", destAddr,
+                                 instructionCount, sizeBytes > pos ? sizeBytes - pos : 0u, copyBytes,
+                                 whole ? "" : " DROPPED (split across VIF chunks)", lower12, upper12);
+                }
+                if (whole)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();

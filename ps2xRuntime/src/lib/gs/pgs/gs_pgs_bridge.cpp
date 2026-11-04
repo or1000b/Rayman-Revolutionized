@@ -30,6 +30,7 @@ namespace ps2x::pgs
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -159,10 +160,155 @@ namespace ps2x::pgs
             uint32_t ctxt = 0;
             uint64_t xyoffset[2] = {};
             uint64_t trxreg = 0;
+            uint64_t trxpos = 0;
             uint64_t bitbltbuf = 0;
             int32_t vx[3] = {}, vy[3] = {};
+            uint32_t vz = 0;
+            float s = 0.0f, t = 0.0f, q = 1.0f;
+            float vu[3] = {}, vv[3] = {};
             uint32_t vcount = 0;
+            // For the screen-covering primitive report.
+            uint64_t prim = 0;
+            uint32_t rgba = 0;
+            uint64_t alpha[2] = {};
+            uint64_t frame[2] = {};
+            uint64_t tex0[2] = {};
+            uint64_t test[2] = {};
+            uint64_t zbuf[2] = {};
+            uint64_t tex1[2] = {};
+            uint64_t miptbp1[2] = {};
         } g_shadow;
+        // TEX1 / MIPTBP1 / TEX0 combinations used by world draws (textured, no Cd*As) in report frames, with counts.
+        struct TexState
+        {
+            uint64_t tex1, miptbp1, tex0;
+            uint64_t count;
+        };
+        TexState g_texStates[16] = {};
+        uint32_t g_texStateCount = 0;
+        // Every primitive of a report frame, grouped by (type, ctxt, TME, ABE, ALPHA, FBMSK): count, screen area
+        // (bounding box clipped to 640x512, halved for triangles) and the last vertex colour seen.
+        struct BlendGroup
+        {
+            uint64_t key;
+            uint64_t count;
+            double area;
+            uint32_t rgba;
+            uint64_t frame;
+        };
+        BlendGroup g_blendGroups[48] = {};
+        uint32_t g_blendGroupCount = 0;
+        // Screen area (pixels, bounding boxes clipped to 640x512) drawn by "Cd * As" multiply passes this frame,
+        // and the TEST / ZBUF state of the last one.
+        uint64_t g_multiplyArea = 0;
+        uint64_t g_multiplyPrims = 0;
+        uint64_t g_multiplyTest = 0, g_multiplyZbuf = 0, g_multiplyFrame = 0;
+        // [0] = world (textured, no Cd*As blending), [1] = multiply passes: Z range and distinct Z values seen.
+        uint32_t g_zMin[2] = {0xFFFFFFFFu, 0xFFFFFFFFu}, g_zMax[2] = {};
+        uint64_t g_zCount[2] = {}, g_zZero[2] = {};
+        // Z buckets per pass kind: <= 0xFFFF, <= 0xFFFFF, larger.
+        uint64_t g_zHist[2][3] = {};
+        // Texture coordinates of textured, non-FST world primitives (no Cd*As blend) in report frames.
+        struct StqStats
+        {
+            uint64_t verts = 0, qZero = 0, qNeg = 0, tris = 0, flatTris = 0;
+            float qMin = 1e30f, qMax = -1e30f, uMin = 1e30f, uMax = -1e30f, vMin = 1e30f, vMax = -1e30f;
+        } g_stq;
+        uint64_t g_worldTest = 0, g_worldZbuf = 0;
+        uint64_t g_frameNumber = 0;
+        uint32_t g_coverLogsThisFrame = 0;
+        uint64_t g_coverLogs = 0;
+        // Vertex colour histogram of the frame: [textured][max(R,G,B) bucket 0-7 / 8-31 / 32-95 / 96+].
+        uint64_t g_colourHist[2][4] = {};
+
+        // PS2X_PGS_COVER_FROM=<frame>: first frame of the report (frames ~ guest VSyncs); every 120th frame after it.
+        uint64_t coverFrom()
+        {
+            static const uint64_t from = []()
+            {
+                const char *value = std::getenv("PS2X_PGS_COVER_FROM");
+                return value ? std::strtoull(value, nullptr, 10) : 0ull;
+            }();
+            return from;
+        }
+
+        bool coverFrame()
+        {
+            return g_frameNumber >= coverFrom() && ((g_frameNumber - coverFrom()) % 120u) == 0u;
+        }
+
+        // Bug hunt (dark lightmap passes): host->local uploads into GS blocks PS2X_PGS_WATCH_LO..HI (default
+        // 0x3800..0x3a40, the level's T8 lightmaps and their CLUT), from frame PS2X_PGS_COVER_FROM on, with value
+        // statistics of the uploaded data.
+        struct UploadWatch
+        {
+            bool active = false;
+            uint32_t dbp = 0, dbw = 0, dpsm = 0, rrw = 0, rrh = 0, dx = 0, dy = 0;
+            uint64_t expect = 0, got = 0;
+            uint32_t minB = 255, maxB = 0, minA = 255, maxA = 0;
+            uint64_t sumB = 0, sumA = 0, countA = 0;
+            uint32_t first[4] = {};
+        } g_upload;
+        uint32_t g_uploadLogs = 0;
+
+        uint32_t watchBound(const char *name, uint32_t fallback)
+        {
+            const char *value = std::getenv(name);
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : fallback;
+        }
+
+        uint32_t psmBits(uint32_t psm)
+        {
+            switch (psm)
+            {
+            case 0x00: case 0x30: return 32u;
+            case 0x01: case 0x31: return 24u;
+            case 0x02: case 0x0A: case 0x32: case 0x3A: return 16u;
+            case 0x13: return 8u;
+            case 0x14: return 4u;
+            default: return 32u;
+            }
+        }
+
+        void finishUploadWatch()
+        {
+            auto &u = g_upload;
+            std::fprintf(stderr,
+                         "[pgs-upload] frame %llu dbp=%#x dbw=%u dpsm=%#x at %u,%u size %ux%u bytes %llu/%llu byte min/avg/max %u/%.1f/%u "
+                         "alpha(byte 3 of 4) min/avg/max %u/%.1f/%u first %08x %08x %08x %08x\n",
+                         (unsigned long long)g_frameNumber, u.dbp, u.dbw, u.dpsm, u.dx, u.dy, u.rrw, u.rrh, (unsigned long long)u.got,
+                         (unsigned long long)u.expect, u.minB, u.got ? double(u.sumB) / double(u.got) : 0.0, u.maxB, u.minA,
+                         u.countA ? double(u.sumA) / double(u.countA) : 0.0, u.maxA, u.first[0], u.first[1], u.first[2], u.first[3]);
+            u.active = false;
+        }
+
+        void noteImageData(const uint8_t *data, size_t bytes)
+        {
+            auto &u = g_upload;
+            if (!u.active)
+                return;
+            const size_t take = static_cast<size_t>(std::min<uint64_t>(bytes, u.expect - u.got));
+            for (size_t i = 0; i < take; ++i)
+            {
+                const uint64_t at = u.got + i;
+                const uint32_t b = data[i];
+                u.minB = std::min(u.minB, b);
+                u.maxB = std::max(u.maxB, b);
+                u.sumB += b;
+                if ((at & 3u) == 3u)
+                {
+                    u.minA = std::min(u.minA, b);
+                    u.maxA = std::max(u.maxA, b);
+                    u.sumA += b;
+                    ++u.countA;
+                }
+                if (at < 16u)
+                    u.first[at / 4u] |= b << (8u * (at % 4u));
+            }
+            u.got += take;
+            if (u.got >= u.expect)
+                finishUploadWatch();
+        }
 
         void logAnomaly(const char *what, uint64_t value)
         {
@@ -170,9 +316,20 @@ namespace ps2x::pgs
                 std::fprintf(stderr, "[pgs-gif] anomaly %s value=%016llx\n", what, static_cast<unsigned long long>(value));
         }
 
-        void noteVertex(uint32_t x16, uint32_t y16, bool kick)
+        void noteVertex(uint32_t x16, uint32_t y16, bool kick, uint32_t z = 0)
         {
             auto &sh = g_shadow;
+            sh.vz = z;
+            {
+                const float q = sh.q;
+                const float u = q != 0.0f ? sh.s / q : 0.0f, v = q != 0.0f ? sh.t / q : 0.0f;
+                sh.vu[0] = sh.vu[1];
+                sh.vv[0] = sh.vv[1];
+                sh.vu[1] = sh.vu[2];
+                sh.vv[1] = sh.vv[2];
+                sh.vu[2] = u;
+                sh.vv[2] = v;
+            }
             const uint64_t ofs = sh.xyoffset[sh.ctxt & 1u];
             const int32_t px = (static_cast<int32_t>(x16) - static_cast<int32_t>(ofs & 0xFFFFu)) >> 4;
             const int32_t py = (static_cast<int32_t>(y16) - static_cast<int32_t>((ofs >> 32) & 0xFFFFu)) >> 4;
@@ -212,6 +369,110 @@ namespace ps2x::pgs
             g_frameStats.maxPrimH = std::max(g_frameStats.maxPrimH, h);
             if (w > 2048u || h > 2048u)
                 ++g_frameStats.bigPrims;
+
+            if (coverFrame())
+            {
+                const uint32_t c = sh.ctxt & 1u;
+                const uint64_t key = (static_cast<uint64_t>(sh.primType) << 60) | (static_cast<uint64_t>(c) << 59) |
+                                     (static_cast<uint64_t>((sh.prim >> 4) & 1u) << 58) | (static_cast<uint64_t>((sh.prim >> 6) & 1u) << 57) |
+                                     ((sh.alpha[c] & 0xFFull) << 40) | ((sh.alpha[c] >> 32) & 0xFFull) << 32 | (sh.frame[c] >> 32);
+                const int32_t x0 = std::max(minX, 0), x1 = std::min(maxX, 640), y0 = std::max(minY, 0), y1 = std::min(maxY, 512);
+                const double area = (x1 > x0 && y1 > y0) ? double(x1 - x0) * double(y1 - y0) / (sh.primType == 6u ? 1.0 : 2.0) : 0.0;
+                bool found = false;
+                for (uint32_t i = 0; i < g_blendGroupCount && !found; ++i)
+                {
+                    if (g_blendGroups[i].key == key)
+                    {
+                        ++g_blendGroups[i].count;
+                        g_blendGroups[i].area += area;
+                        g_blendGroups[i].rgba = sh.rgba;
+                        found = true;
+                    }
+                }
+                if (!found && g_blendGroupCount < 48u)
+                    g_blendGroups[g_blendGroupCount++] = BlendGroup{key, 1u, area, sh.rgba, sh.frame[c]};
+            }
+
+            // Bug hunt (black level after the intro): primitives that cover most of a 640x448 screen, with the state
+            // that decides what they do to the picture (colour, blending, texture), every 120th frame.
+            if (coverFrame() && ((sh.prim >> 4) & 1u) != 0u)
+            {
+                const bool multiply = ((sh.prim >> 6) & 1u) != 0u && (sh.alpha[sh.ctxt & 1u] & 0xFFu) == 0x89u;
+                const int k = multiply ? 1 : 0;
+                g_zMin[k] = std::min(g_zMin[k], sh.vz);
+                g_zMax[k] = std::max(g_zMax[k], sh.vz);
+                ++g_zCount[k];
+                g_zZero[k] += sh.vz == 0u ? 1u : 0u;
+                ++g_zHist[k][sh.vz <= 0xFFFFu ? 0 : sh.vz <= 0xFFFFFu ? 1 : 2];
+                if (!multiply)
+                {
+                    const uint32_t c = sh.ctxt & 1u;
+                    bool found = false;
+                    for (uint32_t i = 0; i < g_texStateCount && !found; ++i)
+                    {
+                        auto &ts = g_texStates[i];
+                        if (ts.tex1 == sh.tex1[c] && ts.miptbp1 == sh.miptbp1[c] && (ts.tex0 & 0x3FFFu) == (sh.tex0[c] & 0x3FFFu))
+                        {
+                            ++ts.count;
+                            found = true;
+                        }
+                    }
+                    if (!found && g_texStateCount < 16u)
+                        g_texStates[g_texStateCount++] = TexState{sh.tex1[c], sh.miptbp1[c], sh.tex0[c], 1u};
+                    g_worldTest = sh.test[sh.ctxt & 1u];
+                    g_worldZbuf = sh.zbuf[sh.ctxt & 1u];
+                    if (((sh.prim >> 8) & 1u) == 0u) // STQ, not UV
+                    {
+                        auto &st = g_stq;
+                        ++st.verts;
+                        st.qZero += sh.q == 0.0f ? 1u : 0u;
+                        st.qNeg += sh.q < 0.0f ? 1u : 0u;
+                        st.qMin = std::min(st.qMin, sh.q);
+                        st.qMax = std::max(st.qMax, sh.q);
+                        st.uMin = std::min(st.uMin, sh.vu[2]);
+                        st.uMax = std::max(st.uMax, sh.vu[2]);
+                        st.vMin = std::min(st.vMin, sh.vv[2]);
+                        st.vMax = std::max(st.vMax, sh.vv[2]);
+                        if (sh.primType >= 3u && sh.primType <= 5u)
+                        {
+                            ++st.tris;
+                            const float du = std::max(std::fabs(sh.vu[0] - sh.vu[2]), std::fabs(sh.vu[1] - sh.vu[2]));
+                            const float dv = std::max(std::fabs(sh.vv[0] - sh.vv[2]), std::fabs(sh.vv[1] - sh.vv[2]));
+                            st.flatTris += (du < 1e-4f && dv < 1e-4f) ? 1u : 0u;
+                        }
+                    }
+                }
+            }
+            if (coverFrame() && ((sh.prim >> 6) & 1u) != 0u && (sh.alpha[sh.ctxt & 1u] & 0xFFu) == 0x89u)
+            {
+                const int32_t x0 = std::max(minX, 0), x1 = std::min(maxX, 640), y0 = std::max(minY, 0), y1 = std::min(maxY, 512);
+                if (x1 > x0 && y1 > y0)
+                    g_multiplyArea += static_cast<uint64_t>(x1 - x0) * static_cast<uint64_t>(y1 - y0) / (sh.primType == 6u ? 1u : 2u);
+                ++g_multiplyPrims;
+                g_multiplyTest = sh.test[sh.ctxt & 1u];
+                g_multiplyZbuf = sh.zbuf[sh.ctxt & 1u];
+                g_multiplyFrame = sh.frame[sh.ctxt & 1u];
+            }
+            if (coverFrame())
+            {
+                const uint32_t r = sh.rgba & 0xFFu, g = (sh.rgba >> 8) & 0xFFu, b = (sh.rgba >> 16) & 0xFFu;
+                const uint32_t m = std::max(r, std::max(g, b));
+                ++g_colourHist[(sh.prim >> 4) & 1u][m < 8u ? 0 : m < 32u ? 1 : m < 96u ? 2 : 3];
+            }
+            if (w >= 500u && h >= 350u && w <= 2048u && h <= 2048u && coverFrame() &&
+                g_coverLogsThisFrame < 8u && g_coverLogs < 600u)
+            {
+                ++g_coverLogsThisFrame;
+                ++g_coverLogs;
+                const uint32_t c = sh.ctxt & 1u;
+                std::fprintf(stderr,
+                             "[pgs-cover] frame %llu prim=%03llx (type %u tme %u abe %u fst %u ctxt %u) box=%d,%d..%d,%d rgba=%08x "
+                             "alpha=%010llx frame=%llx tex0=%016llx\n",
+                             (unsigned long long)g_frameNumber, (unsigned long long)(sh.prim & 0x7FFu), sh.primType,
+                             (unsigned)((sh.prim >> 4) & 1u), (unsigned)((sh.prim >> 6) & 1u), (unsigned)((sh.prim >> 8) & 1u), c,
+                             minX, minY, maxX, maxY, sh.rgba, (unsigned long long)sh.alpha[c], (unsigned long long)sh.frame[c],
+                             (unsigned long long)sh.tex0[c]);
+            }
         }
 
         void deterministicSignal(uint32_t reg, uint64_t value)
@@ -235,16 +496,51 @@ namespace ps2x::pgs
             case 0x00: // PRIM
                 sh.primType = static_cast<uint32_t>(value & 7u);
                 sh.ctxt = static_cast<uint32_t>((value >> 9) & 1u);
+                sh.prim = value;
                 sh.vcount = 0;
                 break;
+            case 0x01: // RGBAQ (Q = bits 32-63)
+            {
+                sh.rgba = static_cast<uint32_t>(value);
+                const uint32_t qBits = static_cast<uint32_t>(value >> 32);
+                std::memcpy(&sh.q, &qBits, 4u);
+                break;
+            }
+            case 0x02: // ST
+            {
+                const uint32_t sBits = static_cast<uint32_t>(value), tBits = static_cast<uint32_t>(value >> 32);
+                std::memcpy(&sh.s, &sBits, 4u);
+                std::memcpy(&sh.t, &tBits, 4u);
+                break;
+            }
+            case 0x42: case 0x43: // ALPHA_1 / _2
+                sh.alpha[reg - 0x42] = value;
+                break;
+            case 0x4C: case 0x4D: // FRAME_1 / _2
+                sh.frame[reg - 0x4C] = value;
+                break;
+            case 0x14: case 0x15: // TEX1_1 / _2
+                sh.tex1[reg - 0x14] = value;
+                break;
+            case 0x34: case 0x35: // MIPTBP1_1 / _2
+                sh.miptbp1[reg - 0x34] = value;
+                break;
+            case 0x47: case 0x48: // TEST_1 / _2
+                sh.test[reg - 0x47] = value;
+                break;
+            case 0x4E: case 0x4F: // ZBUF_1 / _2
+                sh.zbuf[reg - 0x4E] = value;
+                break;
             case 0x04: case 0x05: // XYZF2 / XYZ2: vertex + kick
-                noteVertex(static_cast<uint32_t>(value & 0xFFFFu), static_cast<uint32_t>((value >> 16) & 0xFFFFu), true);
+                noteVertex(static_cast<uint32_t>(value & 0xFFFFu), static_cast<uint32_t>((value >> 16) & 0xFFFFu), true,
+                           reg == 0x04 ? static_cast<uint32_t>((value >> 32) & 0xFFFFFFu) : static_cast<uint32_t>(value >> 32));
                 break;
             case 0x0C: case 0x0D: // XYZF3 / XYZ3: vertex, no kick
                 noteVertex(static_cast<uint32_t>(value & 0xFFFFu), static_cast<uint32_t>((value >> 16) & 0xFFFFu), false);
                 break;
             case 0x06: case 0x07: // TEX0_1 / TEX0_2
             {
+                sh.tex0[reg - 0x06] = value;
                 ++g_frameStats.tex0;
                 const uint32_t tw = static_cast<uint32_t>((value >> 26) & 0xFu);
                 const uint32_t th = static_cast<uint32_t>((value >> 30) & 0xFu);
@@ -263,6 +559,9 @@ namespace ps2x::pgs
             case 0x50:
                 sh.bitbltbuf = value;
                 break;
+            case 0x51:
+                sh.trxpos = value;
+                break;
             case 0x52:
                 sh.trxreg = value;
                 break;
@@ -276,6 +575,27 @@ namespace ps2x::pgs
                 else
                     ++g_frameStats.uploads;
                 const uint32_t dbw = static_cast<uint32_t>((sh.bitbltbuf >> 48) & 0x3Fu);
+                if (g_upload.active)
+                    finishUploadWatch(); // the previous one ended short
+                const uint32_t dbp = static_cast<uint32_t>((sh.bitbltbuf >> 32) & 0x3FFFu);
+                static const uint32_t watchLo = watchBound("PS2X_PGS_WATCH_LO", 0x3800u);
+                static const uint32_t watchHi = watchBound("PS2X_PGS_WATCH_HI", 0x3a40u);
+                if (dir == 0u && dbp >= watchLo && dbp < watchHi && g_frameNumber >= coverFrom() && g_uploadLogs < 120u)
+                {
+                    ++g_uploadLogs;
+                    g_upload = UploadWatch{};
+                    g_upload.active = true;
+                    g_upload.dbp = dbp;
+                    g_upload.dbw = dbw;
+                    g_upload.dpsm = static_cast<uint32_t>((sh.bitbltbuf >> 56) & 0x3Fu);
+                    g_upload.rrw = rrw;
+                    g_upload.rrh = rrh;
+                    g_upload.dx = static_cast<uint32_t>((sh.trxpos >> 32) & 0x7FFu);
+                    g_upload.dy = static_cast<uint32_t>((sh.trxpos >> 48) & 0x7FFu);
+                    g_upload.expect = static_cast<uint64_t>(rrw) * rrh * psmBits(g_upload.dpsm) / 8u;
+                    if (g_upload.expect == 0u)
+                        g_upload.active = false;
+                }
                 if (dir != 3u && (rrw == 0u || rrh == 0u || (dbw == 0u && dir != 1u)))
                 {
                     ++g_frameStats.badTransfers;
@@ -326,10 +646,24 @@ namespace ps2x::pgs
                             case 0x0:
                                 noteRegister(0x00, qlo);
                                 break;
+                            case 0x2:
+                            {
+                                const uint32_t sBits = static_cast<uint32_t>(qlo), tBits = static_cast<uint32_t>(qlo >> 32),
+                                               qBits = static_cast<uint32_t>(qhi);
+                                std::memcpy(&g_shadow.s, &sBits, 4u);
+                                std::memcpy(&g_shadow.t, &tBits, 4u);
+                                std::memcpy(&g_shadow.q, &qBits, 4u);
+                                break;
+                            }
+                            case 0x1:
+                                g_shadow.rgba = static_cast<uint32_t>((qlo & 0xFFu) | (((qlo >> 32) & 0xFFu) << 8) |
+                                                                      ((qhi & 0xFFu) << 16) | (((qhi >> 32) & 0xFFu) << 24));
+                                break;
                             case 0x4: // XYZF2 / XYZ2 packed: X bits 0-15, Y bits 32-47, ADC bit 111
                             case 0x5:
                                 noteVertex(static_cast<uint32_t>(qlo & 0xFFFFu), static_cast<uint32_t>((qlo >> 32) & 0xFFFFu),
-                                           ((qhi >> 47) & 1u) == 0u);
+                                           ((qhi >> 47) & 1u) == 0u,
+                                           desc == 0x4 ? static_cast<uint32_t>((qhi >> 4) & 0xFFFFFFu) : static_cast<uint32_t>(qhi));
                                 break;
                             case 0xC: case 0xD:
                                 noteVertex(static_cast<uint32_t>(qlo & 0xFFFFu), static_cast<uint32_t>((qlo >> 32) & 0xFFFFu), false);
@@ -338,8 +672,11 @@ namespace ps2x::pgs
                                 noteRegister(desc, qlo);
                                 break;
                             case 0xE: // A+D
-                                noteRegister(static_cast<uint32_t>(qhi & 0xFFu), qlo);
+                            {
+                                const uint32_t adReg = static_cast<uint32_t>(qhi & 0xFFu);
+                                noteRegister(adReg, qlo);
                                 break;
+                            }
                             default:
                                 break;
                             }
@@ -361,6 +698,7 @@ namespace ps2x::pgs
                 else
                 {
                     g_frameStats.imageQwords += nloop;
+                    noteImageData(body, std::min<size_t>(static_cast<size_t>(nloop) * 16u, bytes - offset - 16u));
                 }
                 offset += packetBytes;
             }
@@ -368,6 +706,105 @@ namespace ps2x::pgs
 
         void endFrameStats()
         {
+            if (coverFrame() && g_coverLogs < 600u)
+            {
+                ++g_coverLogs;
+                std::fprintf(stderr,
+                             "[pgs-cover] frame %llu vertex colour max(R,G,B): untextured 0-7:%llu 8-31:%llu 32-95:%llu 96+:%llu | "
+                             "textured 0-7:%llu 8-31:%llu 32-95:%llu 96+:%llu\n",
+                             (unsigned long long)g_frameNumber, (unsigned long long)g_colourHist[0][0],
+                             (unsigned long long)g_colourHist[0][1], (unsigned long long)g_colourHist[0][2],
+                             (unsigned long long)g_colourHist[0][3], (unsigned long long)g_colourHist[1][0],
+                             (unsigned long long)g_colourHist[1][1], (unsigned long long)g_colourHist[1][2],
+                             (unsigned long long)g_colourHist[1][3]);
+            }
+            if (coverFrame() && g_coverLogs < 600u)
+            {
+                ++g_coverLogs;
+                // TEST: ATE 0, ATST 1-3, AREF 4-11, AFAIL 12-13, DATE 14, DATM 15, ZTE 16, ZTST 17-18 (0 never, 1 always,
+                // 2 gequal, 3 greater). ZBUF: ZBP 0-8, PSM 24-27, ZMSK 32.
+                std::fprintf(stderr,
+                             "[pgs-cover] frame %llu multiply passes (Cd*As): %llu prims, area %.2f screens; last TEST=%llx (ZTE %u ZTST %u) "
+                             "ZBUF=%llx (ZBP %#x ZMSK %u) FRAME=%llx\n",
+                             (unsigned long long)g_frameNumber, (unsigned long long)g_multiplyPrims, double(g_multiplyArea) / (640.0 * 448.0),
+                             (unsigned long long)g_multiplyTest, (unsigned)((g_multiplyTest >> 16) & 1u),
+                             (unsigned)((g_multiplyTest >> 17) & 3u), (unsigned long long)g_multiplyZbuf,
+                             (unsigned)(g_multiplyZbuf & 0x1FFu), (unsigned)((g_multiplyZbuf >> 32) & 1u),
+                             (unsigned long long)g_multiplyFrame);
+            }
+            if (coverFrame() && g_coverLogs < 600u)
+            {
+                ++g_coverLogs;
+                std::fprintf(stderr,
+                             "[pgs-cover] frame %llu Z of textured vertices: world %llu verts Z %#x..%#x (zero %llu) TEST=%llx ZBUF=%llx | "
+                             "multiply %llu verts Z %#x..%#x (zero %llu) | Z buckets <=16/<=20/>20 bits: world %llu/%llu/%llu "
+                             "multiply %llu/%llu/%llu\n",
+                             (unsigned long long)g_frameNumber, (unsigned long long)g_zCount[0], g_zCount[0] ? g_zMin[0] : 0u, g_zMax[0],
+                             (unsigned long long)g_zZero[0], (unsigned long long)g_worldTest, (unsigned long long)g_worldZbuf,
+                             (unsigned long long)g_zCount[1], g_zCount[1] ? g_zMin[1] : 0u, g_zMax[1], (unsigned long long)g_zZero[1],
+                             (unsigned long long)g_zHist[0][0], (unsigned long long)g_zHist[0][1], (unsigned long long)g_zHist[0][2],
+                             (unsigned long long)g_zHist[1][0], (unsigned long long)g_zHist[1][1], (unsigned long long)g_zHist[1][2]);
+            }
+            if (coverFrame() && g_coverLogs < 600u)
+            {
+                ++g_coverLogs;
+                const auto &st = g_stq;
+                std::fprintf(stderr,
+                             "[pgs-cover] frame %llu STQ world: %llu verts, Q %g..%g (zero %llu, negative %llu), S/Q %g..%g, T/Q %g..%g, "
+                             "triangles %llu of which all 3 vertices share one texel coordinate: %llu\n",
+                             (unsigned long long)g_frameNumber, (unsigned long long)st.verts, st.verts ? st.qMin : 0.0f,
+                             st.verts ? st.qMax : 0.0f, (unsigned long long)st.qZero, (unsigned long long)st.qNeg,
+                             st.verts ? st.uMin : 0.0f, st.verts ? st.uMax : 0.0f, st.verts ? st.vMin : 0.0f, st.verts ? st.vMax : 0.0f,
+                             (unsigned long long)st.tris, (unsigned long long)st.flatTris);
+            }
+            if (coverFrame() && g_coverLogs < 600u)
+            {
+                for (uint32_t i = 0; i < g_texStateCount && g_coverLogs < 600u; ++i)
+                {
+                    ++g_coverLogs;
+                    const auto &ts = g_texStates[i];
+                    // TEX1: LCM 0, MXL 2-4, MMAG 5, MMIN 6-8, MTBA 9, L 19-20, K 32-43 (signed, 1/16 units).
+                    const int32_t k = static_cast<int32_t>(static_cast<uint32_t>((ts.tex1 >> 32) & 0xFFFu) << 20) >> 20;
+                    std::fprintf(stderr,
+                                 "[pgs-cover] frame %llu world tex state x%llu: TEX1=%llx (LCM %u MXL %u MMAG %u MMIN %u MTBA %u L %u K %.2f) "
+                                 "MIPTBP1=%llx TEX0=%llx\n",
+                                 (unsigned long long)g_frameNumber, (unsigned long long)ts.count, (unsigned long long)ts.tex1,
+                                 (unsigned)(ts.tex1 & 1u), (unsigned)((ts.tex1 >> 2) & 7u), (unsigned)((ts.tex1 >> 5) & 1u),
+                                 (unsigned)((ts.tex1 >> 6) & 7u), (unsigned)((ts.tex1 >> 9) & 1u), (unsigned)((ts.tex1 >> 19) & 3u),
+                                 k / 16.0, (unsigned long long)ts.miptbp1, (unsigned long long)ts.tex0);
+                }
+            }
+            g_texStateCount = 0;
+            if (coverFrame() && g_coverLogs < 600u)
+            {
+                for (uint32_t i = 0; i < g_blendGroupCount && g_coverLogs < 600u; ++i)
+                {
+                    const auto &b = g_blendGroups[i];
+                    if (b.area < 640.0 * 448.0 * 0.05)
+                        continue; // only groups that cover at least 5% of a screen
+                    ++g_coverLogs;
+                    std::fprintf(stderr,
+                                 "[pgs-blend] frame %llu type %u ctxt %u tme %u abe %u ALPHA=%02x FIX=%02x FBMSK=%08x FBP=%#x: %llu prims, "
+                                 "%.2f screens, last rgba %08x\n",
+                                 (unsigned long long)g_frameNumber, (unsigned)(b.key >> 60), (unsigned)((b.key >> 59) & 1u),
+                                 (unsigned)((b.key >> 58) & 1u), (unsigned)((b.key >> 57) & 1u), (unsigned)((b.key >> 40) & 0xFFu),
+                                 (unsigned)((b.key >> 32) & 0xFFu), (unsigned)(b.key & 0xFFFFFFFFu), (unsigned)(b.frame & 0x1FFu),
+                                 (unsigned long long)b.count, b.area / (640.0 * 448.0), b.rgba);
+                }
+            }
+            g_blendGroupCount = 0;
+            g_stq = StqStats{};
+            for (int k = 0; k < 2; ++k)
+            {
+                g_zMin[k] = 0xFFFFFFFFu;
+                g_zMax[k] = 0u;
+                g_zCount[k] = g_zZero[k] = 0u;
+                g_zHist[k][0] = g_zHist[k][1] = g_zHist[k][2] = 0u;
+            }
+            g_multiplyArea = g_multiplyPrims = 0;
+            std::memset(g_colourHist, 0, sizeof(g_colourHist));
+            ++g_frameNumber;
+            g_coverLogsThisFrame = 0;
             auto &f = g_frameStats;
             auto &w = g_windowStats;
             if ((g_traceFrames && f.packets) || f.bigPrims || f.badTex || f.badTransfers)
@@ -623,7 +1060,7 @@ namespace ps2x::pgs
         if (!g_state)
             return;
         bindThread();
-        deterministicSignal(reg & 0xFFu, value);
+        noteRegister(reg & 0xFFu, value); // also delivers SIGNAL / FINISH / LABEL in deterministic mode
         g_state->gs->write_register(static_cast<ParallelGS::RegisterAddr>(reg & 0xFFu), value);
     }
 

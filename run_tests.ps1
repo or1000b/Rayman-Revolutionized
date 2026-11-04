@@ -201,6 +201,11 @@ if ($buildOk) {
                     $var = [ShotMath]::Variance($shot.Path)
                     $ok = $var -ge $check.min_variance
                     $detail = "tick $($shot.Tick) variance {0:N0} (min {1})" -f $var, $check.min_variance
+                    if (-not $check.PSObject.Properties['golden']) {
+                        # No golden picture for this checkpoint: variance only.
+                        Write-CheckResult $sc.name $check $ok $detail
+                        break
+                    }
                     $golden = Join-Path $GoldenDir $check.golden
                     if ($UpdateGolden) {
                         New-Item -ItemType Directory -Force $GoldenDir | Out-Null

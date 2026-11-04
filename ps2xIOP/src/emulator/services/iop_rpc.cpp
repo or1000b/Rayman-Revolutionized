@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -466,6 +468,37 @@ namespace ps2x::iop::detail
                 if (copySize < request.receive.size)
                     (void)m_host.zeroGuest(request.receive.address + copySize, request.receive.size - copySize);
             }
+        }
+
+        // PS2X_UBI_TRACE=1: one line per EE call to UBISOUND ("ee2i"): function, sizes, the request payload and the
+        // reply. The recorded behaviour of the real driver (the "oracle" of docs/ubisound_port.md).
+        static const bool ubiTrace = []()
+        {
+            const char *value = std::getenv("PS2X_UBI_TRACE");
+            return value && std::atoi(value) != 0;
+        }();
+        if (ubiTrace && request.sid == 0x65653269u)
+        {
+            static uint64_t s_call = 0;
+            std::vector<uint8_t> sent(std::min<uint32_t>(request.send.size, 96u));
+            if (!sent.empty())
+                (void)m_host.readGuest(request.send.address, sent.data(), sent.size());
+            std::vector<uint8_t> reply(std::min<uint32_t>(request.receive.size, 32u));
+            if (!reply.empty() && returnPointer != 0u)
+            {
+                const uint32_t physical = IopMemory::physicalAddress(returnPointer);
+                if (physical + reply.size() <= IopMemory::RamSize)
+                    std::memcpy(reply.data(), m_memory.ram().data() + physical, reply.size());
+            }
+            std::ostringstream line;
+            line << "[ubi-rpc] #" << s_call++ << std::hex << " fn=" << request.function << " send=" << request.send.size
+                 << " recv=" << request.receive.size << " in=";
+            for (size_t i = 0; i < sent.size(); ++i)
+                line << (i && (i % 4) == 0 ? "_" : "") << ((sent[i] >> 4) & 0xF) << (sent[i] & 0xF);
+            line << " out=";
+            for (size_t i = 0; i < reply.size(); ++i)
+                line << (i && (i % 4) == 0 ? "_" : "") << ((reply[i] >> 4) & 0xF) << (reply[i] & 0xF);
+            std::fprintf(stderr, "%s\n", line.str().c_str());
         }
 
         result.handled = true;

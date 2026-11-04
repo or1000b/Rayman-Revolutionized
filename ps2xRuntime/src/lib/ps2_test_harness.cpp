@@ -500,11 +500,10 @@ extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uin
 {
     g_guestVsync.store(vsync, std::memory_order_relaxed);
 
-    // PS2X_SPU2_DUMP_AT="1200,2300": full SPU2 state at those guest VSyncs (this thread also runs the IOP).
-    static const std::vector<uint64_t> spu2DumpAt = []()
+    const auto vsyncList = [](const char *name)
     {
         std::vector<uint64_t> at;
-        if (const char *list = std::getenv("PS2X_SPU2_DUMP_AT"))
+        if (const char *list = std::getenv(name))
         {
             for (const char *p = list; *p;)
             {
@@ -517,11 +516,27 @@ extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uin
             }
         }
         return at;
-    }();
+    };
+    // PS2X_SPU2_DUMP_AT="1200,2300": full SPU2 state at those guest VSyncs (this thread also runs the IOP).
+    static const std::vector<uint64_t> spu2DumpAt = vsyncList("PS2X_SPU2_DUMP_AT");
     if (std::find(spu2DumpAt.begin(), spu2DumpAt.end(), vsync) != spu2DumpAt.end())
     {
         std::fprintf(stderr, "[spu2-dump] guest vsync %llu\n", static_cast<unsigned long long>(vsync));
         ps2xSpu2DebugDump();
+    }
+    // PS2X_EE_DUMP_AT="7150,9000": EE RAM (32 MiB) to out/ee_ram_<vsync>.bin at those guest VSyncs. In deterministic
+    // mode two dumps of the same VSync from two runs are identical, so state can be diffed across runs and times.
+    static const std::vector<uint64_t> eeDumpAt = vsyncList("PS2X_EE_DUMP_AT");
+    if (rdram && std::find(eeDumpAt.begin(), eeDumpAt.end(), vsync) != eeDumpAt.end())
+    {
+        char path[64];
+        std::snprintf(path, sizeof(path), "out/ee_ram_%llu.bin", static_cast<unsigned long long>(vsync));
+        if (FILE *f = std::fopen(path, "wb"))
+        {
+            std::fwrite(rdram, 1u, ramBytes, f);
+            std::fclose(f);
+            std::fprintf(stderr, "[ee-dump] guest vsync %llu -> %s\n", static_cast<unsigned long long>(vsync), path);
+        }
     }
 
     if (!ps2xDeterministic() || !rdram || (vsync % 60u) != 0u)
