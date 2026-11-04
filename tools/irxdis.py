@@ -41,11 +41,13 @@ IMPORT_NAMES = {
                21: 'sceSifExecRequest', 22: 'sceSifRpcLoop'},
     'stdio': {4: 'printf'},
     'sysclib': {8: 'setjmp?', 11: 'memcmp?', 12: 'memcpy', 13: 'memmove?', 14: 'memset'},
+    # Ordinals as in the IOP kernel (and ps2xIOP/src/emulator/core/iop_kernel.cpp).
     'thbase': {4: 'CreateThread', 5: 'DeleteThread', 6: 'StartThread', 7: 'StartThreadArgs', 8: 'ExitThread',
-               14: 'ChangeThreadPriority', 18: 'ReleaseWaitThread', 20: 'GetThreadId', 22: 'iReferThreadStatus?',
-               23: 'SleepThread', 24: 'WakeupThread', 25: 'iWakeupThread', 32: 'DelayThread',
-               33: 'GetSystemTime', 34: 'SetAlarm', 35: 'iSetAlarm', 36: 'CancelAlarm', 37: 'iCancelAlarm',
-               38: 'USec2SysClock', 39: 'SysClock2USec'},
+               9: 'ExitDeleteThread', 10: 'TerminateThread', 11: 'iTerminateThread', 14: 'ChangeThreadPriority',
+               15: 'iChangeThreadPriority', 18: 'ReleaseWaitThread', 19: 'iReleaseWaitThread', 20: 'GetThreadId',
+               22: 'ReferThreadStatus', 23: 'iReferThreadStatus', 24: 'SleepThread', 25: 'WakeupThread',
+               26: 'iWakeupThread', 33: 'DelayThread', 34: 'GetSystemTime', 35: 'SetAlarm', 36: 'iSetAlarm',
+               37: 'CancelAlarm', 38: 'iCancelAlarm', 39: 'USec2SysClock', 40: 'SysClock2USec'},
     'thsemap': {4: 'CreateSema', 5: 'DeleteSema', 6: 'SignalSema', 7: 'iSignalSema', 8: 'WaitSema',
                 9: 'PollSema'},
 }

@@ -65,3 +65,33 @@ reference. Bank loading ("load" module + the SPU2 allocator) is where the bank's
   - 2 "load" (fourcc 0x64616f6c, 10 commands, table 0x20ce0, set by 0x9eb4):
     0:0x9924 1:0x9968 2:0x9be0 3:0x9e04 4:0x9a70 5:0x9bac 6:0x9e38 7:0x9eac 8:0x99a4 9:0x9a3c
 - IOP->EE notifications: sid 0x696f3265 "io2e" used at 0xcbc (to be read).
+- "load" commands read so far: 2 (0x9be0) = bank from disc straight to SPU2 RAM: in `{lsn, bytes}`, allocates SPU2
+  memory (allocator 0x14c0 on the heap at 0x17dc0), then loops sceCdRead into an IOP buffer + sceSdVoiceTrans(core 1,
+  mode 8 = write by PIO) chunk by chunk, out `{spuAddr, bytes}`. 4 (0x9a70) = disc -> new IOP buffer, out
+  `{iopAddr, bytes}`; 5 (0x9bac) frees it. 8 (0x99a4) = IOP buffer -> SPU2 by DMA, out `{spuAddr, bytes}`; 9 frees.
+  Rayman loads one 1.8 MiB bank with command 2 at boot (lsn 0x1cc3da, 0x1c6250 bytes -> SPU2 0x11010).
+- "play" command 2 (0xda0): in 0x40 bytes; looks up the sound class by id (0x976c, registry 0x20c80), then class
+  vtable +0x10 = new instance (fixed pools: ~24 instances per class), +0x44, +0x48, +0x38 = start. Instances are only
+  freed by the update tick (below) when their voice ends.
+- Channel driver (vtable 0x13d30, object 0x20fe0, 24 channels of 0x2c bytes from +4): channel = {core, voice, flags,
+  owner, ..., +0x24, +0x28 SSA}. 0xd774 fills a channel from a sample descriptor (+0xa, +0x14, +0x18 = SPU2 address);
+  0xd56c keys it on (sceSdProcBatch: ADSR 000f/1fc0, SSA, KON). Update 0xd870 (vtable +0x34 via 0xe15c): flags
+  1 allocated, 2 key-on wanted, 4 keyed on, 8 ENDX seen (sceSdGetSwitch(ENDX)), 0x20/0x40/0x80 start / ? / end
+  reported to the owner (0xd9e8 -> owner vtable +0x30).
+- Tick: thread 0x9344 (priority 0x6b) arms SetAlarm(USec2SysClock(200000)) with handler 0x9314 (iSignalSema), then
+  per tick calls every registered driver's update (0x941c -> driver vtable +0x34). Drivers registered in 0x9480:
+  0xe184 (channels), 0x129ac, 0xa7c8, 0x2338, 0xc314, 0x6008, 0x43fc, 0x79c4, 0x10780.
+
+### Oracle bugs found and fixed (2026-11-04)
+1. **SSA = 0**: the IOP ran RPC handlers synchronously with a 2M-instruction cap. Load command 2 (1.8 MiB by PIO)
+   needs far more, so it was cut off: a third of the bank in SPU2 RAM and an unwritten reply (`{0, 0}`), so the game
+   built every sound at SPU2 address 0. Fix: `kMaxRpcCallInstructions` (400M) for RPC calls, and
+   `[IOP] guest call ... did not return` when a call is still abandoned.
+2. **Sounds never end, plays fail after ~24**: SetAlarm / CancelAlarm were stubs, so the tick never ran. Fix: real
+   alarms in `iop_emulator.cpp` (handler in interrupt context, return value = next interval).
+3. **Level sound data not loaded**: the IOP heap never reused freed blocks and had only 832 KiB, so load command 4
+   (~900 KiB IOP buffer at the level start) failed. Fix: one first-fit arena for module images and AllocSysMemory.
+   The real IOP has ~1.5 MiB free here; a native port must not assume less.
+
+Tools: `PS2X_IOP_WATCH="addr[:reg:bytes],..."` logs registers (and memory at a register) when the IOP reaches an
+address (`[iop-watch]`); UBISOUND's base: the `[IOP] loaded IRX id=6` line (0x45d00 before the 2026-11-04 heap change).

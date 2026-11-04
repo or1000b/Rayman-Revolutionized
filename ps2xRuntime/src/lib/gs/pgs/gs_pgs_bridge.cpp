@@ -218,6 +218,7 @@ namespace ps2x::pgs
         uint64_t g_frameNumber = 0;
         uint32_t g_coverLogsThisFrame = 0;
         uint64_t g_coverLogs = 0;
+        uint32_t g_bigPrimLogs = 0;
         // Vertex colour histogram of the frame: [textured][max(R,G,B) bucket 0-7 / 8-31 / 32-95 / 96+].
         uint64_t g_colourHist[2][4] = {};
 
@@ -458,6 +459,27 @@ namespace ps2x::pgs
                 const uint32_t r = sh.rgba & 0xFFu, g = (sh.rgba >> 8) & 0xFFu, b = (sh.rgba >> 16) & 0xFFu;
                 const uint32_t m = std::max(r, std::max(g, b));
                 ++g_colourHist[(sh.prim >> 4) & 1u][m < 8u ? 0 : m < 32u ? 1 : m < 96u ? 2 : 3];
+            }
+            // PS2X_PGS_BIGPRIM=1: every frame from PS2X_PGS_COVER_FROM on, untextured primitives that cover most of the
+            // screen, with the depth state that decides whether they hide the picture (TEST, ZBUF, vertex Z).
+            // PS2X_PGS_BIGPRIM=2: fans and sprites only (overlays, clears), not the world's strips.
+            static const uint32_t bigPrimLog = watchBound("PS2X_PGS_BIGPRIM", 0u);
+            if (bigPrimLog != 0u && w >= 500u && h >= 350u && w <= 2048u && h <= 2048u && ((sh.prim >> 4) & 1u) == 0u &&
+                (bigPrimLog != 2u || sh.primType >= 5u) && g_frameNumber >= coverFrom() && g_bigPrimLogs < 3000u)
+            {
+                ++g_bigPrimLogs;
+                const uint32_t c = sh.ctxt & 1u;
+                const uint64_t test = sh.test[c];
+                std::fprintf(stderr,
+                             "[pgs-bigprim] frame %llu type %u abe %u ctxt %u box=%d,%d..%d,%d rgba=%08x z=%#x alpha=%010llx "
+                             "TEST=%llx (ATE %u ATST %u AREF %02x AFAIL %u ZTE %u ZTST %u) ZBUF=%llx (ZBP %#x PSM %#x ZMSK %u) "
+                             "FRAME=%llx\n",
+                             (unsigned long long)g_frameNumber, sh.primType, (unsigned)((sh.prim >> 6) & 1u), c, minX, minY,
+                             maxX, maxY, sh.rgba, sh.vz, (unsigned long long)sh.alpha[c], (unsigned long long)test,
+                             (unsigned)(test & 1u), (unsigned)((test >> 1) & 7u), (unsigned)((test >> 4) & 0xFFu),
+                             (unsigned)((test >> 12) & 3u), (unsigned)((test >> 16) & 1u), (unsigned)((test >> 17) & 3u),
+                             (unsigned long long)sh.zbuf[c], (unsigned)(sh.zbuf[c] & 0x1FFu), (unsigned)((sh.zbuf[c] >> 24) & 0xFu),
+                             (unsigned)((sh.zbuf[c] >> 32) & 1u), (unsigned long long)sh.frame[c]);
             }
             if (w >= 500u && h >= 350u && w <= 2048u && h <= 2048u && coverFrame() &&
                 g_coverLogsThisFrame < 8u && g_coverLogs < 600u)
@@ -1141,6 +1163,13 @@ namespace ps2x::pgs
         info.crtc_offsets = false;
         info.adapt_to_internal_horizontal_resolution = false;
 
+        if (watchBound("PS2X_PGS_BIGPRIM", 0u) != 0u && g_frameNumber >= coverFrom() && g_bigPrimLogs < 3000u)
+        {
+            ++g_bigPrimLogs;
+            std::fprintf(stderr, "[pgs-scan] frame %llu pmode=%llx dispfb1=%llx dispfb2=%llx\n",
+                         (unsigned long long)g_frameNumber, (unsigned long long)regs.pmode,
+                         (unsigned long long)regs.dispfb1, (unsigned long long)regs.dispfb2);
+        }
         endFrameStats();
         g_state->gs->flush();
         ParallelGS::ScanoutResult result = g_state->gs->vsync(info);

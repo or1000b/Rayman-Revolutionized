@@ -1,5 +1,6 @@
 #include "iop_emulator.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
@@ -115,6 +116,7 @@ namespace ps2x::iop::detail
               loadcore(memory, imports)
         {
             reset();
+            parsePcWatches();
         }
 
         void reset()
@@ -130,6 +132,7 @@ namespace ps2x::iop::detail
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
+            alarms.clear();
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
@@ -289,6 +292,11 @@ namespace ps2x::iop::detail
                     setV0(0);
                     return ImportDisposition::Handled;
                 }
+                if (call.ordinal >= 35u && call.ordinal <= 38u)
+                {
+                    dispatchAlarmImport(call.ordinal, cpu);
+                    return ImportDisposition::Handled;
+                }
                 return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
@@ -379,10 +387,89 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        // PS2X_IOP_WATCH="addr[:reg:bytes],..." (hex IOP addresses): log the registers, and optionally the
+        // memory a register points to, each time execution reaches addr. PS2X_IOP_WATCH_MAX = hits per address
+        // (default 40). Debug aid for the UBISOUND port.
+        struct PcWatch
+        {
+            uint32_t pc = 0u;
+            int reg = -1;
+            uint32_t bytes = 0u;
+            uint32_t hits = 0u;
+        };
+        std::vector<PcWatch> pcWatches;
+        uint32_t pcWatchMax = 40u;
+
+        static int parseRegisterName(const std::string &name)
+        {
+            static const char *const kNames[32] = {"zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+                                                   "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+                                                   "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+                                                   "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+            for (int i = 0; i < 32; ++i)
+                if (name == kNames[i])
+                    return i;
+            return -1;
+        }
+
+        void parsePcWatches()
+        {
+            const char *spec = std::getenv("PS2X_IOP_WATCH");
+            if (!spec)
+                return;
+            if (const char *max = std::getenv("PS2X_IOP_WATCH_MAX"))
+                pcWatchMax = static_cast<uint32_t>(std::strtoul(max, nullptr, 10));
+            std::stringstream list(spec);
+            std::string item;
+            while (std::getline(list, item, ','))
+            {
+                PcWatch watch;
+                std::stringstream parts(item);
+                std::string field;
+                if (!std::getline(parts, field, ':'))
+                    continue;
+                watch.pc = static_cast<uint32_t>(std::strtoul(field.c_str(), nullptr, 16));
+                if (std::getline(parts, field, ':'))
+                    watch.reg = parseRegisterName(field);
+                if (std::getline(parts, field, ':'))
+                    watch.bytes = std::min<uint32_t>(static_cast<uint32_t>(std::strtoul(field.c_str(), nullptr, 0)), 256u);
+                pcWatches.push_back(watch);
+            }
+        }
+
+        void checkPcWatch(const CpuState &cpu)
+        {
+            for (PcWatch &watch : pcWatches)
+            {
+                if (watch.pc != cpu.pc || watch.hits >= pcWatchMax)
+                    continue;
+                ++watch.hits;
+                std::ostringstream out;
+                out << "[iop-watch] pc=0x" << std::hex << cpu.pc << " ra=0x" << cpu.gpr[31]
+                    << " a0=0x" << cpu.gpr[4] << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6]
+                    << " a3=0x" << cpu.gpr[7] << " v0=0x" << cpu.gpr[2] << " s0=0x" << cpu.gpr[16]
+                    << " s1=0x" << cpu.gpr[17] << " sp=0x" << cpu.gpr[29] << " cyc=" << std::dec << totalCycles;
+                if (watch.reg >= 0 && watch.bytes)
+                {
+                    const uint32_t at = cpu.gpr[watch.reg];
+                    out << " mem@0x" << std::hex << at << "=";
+                    for (uint32_t i = 0; i + 4u <= watch.bytes; i += 4u)
+                    {
+                        char word[10];
+                        std::snprintf(word, sizeof(word), "%08x ", read32(at + i));
+                        out << word;
+                    }
+                }
+                log(LogLevel::Info, out.str());
+            }
+        }
+
         bool step(CpuState &cpu)
         {
             if (cpu.stopped)
                 return false;
+            if (!pcWatches.empty())
+                checkPcWatch(cpu);
             if (cpu.pc == kThreadReturnSentinel || cpu.pc == kCallReturnSentinel)
             {
                 cpu.stopped = true;
@@ -493,7 +580,21 @@ namespace ps2x::iop::detail
                 cpu.gpr[29] = kCallStackBase - 32u;
             }
             cpu.gpr[31] = kCallReturnSentinel;
-            runCpu(cpu, budget);
+            const uint32_t executed = runCpu(cpu, budget);
+            if (cpu.pc != kCallReturnSentinel)
+            {
+                // The call was abandoned before it returned: its work is half done and v0 is not its result.
+                static uint32_t s_reported = 0u;
+                if (s_reported < 20u)
+                {
+                    ++s_reported;
+                    std::ostringstream out;
+                    out << "[IOP] guest call 0x" << std::hex << address << " did not return: pc=0x" << cpu.pc
+                        << " ra=0x" << cpu.gpr[31] << std::dec << " executed=" << executed << " budget=" << budget
+                        << (cpu.yielded ? " (blocked)" : "");
+                    log(LogLevel::Warning, out.str());
+                }
+            }
             return cpu.gpr[2];
         }
 
@@ -517,7 +618,7 @@ namespace ps2x::iop::detail
                                       uint32_t gp) override
         {
             dirtyStackForNextCall = true;
-            const uint32_t result = callFunction(address, a0, a1, a2, a3, gp);
+            const uint32_t result = callFunction(address, a0, a1, a2, a3, gp, kMaxRpcCallInstructions);
             dirtyStackForNextCall = false;
             return result;
         }
@@ -563,6 +664,85 @@ namespace ps2x::iop::detail
                 throw;
             }
             servicingDmaInterrupts = false;
+        }
+
+        // thbase 35-38: SetAlarm, iSetAlarm, CancelAlarm, iCancelAlarm.
+        void dispatchAlarmImport(uint16_t ordinal, CpuState &cpu)
+        {
+            constexpr int32_t kFoundHandler = -104; // KE_FOUND_HANDLER
+            constexpr int32_t kNotFoundHandler = -105; // KE_NOTFOUND_HANDLER
+            const auto find = [this](uint32_t handler, uint32_t common)
+            {
+                return std::find_if(alarms.begin(), alarms.end(), [&](const Alarm &alarm)
+                                    { return alarm.handler == handler && alarm.common == common; });
+            };
+            int32_t result = 0;
+            if (ordinal == 35u || ordinal == 36u)
+            {
+                const uint64_t clock = static_cast<uint64_t>(read32(cpu.gpr[4])) |
+                                       (static_cast<uint64_t>(read32(cpu.gpr[4] + 4u)) << 32u);
+                if (find(cpu.gpr[5], cpu.gpr[6]) != alarms.end())
+                    result = kFoundHandler;
+                else
+                    alarms.push_back(Alarm{totalCycles + std::max<uint64_t>(clock, 1u), cpu.gpr[5], cpu.gpr[6], cpu.gpr[28]});
+            }
+            else
+            {
+                const auto it = find(cpu.gpr[4], cpu.gpr[5]);
+                if (it == alarms.end())
+                    result = kNotFoundHandler;
+                else
+                    alarms.erase(it);
+            }
+            cpu.gpr[2] = static_cast<uint32_t>(result);
+        }
+
+        void serviceAlarms()
+        {
+            if (servicingAlarms || alarms.empty())
+                return;
+            servicingAlarms = true;
+            struct Guard
+            {
+                bool &flag;
+                ~Guard() { flag = false; }
+            } guard{servicingAlarms};
+            for (size_t i = 0; i < alarms.size();)
+            {
+                if (alarms[i].due > totalCycles)
+                {
+                    ++i;
+                    continue;
+                }
+                const Alarm alarm = alarms[i];
+                const uint32_t next = callFunction(alarm.handler, alarm.common, 0u, 0u, 0u, alarm.gp, 100000u);
+                // The handler may have cancelled or re-armed alarms; find this one again.
+                const auto it = std::find_if(alarms.begin(), alarms.end(), [&](const Alarm &other)
+                                             { return other.handler == alarm.handler && other.common == alarm.common &&
+                                                      other.due == alarm.due; });
+                if (it == alarms.end())
+                {
+                    i = 0;
+                    continue;
+                }
+                if (next == 0u)
+                {
+                    alarms.erase(it);
+                    i = 0;
+                    continue;
+                }
+                // Periodic: keep the cadence of the original schedule.
+                it->due = std::max(alarm.due + next, totalCycles + 1u);
+                ++i;
+            }
+        }
+
+        uint64_t nextAlarmCycle(uint64_t fallback) const noexcept
+        {
+            uint64_t next = fallback;
+            for (const Alarm &alarm : alarms)
+                next = std::min(next, alarm.due);
+            return next;
         }
 
         void servicePendingGuestCallbacks()
@@ -660,6 +840,7 @@ namespace ps2x::iop::detail
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
+                    serviceAlarms();
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
@@ -669,6 +850,7 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        nextWake = nextAlarmCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -798,8 +980,11 @@ namespace ps2x::iop::detail
                 return false;
             // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution and release the image cleanly.
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
+            std::erase_if(alarms, [&](const Alarm &alarm)
+                          { return alarm.handler - it->second.base < it->second.size; });
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            (void)memory.freeAllocation(it->second.base);
             modules.erase(it);
             kernel.cleanupDeadThreads();
             if (result)
@@ -826,6 +1011,17 @@ namespace ps2x::iop::detail
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+        // thbase alarms (SetAlarm / CancelAlarm): handler(common) runs in interrupt context when due; its return
+        // value is the next interval in IOP cycles (0 = done).
+        struct Alarm
+        {
+            uint64_t due = 0u;
+            uint32_t handler = 0u;
+            uint32_t common = 0u;
+            uint32_t gp = 0u;
+        };
+        std::vector<Alarm> alarms;
+        bool servicingAlarms = false;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;

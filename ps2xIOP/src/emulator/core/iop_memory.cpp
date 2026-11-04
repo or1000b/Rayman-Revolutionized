@@ -115,7 +115,6 @@ namespace ps2x::iop::detail
         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
         m_hardware.clear();
         m_allocations.clear();
-        m_heapCursor = HeapBase;
         m_interruptStatus = 0;
         m_interruptMask = 0;
         m_interruptControl = 1;
@@ -411,6 +410,16 @@ namespace ps2x::iop::detail
         return result;
     }
 
+    void IopMemory::insertAllocation(uint32_t address, uint32_t size)
+    {
+        // Kept sorted by address: the free gaps are the spaces between neighbours.
+        const auto at = std::lower_bound(m_allocations.begin(), m_allocations.end(), address,
+                                         [](const Allocation &block, uint32_t value)
+                                         { return block.address < value; });
+        m_allocations.insert(at, Allocation{address, size});
+        markOwned(address, size);
+    }
+
     uint32_t IopMemory::allocate(uint32_t size, uint32_t alignment, std::optional<uint32_t> fixed)
     {
         size = alignUp(std::max(size, 1u), 16u);
@@ -418,38 +427,52 @@ namespace ps2x::iop::detail
         if (fixed)
         {
             const uint32_t address = *fixed;
-            if (address < HeapBase || address + size > HeapLimit)
+            if (address < HeapBase || address > HeapLimit || size > HeapLimit - address)
                 return 0u;
             for (const auto &block : m_allocations)
                 if (address < block.address + block.size && block.address < address + size)
                     return 0u;
-            m_allocations.push_back({address, size});
-            markOwned(address, size);
+            insertAllocation(address, size);
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
-        for (;;)
+        uint32_t candidate = alignUp(HeapBase, alignment);
+        for (const auto &block : m_allocations)
         {
-            bool overlap = false;
-            for (const auto &block : m_allocations)
-            {
-                if (candidate < block.address + block.size && block.address < candidate + size)
-                {
-                    candidate = alignUp(block.address + block.size, alignment);
-                    overlap = true;
-                    break;
-                }
-            }
-            if (!overlap)
+            if (block.address + block.size <= candidate)
+                continue;
+            if (block.address >= candidate && block.address - candidate >= size)
                 break;
+            candidate = alignUp(block.address + block.size, alignment);
         }
         if (candidate > HeapLimit || size > HeapLimit - candidate)
             return 0u;
-        m_allocations.push_back({candidate, size});
-        markOwned(candidate, size);
-        m_heapCursor = std::max(m_heapCursor, candidate + size);
+        insertAllocation(candidate, size);
         return candidate;
+    }
+
+    uint32_t IopMemory::allocateHigh(uint32_t size, uint32_t alignment)
+    {
+        size = alignUp(std::max(size, 1u), 16u);
+        alignment = std::max<uint32_t>(alignment, 4u);
+        uint32_t gapEnd = HeapLimit;
+        for (auto block = m_allocations.rbegin();; ++block)
+        {
+            const bool last = block == m_allocations.rend();
+            const uint32_t gapStart = last ? HeapBase : block->address + block->size;
+            if (gapEnd >= gapStart && gapEnd - gapStart >= size)
+            {
+                const uint32_t address = (gapEnd - size) & ~(alignment - 1u);
+                if (address >= gapStart)
+                {
+                    insertAllocation(address, size);
+                    return address;
+                }
+            }
+            if (last)
+                return 0u;
+            gapEnd = std::min(gapEnd, block->address);
+        }
     }
 
     bool IopMemory::freeAllocation(uint32_t address)
@@ -468,7 +491,28 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        uint32_t best = 0u;
+        uint32_t cursor = HeapBase;
+        for (const auto &block : m_allocations)
+        {
+            if (block.address > cursor)
+                best = std::max(best, block.address - cursor);
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        return cursor < HeapLimit ? std::max(best, HeapLimit - cursor) : best;
+    }
+
+    uint32_t IopMemory::totalFreeMemory() const
+    {
+        uint32_t total = 0u;
+        uint32_t cursor = HeapBase;
+        for (const auto &block : m_allocations)
+        {
+            if (block.address > cursor)
+                total += block.address - cursor;
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        return cursor < HeapLimit ? total + (HeapLimit - cursor) : total;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

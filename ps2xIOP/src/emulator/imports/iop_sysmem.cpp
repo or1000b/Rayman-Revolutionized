@@ -27,9 +27,10 @@ namespace ps2x::iop::detail
         {
         case 4: // AllocSysMemory
         {
-            const uint32_t address = a0 == 2u
-                                         ? m_memory.allocate(a1, 16u, a2)
-                                         : m_memory.allocate(a1, 16u);
+            // Mode 0 = lowest free block, 1 = highest, 2 = at the given address.
+            const uint32_t address = a0 == 2u   ? m_memory.allocate(a1, 16u, a2)
+                                     : a0 == 1u ? m_memory.allocateHigh(a1, 16u)
+                                                : m_memory.allocate(a1, 16u);
             setV0(address);
             return true;
         }
@@ -40,8 +41,10 @@ namespace ps2x::iop::detail
             setV0(IopMemory::RamSize);
             return true;
         case 7: // QueryMaxFreeMemSize
-        case 8: // QueryTotalFreeMemSize
             setV0(m_memory.maxFreeMemory());
+            return true;
+        case 8: // QueryTotalFreeMemSize
+            setV0(m_memory.totalFreeMemory());
             return true;
         case 9: // QueryBlockTopAddress
             if (const auto block = m_memory.allocationContaining(a0))

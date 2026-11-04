@@ -5,6 +5,7 @@
     "shots: window frames whose picture is saved; checks of type 'shot' refer to them.",
     "Runs are deterministic (PS2X_DETERMINISTIC=1: guest time from guest cycles only; ticks in input/frames/shots are guest VSyncs) unless a scenario sets \"deterministic\": false.",
     "known_fail: the check is expected to fail for a known reason; it is reported but does not fail the run.",
+    "env: extra environment variables for this scenario's runs (for example a trace that a log check needs).",
     "Golden pictures live in tests/golden/ (game content: never committed, see .gitignore)."
   ],
   "scenarios": [
@@ -24,8 +25,8 @@
         { "type": "fps", "after_tick": 1100, "min": 20, "label": "menu frame rate" },
         { "type": "iopcd", "min_host": 1, "max_fail": 0, "label": "UBISOUND reads the disc through the host reader" },
         { "type": "deterministic", "label": "two runs with the same input end in the same state (EE RAM hash per second)" },
-        { "type": "audio_peak", "after_tick": 600, "min": 2000, "label": "sound is audible",
-          "known_fail": "SPU2 output is near silent (peak ~130); see CLAUDE.md, Sound" }
+        { "type": "log_absent", "pattern": "\\[IOP\\] guest call 0x[0-9a-f]+ did not return", "label": "IOP calls (RPC handlers, callbacks) run to the end" },
+        { "type": "audio_peak", "after_tick": 600, "min": 2000, "label": "sound is audible" }
       ]
     },
     {
@@ -53,16 +54,19 @@
       "input": "600:start:10,1300:cross:10,2400:cross:10,2600:start:10",
       "frames": 10000,
       "shots": [2500, 3100, 5000, 9600],
+      "env": { "PS2X_UBI_TRACE": "1" },
       "_note": "Timeline (guest VSyncs): name entry from ~2450, loading screen ~2800, Ubi Soft logo ~3000, intro cutscene ~3400-7700, level from ~8000.",
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
         { "type": "log_absent", "pattern": "\\[guest-recursion\\]|\\[guest-branch:missing-target\\]|\\[rayman-ai\\]", "label": "no runaway recursion, bad branch or broken AI tree" },
+        { "type": "log_absent", "pattern": "\\[IOP\\] guest call 0x[0-9a-f]+ did not return", "label": "IOP calls (RPC handlers, callbacks) run to the end" },
+        { "type": "log_absent", "pattern": "\\[ubi-rpc\\] .* fn=2000[0-9a-f] .* out=ffffffff", "label": "UBISOUND bank / buffer loads succeed (needs PS2X_UBI_TRACE)" },
         { "type": "shot", "tick": 2500, "min_variance": 300, "golden": "intro_name_entry.bmp", "max_diff": 20, "label": "name entry screen" },
         { "type": "shot", "tick": 3100, "min_variance": 150, "golden": "intro_ubisoft_logo.bmp", "max_diff": 20, "label": "Ubi Soft logo" },
         { "type": "shot", "tick": 5000, "min_variance": 100, "label": "intro cutscene draws" },
         { "type": "fps", "after_tick": 8500, "min": 10, "label": "first level runs" },
         { "type": "shot", "tick": 9600, "min_variance": 100, "label": "first level is visible",
-          "known_fail": "fade-in after the level loads never starts (black layer alpha 0x7c); probably waits for a UBISOUND event (CLAUDE.md issue 7)" }
+          "known_fail": "the level is drawn black although its fade-in runs; suspects: the lightmap multiply passes or VU1 clipper garbage (CLAUDE.md issue 7)" }
       ]
     }
   ]

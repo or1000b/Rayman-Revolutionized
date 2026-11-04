@@ -127,6 +127,14 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     $env:PS2X_DETERMINISTIC = '1'
     if ($sc.PSObject.Properties['deterministic'] -and -not $sc.deterministic) { $env:PS2X_DETERMINISTIC = '0' }
     if ($sc.renderer -eq 'cpu') { $env:PS2X_GS_RENDERER = 'cpu' } else { Remove-Item Env:PS2X_GS_RENDERER -ErrorAction SilentlyContinue }
+    # Extra variables of this scenario ("env": { "PS2X_UBI_TRACE": "1" }); cleared again after the run.
+    $extraEnv = @()
+    if ($sc.PSObject.Properties['env']) {
+        foreach ($p in $sc.env.PSObject.Properties) {
+            Set-Item -Path "Env:$($p.Name)" -Value ([string]$p.Value)
+            $extraEnv += $p.Name
+        }
+    }
 
     # The game paces itself to ~60 frames per second; allow 3x plus start-up before giving up.
     $timeoutSec = [int]($sc.frames / 60 * 3) + 120
@@ -142,6 +150,7 @@ function Invoke-GameRun($sc, $log, $shotDir) {
         $proc.WaitForExit()
         $code = $proc.ExitCode
     }
+    foreach ($name in $extraEnv) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
     $seconds = [math]::Round(((Get-Date) - $started).TotalSeconds)
     Write-Host "  run took $seconds s, exit code $code, log $log"
     New-Item -ItemType Directory -Force $shotDir | Out-Null

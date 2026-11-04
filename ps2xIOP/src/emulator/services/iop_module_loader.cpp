@@ -429,14 +429,29 @@ namespace ps2x::iop::detail
                               (minVaddr < kModuleLoadBase && minVaddr != 0u);
         uint32_t base = 0u;
         int64_t delta = 0;
+        // Frees the image block again if loading fails after it was allocated.
+        uint32_t imageBlock = 0u;
+        struct ImageBlockGuard
+        {
+            IopMemory &memory;
+            uint32_t &block;
+            const IopImageLoadResult &result;
+            ~ImageBlockGuard()
+            {
+                if (block != 0u && !result)
+                    (void)memory.freeAllocation(block);
+            }
+        } imageBlockGuard{memory, imageBlock, result};
         if (relocate)
         {
-            base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            // The image is a block of the IOP heap, like loadcore's AllocSysMemory on hardware.
+            base = memory.allocate(span, 0x100u);
+            if (base == 0u)
             {
                 result.error = IopImageLoadError::ArenaExhausted;
                 return result;
             }
+            imageBlock = base;
             delta = static_cast<int64_t>(base) - minVaddr;
             result.nextModuleCursor = base + span;
         }
