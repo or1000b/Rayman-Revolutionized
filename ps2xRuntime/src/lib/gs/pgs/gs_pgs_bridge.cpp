@@ -463,23 +463,27 @@ namespace ps2x::pgs
             // PS2X_PGS_BIGPRIM=1: every frame from PS2X_PGS_COVER_FROM on, untextured primitives that cover most of the
             // screen, with the depth state that decides whether they hide the picture (TEST, ZBUF, vertex Z).
             // PS2X_PGS_BIGPRIM=2: fans and sprites only (overlays, clears), not the world's strips.
+            // PS2X_PGS_BIGPRIM=3: fans and sprites, textured ones too (post-processing passes that redraw the frame).
             static const uint32_t bigPrimLog = watchBound("PS2X_PGS_BIGPRIM", 0u);
-            if (bigPrimLog != 0u && w >= 500u && h >= 350u && w <= 2048u && h <= 2048u && ((sh.prim >> 4) & 1u) == 0u &&
-                (bigPrimLog != 2u || sh.primType >= 5u) && g_frameNumber >= coverFrom() && g_bigPrimLogs < 3000u)
+            if (bigPrimLog != 0u && w >= 500u && h >= 350u && w <= 2048u && h <= 2048u &&
+                (bigPrimLog == 3u || ((sh.prim >> 4) & 1u) == 0u) && (bigPrimLog == 1u || sh.primType >= 5u) &&
+                g_frameNumber >= coverFrom() && g_bigPrimLogs < 3000u)
             {
                 ++g_bigPrimLogs;
                 const uint32_t c = sh.ctxt & 1u;
                 const uint64_t test = sh.test[c];
                 std::fprintf(stderr,
-                             "[pgs-bigprim] frame %llu type %u abe %u ctxt %u box=%d,%d..%d,%d rgba=%08x z=%#x alpha=%010llx "
+                             "[pgs-bigprim] frame %llu type %u tme %u abe %u ctxt %u box=%d,%d..%d,%d rgba=%08x z=%#x alpha=%010llx "
                              "TEST=%llx (ATE %u ATST %u AREF %02x AFAIL %u ZTE %u ZTST %u) ZBUF=%llx (ZBP %#x PSM %#x ZMSK %u) "
-                             "FRAME=%llx\n",
-                             (unsigned long long)g_frameNumber, sh.primType, (unsigned)((sh.prim >> 6) & 1u), c, minX, minY,
+                             "FRAME=%llx TEX0=%llx\n",
+                             (unsigned long long)g_frameNumber, sh.primType, (unsigned)((sh.prim >> 4) & 1u),
+                             (unsigned)((sh.prim >> 6) & 1u), c, minX, minY,
                              maxX, maxY, sh.rgba, sh.vz, (unsigned long long)sh.alpha[c], (unsigned long long)test,
                              (unsigned)(test & 1u), (unsigned)((test >> 1) & 7u), (unsigned)((test >> 4) & 0xFFu),
                              (unsigned)((test >> 12) & 3u), (unsigned)((test >> 16) & 1u), (unsigned)((test >> 17) & 3u),
                              (unsigned long long)sh.zbuf[c], (unsigned)(sh.zbuf[c] & 0x1FFu), (unsigned)((sh.zbuf[c] >> 24) & 0xFu),
-                             (unsigned)((sh.zbuf[c] >> 32) & 1u), (unsigned long long)sh.frame[c]);
+                             (unsigned)((sh.zbuf[c] >> 32) & 1u), (unsigned long long)sh.frame[c],
+                             (unsigned long long)sh.tex0[c]);
             }
             if (w >= 500u && h >= 350u && w <= 2048u && h <= 2048u && coverFrame() &&
                 g_coverLogsThisFrame < 8u && g_coverLogs < 600u)
@@ -628,6 +632,112 @@ namespace ps2x::pgs
             }
             default:
                 break;
+            }
+        }
+
+        // Bug-hunt experiments on the GIF stream (PS2X_PGS_EXPERIMENT, bit mask; off by default):
+        //   1 = neutralise the multiply passes (ALPHA 0x89 = Cd * As becomes Cd: the lightmaps are not applied);
+        //   2 = do not draw triangles that use a vertex at GS (0,0) (VU1 clipper garbage, see CLAUDE.md issue 6);
+        //   4 = do not draw context-1 primitives (Rayman: lightmap, fog and shadow passes);
+        //   8 = do not draw textured context-0 primitives (Rayman: the base pass of the world);
+        //  16 = draw textured context-0 primitives without alpha blending (opaque).
+        uint32_t experimentMask()
+        {
+            static const uint32_t mask = watchBound("PS2X_PGS_EXPERIMENT", 0u);
+            return mask;
+        }
+
+        uint64_t g_experimentPrim = 0u; // PRIM as the experiments see it (the GS register persists across packets)
+
+        bool experimentSkips(uint32_t mask)
+        {
+            const bool ctxt1 = ((g_experimentPrim >> 9) & 1u) != 0u, textured = ((g_experimentPrim >> 4) & 1u) != 0u;
+            return ((mask & 4u) != 0u && ctxt1) || ((mask & 8u) != 0u && !ctxt1 && textured);
+        }
+
+        void experimentGif(uint8_t *data, size_t bytes, uint32_t mask)
+        {
+            size_t offset = 0u;
+            while (bytes - offset >= 16u)
+            {
+                uint64_t lo = 0u, regs = 0u;
+                std::memcpy(&lo, data + offset, 8u);
+                std::memcpy(&regs, data + offset + 8u, 8u);
+                const size_t packetBytes = gifPacketBytes(data + offset);
+                if (bytes - offset < packetBytes)
+                    break;
+                const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+                const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
+                uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+                if (nreg == 0u)
+                    nreg = 16u;
+                uint8_t *body = data + offset + 16u;
+                uint32_t suppressKicks = 0u;
+                if ((lo >> 46) & 1u) // PRE
+                {
+                    g_experimentPrim = (lo >> 47) & 0x7FFu;
+                    if ((mask & 16u) != 0u && (g_experimentPrim & 0x210u) == 0x10u) // textured, context 0
+                    {
+                        lo &= ~(1ull << (47 + 6)); // ABE off
+                        std::memcpy(data + offset, &lo, 8u);
+                    }
+                }
+                if (flg == 0u) // PACKED
+                {
+                    for (uint32_t loop = 0; loop < nloop; ++loop)
+                    {
+                        for (uint32_t r = 0; r < nreg; ++r)
+                        {
+                            uint8_t *q = body + (static_cast<size_t>(loop) * nreg + r) * 16u;
+                            uint64_t qlo = 0u, qhi = 0u;
+                            std::memcpy(&qlo, q, 8u);
+                            std::memcpy(&qhi, q + 8u, 8u);
+                            const uint32_t desc = static_cast<uint32_t>((regs >> (4u * r)) & 0xFu);
+                            const bool primWrite = desc == 0x0u || (desc == 0xEu && (qhi & 0xFFu) == 0x00u);
+                            if (primWrite)
+                            {
+                                g_experimentPrim = qlo & 0x7FFu;
+                                if ((mask & 16u) != 0u && (g_experimentPrim & 0x210u) == 0x10u)
+                                {
+                                    qlo &= ~0x40ull; // ABE off
+                                    std::memcpy(q, &qlo, 8u);
+                                }
+                            }
+                            if (desc == 0xEu)
+                            {
+                                const uint32_t adReg = static_cast<uint32_t>(qhi & 0xFFu);
+                                if ((mask & 1u) != 0u && (adReg == 0x42u || adReg == 0x43u) && (qlo & 0xFFu) == 0x89u)
+                                {
+                                    qlo = (qlo & ~0xFFull) | 0x65u; // (Cd - Cd) * FIX + Cd = Cd
+                                    std::memcpy(q, &qlo, 8u);
+                                }
+                                if ((adReg == 0x04u || adReg == 0x05u) && experimentSkips(mask))
+                                {
+                                    qhi = (qhi & ~0xFFull) | (adReg + 8u); // XYZ(F)2 -> XYZ(F)3: no drawing kick
+                                    std::memcpy(q + 8u, &qhi, 8u);
+                                }
+                            }
+                            if ((desc == 0x4u || desc == 0x5u) && experimentSkips(mask))
+                            {
+                                qhi |= 1ull << 47; // ADC: no drawing kick
+                                std::memcpy(q + 8u, &qhi, 8u);
+                            }
+                            if ((mask & 2u) != 0u && (desc == 0x4u || desc == 0x5u))
+                            {
+                                // A strip or fan triangle uses the last three vertices: suppress three kicks.
+                                if ((qlo & 0xFFFFu) == 0u && ((qlo >> 32) & 0xFFFFu) == 0u)
+                                    suppressKicks = 3u;
+                                if (suppressKicks != 0u)
+                                {
+                                    --suppressKicks;
+                                    qhi |= 1ull << 47; // ADC: no drawing kick
+                                    std::memcpy(q + 8u, &qhi, 8u);
+                                }
+                            }
+                        }
+                    }
+                }
+                offset += packetBytes;
             }
         }
 
@@ -1036,7 +1146,14 @@ namespace ps2x::pgs
             bytes = joined.size();
         }
         const size_t complete = completeGifBytes(input, bytes);
-        if (complete != 0u)
+        if (complete != 0u && experimentMask() != 0u)
+        {
+            std::vector<uint8_t> changed(input, input + complete);
+            experimentGif(changed.data(), changed.size(), experimentMask());
+            analyzeGif(changed.data(), changed.size());
+            g_state->gs->gif_transfer(index, changed.data(), changed.size());
+        }
+        else if (complete != 0u)
         {
             analyzeGif(input, complete);
             g_state->gs->gif_transfer(index, input, complete);
