@@ -66,7 +66,7 @@
         { "type": "shot", "tick": 5000, "min_variance": 100, "label": "intro cutscene draws" },
         { "type": "fps", "after_tick": 8500, "min": 10, "label": "first level runs" },
         { "type": "shot", "tick": 9600, "min_variance": 100, "label": "first level is visible",
-          "known_fail": "the level is drawn black although its fade-in runs; suspects: the lightmap multiply passes or VU1 clipper garbage (CLAUDE.md issue 7)" }
+          "known_fail": "an AI script keeps a black screen effect (alpha 249/255) over the level until the camera leaves its normal comport; the intro cinematic never starts (CLAUDE.md issue 7)" }
       ]
     }
   ]

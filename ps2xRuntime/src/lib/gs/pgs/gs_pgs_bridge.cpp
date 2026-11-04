@@ -36,6 +36,8 @@ namespace ps2x::pgs
 #include <memory>
 #include <mutex>
 
+extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
+
 namespace ps2x::pgs
 {
     namespace
@@ -258,6 +260,44 @@ namespace ps2x::pgs
             return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : fallback;
         }
 
+        // PS2X_PGS_CAPTURE_VSYNC=<guest vsync>: everything the GS receives during one whole scanout frame (the first
+        // one that starts after that guest VSync) goes to out/gif_capture.bin, for offline analysis with
+        // tools/gifcap.py. Records: u32 kind (0 = GIF data, 1 = register write), u32 path index or register,
+        // u64 byte count or register value, then the bytes (GIF data only). Game content: never commit a capture.
+        std::FILE *g_captureFile = nullptr;
+        bool g_captureDone = false;
+
+        void captureRecord(uint32_t kind, uint32_t id, uint64_t sizeOrValue, const uint8_t *data)
+        {
+            if (!g_captureFile)
+                return;
+            std::fwrite(&kind, 4u, 1u, g_captureFile);
+            std::fwrite(&id, 4u, 1u, g_captureFile);
+            std::fwrite(&sizeOrValue, 8u, 1u, g_captureFile);
+            if (kind == 0u && data)
+                std::fwrite(data, 1u, static_cast<size_t>(sizeOrValue), g_captureFile);
+        }
+
+        // At every scanout: ends a running capture, or starts one once the guest has reached the asked VSync.
+        void captureFrameBoundary(uint64_t frame)
+        {
+            static const uint32_t at = watchBound("PS2X_PGS_CAPTURE_VSYNC", 0u);
+            if (g_captureFile)
+            {
+                std::fclose(g_captureFile);
+                g_captureFile = nullptr;
+                g_captureDone = true;
+                std::fprintf(stderr, "[pgs-capture] done: out/gif_capture.bin (frame %llu)\n", (unsigned long long)frame);
+                return;
+            }
+            if (at == 0u || g_captureDone || ps2xGuestVsync() < at)
+                return;
+            g_captureFile = std::fopen("out/gif_capture.bin", "wb");
+            g_captureDone = g_captureFile == nullptr;
+            std::fprintf(stderr, "[pgs-capture] %s at frame %llu, guest vsync %llu\n", g_captureFile ? "start" : "cannot open out/gif_capture.bin",
+                         (unsigned long long)frame, (unsigned long long)ps2xGuestVsync());
+        }
+
         uint32_t psmBits(uint32_t psm)
         {
             switch (psm)
@@ -464,10 +504,12 @@ namespace ps2x::pgs
             // screen, with the depth state that decides whether they hide the picture (TEST, ZBUF, vertex Z).
             // PS2X_PGS_BIGPRIM=2: fans and sprites only (overlays, clears), not the world's strips.
             // PS2X_PGS_BIGPRIM=3: fans and sprites, textured ones too (post-processing passes that redraw the frame).
+            // At most PS2X_PGS_BIGPRIM_MAX lines (default 3000).
             static const uint32_t bigPrimLog = watchBound("PS2X_PGS_BIGPRIM", 0u);
+            static const uint32_t bigPrimMax = watchBound("PS2X_PGS_BIGPRIM_MAX", 3000u);
             if (bigPrimLog != 0u && w >= 500u && h >= 350u && w <= 2048u && h <= 2048u &&
                 (bigPrimLog == 3u || ((sh.prim >> 4) & 1u) == 0u) && (bigPrimLog == 1u || sh.primType >= 5u) &&
-                g_frameNumber >= coverFrom() && g_bigPrimLogs < 3000u)
+                g_frameNumber >= coverFrom() && g_bigPrimLogs < bigPrimMax)
             {
                 ++g_bigPrimLogs;
                 const uint32_t c = sh.ctxt & 1u;
@@ -640,7 +682,8 @@ namespace ps2x::pgs
         //   2 = do not draw triangles that use a vertex at GS (0,0) (VU1 clipper garbage, see CLAUDE.md issue 6);
         //   4 = do not draw context-1 primitives (Rayman: lightmap, fog and shadow passes);
         //   8 = do not draw textured context-0 primitives (Rayman: the base pass of the world);
-        //  16 = draw textured context-0 primitives without alpha blending (opaque).
+        //  16 = draw textured context-0 primitives without alpha blending (opaque);
+        //  32 = do not draw untextured, alpha-blended black primitives (fades and dimming overlays).
         uint32_t experimentMask()
         {
             static const uint32_t mask = watchBound("PS2X_PGS_EXPERIMENT", 0u);
@@ -648,11 +691,14 @@ namespace ps2x::pgs
         }
 
         uint64_t g_experimentPrim = 0u; // PRIM as the experiments see it (the GS register persists across packets)
+        uint32_t g_experimentRgb = 0u;  // R, G, B of RGBAQ as the experiments see it
 
         bool experimentSkips(uint32_t mask)
         {
             const bool ctxt1 = ((g_experimentPrim >> 9) & 1u) != 0u, textured = ((g_experimentPrim >> 4) & 1u) != 0u;
-            return ((mask & 4u) != 0u && ctxt1) || ((mask & 8u) != 0u && !ctxt1 && textured);
+            const bool blended = ((g_experimentPrim >> 6) & 1u) != 0u;
+            return ((mask & 4u) != 0u && ctxt1) || ((mask & 8u) != 0u && !ctxt1 && textured) ||
+                   ((mask & 32u) != 0u && !textured && blended && g_experimentRgb == 0u);
         }
 
         void experimentGif(uint8_t *data, size_t bytes, uint32_t mask)
@@ -703,9 +749,13 @@ namespace ps2x::pgs
                                     std::memcpy(q, &qlo, 8u);
                                 }
                             }
+                            if (desc == 0x1u) // RGBAQ packed: R 0-7, G 32-39, B 64-71
+                                g_experimentRgb = static_cast<uint32_t>((qlo & 0xFFu) | ((qlo >> 24) & 0xFF00u) | ((qhi & 0xFFu) << 16));
                             if (desc == 0xEu)
                             {
                                 const uint32_t adReg = static_cast<uint32_t>(qhi & 0xFFu);
+                                if (adReg == 0x01u)
+                                    g_experimentRgb = static_cast<uint32_t>(qlo & 0xFFFFFFu);
                                 if ((mask & 1u) != 0u && (adReg == 0x42u || adReg == 0x43u) && (qlo & 0xFFu) == 0x89u)
                                 {
                                     qlo = (qlo & ~0xFFull) | 0x65u; // (Cd - Cd) * FIX + Cd = Cd
@@ -1145,18 +1195,22 @@ namespace ps2x::pgs
             input = joined.data();
             bytes = joined.size();
         }
+        const auto forward = [index](const uint8_t *packets, size_t size)
+        {
+            analyzeGif(packets, size);
+            captureRecord(0u, index, size, packets);
+            g_state->gs->gif_transfer(index, packets, size);
+        };
         const size_t complete = completeGifBytes(input, bytes);
         if (complete != 0u && experimentMask() != 0u)
         {
             std::vector<uint8_t> changed(input, input + complete);
             experimentGif(changed.data(), changed.size(), experimentMask());
-            analyzeGif(changed.data(), changed.size());
-            g_state->gs->gif_transfer(index, changed.data(), changed.size());
+            forward(changed.data(), changed.size());
         }
         else if (complete != 0u)
         {
-            analyzeGif(input, complete);
-            g_state->gs->gif_transfer(index, input, complete);
+            forward(input, complete);
         }
         if (complete == bytes)
             return;
@@ -1178,8 +1232,7 @@ namespace ps2x::pgs
                 std::vector<uint8_t> partial(rest, rest + 16u + imageQw * 16u);
                 const uint64_t retagged = (tagLo & ~0x7FFFull) | static_cast<uint64_t>(imageQw);
                 std::memcpy(partial.data(), &retagged, sizeof(retagged));
-                analyzeGif(partial.data(), partial.size());
-                g_state->gs->gif_transfer(index, partial.data(), partial.size());
+                forward(partial.data(), partial.size());
             }
             return;
         }
@@ -1200,6 +1253,7 @@ namespace ps2x::pgs
             return;
         bindThread();
         noteRegister(reg & 0xFFu, value); // also delivers SIGNAL / FINISH / LABEL in deterministic mode
+        captureRecord(1u, reg & 0xFFu, value, nullptr);
         g_state->gs->write_register(static_cast<ParallelGS::RegisterAddr>(reg & 0xFFu), value);
     }
 
@@ -1280,14 +1334,16 @@ namespace ps2x::pgs
         info.crtc_offsets = false;
         info.adapt_to_internal_horizontal_resolution = false;
 
-        if (watchBound("PS2X_PGS_BIGPRIM", 0u) != 0u && g_frameNumber >= coverFrom() && g_bigPrimLogs < 3000u)
+        if (watchBound("PS2X_PGS_BIGPRIM", 0u) != 0u && g_frameNumber >= coverFrom() &&
+            g_bigPrimLogs < watchBound("PS2X_PGS_BIGPRIM_MAX", 3000u))
         {
             ++g_bigPrimLogs;
-            std::fprintf(stderr, "[pgs-scan] frame %llu pmode=%llx dispfb1=%llx dispfb2=%llx\n",
-                         (unsigned long long)g_frameNumber, (unsigned long long)regs.pmode,
+            std::fprintf(stderr, "[pgs-scan] frame %llu guest vsync %llu pmode=%llx dispfb1=%llx dispfb2=%llx\n",
+                         (unsigned long long)g_frameNumber, (unsigned long long)ps2xGuestVsync(), (unsigned long long)regs.pmode,
                          (unsigned long long)regs.dispfb1, (unsigned long long)regs.dispfb2);
         }
         endFrameStats();
+        captureFrameBoundary(g_frameNumber);
         g_state->gs->flush();
         ParallelGS::ScanoutResult result = g_state->gs->vsync(info);
         if (!result.image)

@@ -494,6 +494,12 @@ extern "C" bool ps2xDeterministic()
     return on;
 }
 
+// Last guest VSync seen by ps2xTestOnGuestVSync (for tools that pick a moment by guest time, e.g. GS captures).
+extern "C" uint64_t ps2xGuestVsync()
+{
+    return g_guestVsync.load(std::memory_order_relaxed);
+}
+
 // EE thread, at every VBlank start (EeScheduler). Feeds the guest clock used in deterministic mode and
 // logs the state fingerprint used to compare two runs.
 extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uint8_t *rdram, uint32_t ramBytes)

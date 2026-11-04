@@ -1523,6 +1523,49 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    // PS2X_VU1_DUMP_RGBA=<A<<24 | B<<16 | G<<8 | R>: VU1 snapshot (dumpVu1Snapshot: microcode, data memory at MSCAL,
+    // VIF stream) at the first XGKICK whose packet sets that colour in a PACKED RGBAQ. Bug hunt: which microprogram
+    // and which input produce a given primitive.
+    static const char *dumpRgbaEnv = std::getenv("PS2X_VU1_DUMP_RGBA");
+    static const uint32_t dumpRgba = dumpRgbaEnv ? static_cast<uint32_t>(std::strtoul(dumpRgbaEnv, nullptr, 0)) : 0u;
+    static bool dumpedRgba = false;
+    if (dumpRgbaEnv && !dumpedRgba)
+    {
+        const uint8_t *p = m_xgkick.packet.data();
+        for (uint32_t off = 0u; off + 16u <= m_xgkick.totalBytes && !dumpedRgba;)
+        {
+            uint64_t tagLo = 0u, regs = 0u;
+            std::memcpy(&tagLo, p + off, 8u);
+            std::memcpy(&regs, p + off + 8u, 8u);
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 3u);
+            const uint32_t nreg = ((tagLo >> 60) & 0xFu) ? static_cast<uint32_t>((tagLo >> 60) & 0xFu) : 16u;
+            off += 16u;
+            if (flg != 0u)
+            {
+                off += flg == 1u ? ((nloop * nreg + 1u) & ~1u) * 8u : nloop * 16u;
+                continue;
+            }
+            for (uint32_t i = 0u; i < nloop * nreg && off + 16u <= m_xgkick.totalBytes; ++i, off += 16u)
+            {
+                if (((regs >> (4u * (i % nreg))) & 0xFu) != 1u)
+                    continue;
+                uint32_t w[4];
+                std::memcpy(w, p + off, 16u);
+                const uint32_t rgba = (w[0] & 0xFFu) | ((w[1] & 0xFFu) << 8) | ((w[2] & 0xFFu) << 16) | ((w[3] & 0xFFu) << 24);
+                if (rgba == dumpRgba)
+                {
+                    dumpedRgba = true;
+                    g_ps2xDbgVu1DumpsRemaining = std::max(g_ps2xDbgVu1DumpsRemaining, 1);
+                    dumpVu1Snapshot("PS2X_VU1_DUMP_RGBA match", m_state, m_cycle, m_xgkick.sourceAddress, m_xgkick.totalBytes,
+                                    m_xgkick.packet.data(), m_activeVuData, m_activeVuDataSize);
+                    std::fprintf(stderr, "[vu1-dump] RGBA %08x found in an XGKICK packet: out/vu1dump*_info.txt\n", rgba);
+                    break;
+                }
+            }
+        }
+    }
+
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)

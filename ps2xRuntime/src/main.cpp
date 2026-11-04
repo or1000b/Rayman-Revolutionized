@@ -19,6 +19,9 @@
 #include <cstring>
 #include <cstdio>
 #include <thread>
+#include <array>
+
+extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
 #if defined(_WIN32)
 // Rayman bring-up: report crashes in out\run.log. Declared by hand so <windows.h> (which clashes
@@ -244,6 +247,207 @@ namespace
         return value;
     }
 
+    // 0x155698 builds the full-screen fade quad (vertex array at 0x36FFC0): f12 = alpha (0-255), f13 = grey level,
+    // a2 = viewport. PS2X_RAYMAN_FADE_TRACE=1 logs every change of (caller, alpha, grey, viewport) with the guest
+    // VSync (bug hunt: CLAUDE.md issue 7, a black quad at alpha 249 over the first level).
+    constexpr uint32_t kRaymanFadeQuadAddr = 0x00155698u;
+    PS2Runtime::RecompiledFunction g_raymanFadeQuad = nullptr;
+
+    void raymanFadeQuadTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        struct Last
+        {
+            uint32_t ra = 0, a2 = 0;
+            float alpha = -1.0f, grey = -1.0f;
+        };
+        static Last s_last[8];
+        static uint32_t s_logs = 0u;
+        const uint32_t ra = getRegU32(ctx, 31), a2 = getRegU32(ctx, 6);
+        const float alpha = ctx->f[12], grey = ctx->f[13];
+        Last &last = s_last[(ra >> 2) & 7u];
+        if ((last.ra != ra || last.a2 != a2 || last.alpha != alpha || last.grey != grey) && s_logs < 4000u)
+        {
+            ++s_logs;
+            last = Last{ra, a2, alpha, grey};
+            std::fprintf(stderr, "[rayman-fade] vsync %llu ra=0x%x alpha=%g grey=%g viewport=0x%x a0=0x%x a1=0x%x s0=0x%x s2=0x%x\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), ra, alpha, grey, a2, getRegU32(ctx, 4),
+                         getRegU32(ctx, 5), getRegU32(ctx, 16), getRegU32(ctx, 18));
+        }
+        g_raymanFadeQuad(rdram, ctx, runtime);
+    }
+
+    // Screen-effect records (0x60 bytes each, array at 0x3796D0): +0x0 type (low byte) | state (0xF000) | flags,
+    // +0xC start time, +0x4C duration, +0x58 alpha. 0x1D46A0 creates one (a0 = type word, f12 -> +0x4C,
+    // f13 -> +0x40, f14 -> +0x44), 0x1D6B50 updates record a0 once per frame (gp-0x69F4 = frame time).
+    // Traced with PS2X_RAYMAN_FADE_TRACE: every creation, and every update of record 0 that changes it.
+    constexpr uint32_t kRaymanEffectNewAddr = 0x001D46A0u, kRaymanEffectUpdateAddr = 0x001D6B50u;
+    constexpr uint32_t kRaymanEffectRecords = 0x003796D0u;
+    PS2Runtime::RecompiledFunction g_raymanEffectNew = nullptr, g_raymanEffectUpdate = nullptr;
+
+    float readGuestF32(const uint8_t *rdram, uint32_t address)
+    {
+        const uint32_t bits = readGuest32(rdram, address);
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    void logEffectRecord(const char *what, const uint8_t *rdram, R5900Context *ctx, uint32_t index)
+    {
+        const uint32_t rec = kRaymanEffectRecords + index * 0x60u, gp = getRegU32(ctx, 28);
+        std::fprintf(stderr,
+                     "[rayman-effect] %s vsync %llu rec %u type=%08x +4=%x start=%g dur=%g alpha=%g +40=%g +44=%g +48=%g "
+                     "+50=%x | frame time=%g gp-0x69FC=%g\n",
+                     what, static_cast<unsigned long long>(ps2xGuestVsync()), index, readGuest32(rdram, rec),
+                     readGuest32(rdram, rec + 4u), readGuestF32(rdram, rec + 0xCu), readGuestF32(rdram, rec + 0x4Cu),
+                     readGuestF32(rdram, rec + 0x58u), readGuestF32(rdram, rec + 0x40u), readGuestF32(rdram, rec + 0x44u),
+                     readGuestF32(rdram, rec + 0x48u), readGuest32(rdram, rec + 0x50u), readGuestF32(rdram, gp - 0x69F4u),
+                     readGuestF32(rdram, gp - 0x69FCu));
+    }
+
+    void raymanEffectNewTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u;
+        const uint32_t type = getRegU32(ctx, 4);
+        const bool log = (type & 0xFFu) != 0x03u && s_logs < 200u; // 0x03: particles (menus, many per frame)
+        if (log)
+        {
+            ++s_logs;
+            std::fprintf(stderr, "[rayman-effect] new vsync %llu ra=0x%x type=%08x f12=%g f13=%g f14=%g a1=0x%x a2=0x%x a3=0x%x\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), getRegU32(ctx, 31), type, ctx->f[12],
+                         ctx->f[13], ctx->f[14], getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7));
+        }
+        g_raymanEffectNew(rdram, ctx, runtime);
+        if (log)
+            std::fprintf(stderr, "[rayman-effect]   -> v0=0x%x count gp-0x6A28=%u\n", getRegU32(ctx, 2),
+                         readGuest32(rdram, getRegU32(ctx, 28) - 0x6A28u));
+    }
+
+    // 0x1D4FA8: per-frame effect manager (frame time, expiry, compaction, then 0x1D6B50 for each record).
+    constexpr uint32_t kRaymanEffectTickAddr = 0x001D4FA8u;
+    PS2Runtime::RecompiledFunction g_raymanEffectTick = nullptr;
+
+    // 0x2000A0: the AI procedure "create screen effect" (a0 = actor context, a1 = node; it evaluates its arguments
+    // with 0x1DF760 and calls 0x1DA3F0(effect id, pos, pos, a3, f12 = value)). Traced with PS2X_RAYMAN_FADE_TRACE: which
+    // actor asks for which effect (first 120 distinct actor / id / value combinations).
+    constexpr uint32_t kRaymanFxProcAddr = 0x002000A0u, kRaymanFxDispatchAddr = 0x001DA3F0u;
+    PS2Runtime::RecompiledFunction g_raymanFxProc = nullptr, g_raymanFxDispatch = nullptr;
+    uint32_t g_raymanFxActor = 0u, g_raymanFxNode = 0u;
+
+    // 0x1DFC30(mind, comport): switches an AI mind to another comport (mind+8 = current, +0xC = previous). Called by
+    // 0x1F5588 (procedure 0x3B "change comport", a no-op when the mind already runs the target) and 0x1DFC00.
+    constexpr uint32_t kRaymanSetComportAddr = 0x001DFC30u, kRaymanChangeComportAddr = 0x001F5588u;
+    PS2Runtime::RecompiledFunction g_raymanSetComport = nullptr, g_raymanChangeComport = nullptr;
+
+    void raymanSetComportTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u;
+        const uint32_t mind = getRegU32(ctx, 4), comport = getRegU32(ctx, 5);
+        if (ps2xGuestVsync() >= 2880u && s_logs < 600u)
+        {
+            ++s_logs;
+            std::fprintf(stderr, "[rayman-comport] vsync %llu set mind 0x%x comport 0x%x -> 0x%x ra=0x%x\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), mind, readGuest32(rdram, mind + 8u), comport,
+                         getRegU32(ctx, 31));
+        }
+        g_raymanSetComport(rdram, ctx, runtime);
+    }
+
+    void raymanChangeComportTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u;
+        const uint32_t mind = getRegU32(ctx, 4), comport = getRegU32(ctx, 5);
+        if (ps2xGuestVsync() >= 2880u && readGuest32(rdram, mind + 8u) == comport && s_logs < 60u)
+        {
+            ++s_logs;
+            std::fprintf(stderr, "[rayman-comport] vsync %llu change mind 0x%x to its current comport 0x%x (no-op) ra=0x%x\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), mind, comport, getRegU32(ctx, 31));
+        }
+        g_raymanChangeComport(rdram, ctx, runtime);
+    }
+
+    void raymanFxProcTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_raymanFxActor = getRegU32(ctx, 4);
+        g_raymanFxNode = getRegU32(ctx, 5);
+        g_raymanFxProc(rdram, ctx, runtime);
+        g_raymanFxActor = g_raymanFxNode = 0u;
+    }
+
+    void raymanFxDispatchTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        struct Seen
+        {
+            uint32_t actor, id;
+            float value;
+        };
+        static Seen s_seen[120];
+        static uint32_t s_count = 0u;
+        const uint32_t id = getRegU32(ctx, 4);
+        const float value = ctx->f[12];
+        bool known = false;
+        for (uint32_t i = 0; i < s_count && !known; ++i)
+            known = s_seen[i].actor == g_raymanFxActor && s_seen[i].id == id && s_seen[i].value == value;
+        if (!known && s_count < 120u)
+        {
+            s_seen[s_count++] = Seen{g_raymanFxActor, id, value};
+            std::fprintf(stderr, "[rayman-fx] vsync %llu effect id 0x%x value %g a3=0x%x ra=0x%x from AI actor 0x%x node 0x%x\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), id, value, getRegU32(ctx, 7), getRegU32(ctx, 31),
+                         g_raymanFxActor, g_raymanFxNode);
+        }
+        g_raymanFxDispatch(rdram, ctx, runtime);
+    }
+
+    void raymanEffectTickTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_calls = 0u, s_logs = 0u, s_lastState = 0xFFFFFFFFu;
+        const uint32_t gp = getRegU32(ctx, 28);
+        const auto state = [&]()
+        {
+            return readGuest32(rdram, gp - 0x6A28u) | (static_cast<uint32_t>(rdram[(gp - 0x69E8u) & 0x01FFFFFFu]) << 16) |
+                   (static_cast<uint32_t>(rdram[(gp - 0x690Bu) & 0x01FFFFFFu]) << 20) |
+                   (static_cast<uint32_t>(rdram[(gp - 0x6A08u) & 0x01FFFFFFu]) << 24);
+        };
+        const uint32_t before = state();
+        g_raymanEffectTick(rdram, ctx, runtime);
+        ++s_calls;
+        const uint32_t after = state();
+        const uint64_t vs = ps2xGuestVsync();
+        if (((vs >= 2880u && after != s_lastState) || (vs >= 8340u && vs <= 8380u) || (s_calls % 500u) == 0u) && s_logs < 300u)
+        {
+            ++s_logs;
+            s_lastState = after;
+            std::fprintf(stderr, "[rayman-effect] tick #%u vsync %llu count %u->%u flags 69E8=%u 690B=%u 6A08=%u (before %08x)\n",
+                         s_calls, static_cast<unsigned long long>(ps2xGuestVsync()), before & 0xFFFFu, after & 0xFFFFu,
+                         (after >> 16) & 0xFu, (after >> 20) & 0xFu, after >> 24, before);
+            logEffectRecord("  rec0", rdram, ctx, 0u);
+        }
+    }
+
+    void raymanEffectUpdateTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u, s_calls = 0u;
+        const uint32_t index = getRegU32(ctx, 4);
+        const uint32_t rec = kRaymanEffectRecords + index * 0x60u;
+        const uint32_t typeBefore = readGuest32(rdram, rec), alphaBefore = readGuest32(rdram, rec + 0x58u);
+        const uint64_t vs = ps2xGuestVsync();
+        const bool fade = (typeBefore & 0xFFu) == 0x11u || (vs >= 8340u && vs <= 8380u); // 0x11: the full-screen fade (drawn by 0x1D5568)
+        const bool early = fade && s_calls < 6u;
+        if (early)
+            logEffectRecord("update before:", rdram, ctx, index);
+        g_raymanEffectUpdate(rdram, ctx, runtime);
+        if (!fade)
+            return;
+        ++s_calls;
+        const bool changed = readGuest32(rdram, rec) != typeBefore || readGuest32(rdram, rec + 0x58u) != alphaBefore;
+        if ((early || changed || (vs >= 8340u && vs <= 8380u) || (s_calls % 600u) == 0u) && s_logs < 400u)
+        {
+            ++s_logs;
+            std::fprintf(stderr, "[rayman-effect] update of rec %u: type before %08x\n", index, typeBefore);
+            logEffectRecord(changed ? "update changed:" : "update after: ", rdram, ctx, index);
+        }
+    }
+
     void raymanEvalTreeGuard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t node = getRegU32(ctx, 5);
@@ -338,6 +542,31 @@ namespace
         slot.actor = getRegU32(ctx, 4);
         slot.node = node;
         slot.type = node >= 0x00100000u ? (readGuest32(rdram, node + 4u) >> 24) : 0xFFu;
+
+        // PS2X_RAYMAN_AI_WATCH="lo,hi,fromVsync,toVsync": log every node in [lo, hi) dispatched between those guest
+        // VSyncs (node, type, depth, param, a2 result buffer before / after, next node). Bug hunt: which branch of a
+        // script runs and what its conditions return (CLAUDE.md issue 7: the camera script that keeps the level black).
+        static const auto watch = []()
+        {
+            std::array<uint64_t, 4> w{0u, 0u, 0u, 0u};
+            if (const char *text = std::getenv("PS2X_RAYMAN_AI_WATCH"))
+                std::sscanf(text, "%llx,%llx,%llu,%llu", reinterpret_cast<unsigned long long *>(&w[0]),
+                            reinterpret_cast<unsigned long long *>(&w[1]), reinterpret_cast<unsigned long long *>(&w[2]),
+                            reinterpret_cast<unsigned long long *>(&w[3]));
+            return w;
+        }();
+        const uint64_t vsync = watch[1] != 0u ? ps2xGuestVsync() : 0u;
+        if (watch[1] != 0u && node >= watch[0] && node < watch[1] && vsync >= watch[2] && vsync <= watch[3])
+        {
+            const uint32_t result = getRegU32(ctx, 6), word = readGuest32(rdram, node + 4u);
+            const uint32_t before0 = readGuest32(rdram, result), before1 = readGuest32(rdram, result + 4u);
+            g_raymanNodeDispatch(rdram, ctx, runtime);
+            std::fprintf(stderr, "[rayman-ai-watch] vsync %llu actor 0x%x node 0x%x type %u depth %u param 0x%x | result %08x %08x -> %08x %08x | next 0x%x\n",
+                         static_cast<unsigned long long>(vsync), slot.actor, node, word >> 24, (word >> 16) & 0xFFu,
+                         readGuest32(rdram, node), before0, before1, readGuest32(rdram, result), readGuest32(rdram, result + 4u),
+                         getRegU32(ctx, 2));
+            return;
+        }
         g_raymanNodeDispatch(rdram, ctx, runtime);
     }
 
@@ -382,6 +611,64 @@ namespace
             g_raymanNodeDispatch = runtime.lookupFunction(kRaymanNodeDispatchAddr);
             if (g_raymanNodeDispatch && runtime.registerFunction(kRaymanNodeDispatchAddr, &raymanNodeDispatchTrace))
                 std::cerr << "[hle] Rayman: AI node trace installed at 0x1DF760" << std::endl;
+        }
+
+        uint32_t fadeEntryWord = 0u;
+        std::memcpy(&fadeEntryWord, rdram + kRaymanFadeQuadAddr, sizeof(fadeEntryWord));
+        // lwc1 $f2, 0xC($a2)
+        if (std::getenv("PS2X_RAYMAN_FADE_TRACE") && fadeEntryWord == 0xC4C2000Cu && runtime.hasFunction(kRaymanFadeQuadAddr))
+        {
+            g_raymanFadeQuad = runtime.lookupFunction(kRaymanFadeQuadAddr);
+            if (g_raymanFadeQuad && runtime.registerFunction(kRaymanFadeQuadAddr, &raymanFadeQuadTrace))
+                std::cerr << "[hle] Rayman: fade quad trace installed at 0x155698" << std::endl;
+            uint32_t newWord = 0u, updateWord = 0u;
+            std::memcpy(&newWord, rdram + kRaymanEffectNewAddr, sizeof(newWord));
+            std::memcpy(&updateWord, rdram + kRaymanEffectUpdateAddr, sizeof(updateWord));
+            // addiu sp,sp,-0xC0 / addiu v1,zero,0x60
+            if (newWord == 0x27BDFF40u && updateWord == 0x24030060u && runtime.hasFunction(kRaymanEffectNewAddr) &&
+                runtime.hasFunction(kRaymanEffectUpdateAddr))
+            {
+                g_raymanEffectNew = runtime.lookupFunction(kRaymanEffectNewAddr);
+                g_raymanEffectUpdate = runtime.lookupFunction(kRaymanEffectUpdateAddr);
+                if (runtime.registerFunction(kRaymanEffectNewAddr, &raymanEffectNewTrace) &&
+                    runtime.registerFunction(kRaymanEffectUpdateAddr, &raymanEffectUpdateTrace))
+                    std::cerr << "[hle] Rayman: screen effect trace installed at 0x1D46A0 / 0x1D6B50" << std::endl;
+            }
+            uint32_t setWord = 0u, changeWord = 0u;
+            std::memcpy(&setWord, rdram + kRaymanSetComportAddr, sizeof(setWord));
+            std::memcpy(&changeWord, rdram + kRaymanChangeComportAddr, sizeof(changeWord));
+            // addiu sp,sp,-0x30 / addiu sp,sp,-0x20
+            if (setWord == 0x27BDFFD0u && changeWord == 0x27BDFFE0u && runtime.hasFunction(kRaymanSetComportAddr) &&
+                runtime.hasFunction(kRaymanChangeComportAddr))
+            {
+                g_raymanSetComport = runtime.lookupFunction(kRaymanSetComportAddr);
+                g_raymanChangeComport = runtime.lookupFunction(kRaymanChangeComportAddr);
+                if (runtime.registerFunction(kRaymanSetComportAddr, &raymanSetComportTrace) &&
+                    runtime.registerFunction(kRaymanChangeComportAddr, &raymanChangeComportTrace))
+                    std::cerr << "[hle] Rayman: comport change trace installed at 0x1DFC30 / 0x1F5588" << std::endl;
+            }
+            uint32_t procWord = 0u, dispatchWord = 0u;
+            std::memcpy(&procWord, rdram + kRaymanFxProcAddr, sizeof(procWord));
+            std::memcpy(&dispatchWord, rdram + kRaymanFxDispatchAddr, sizeof(dispatchWord));
+            // addiu sp,sp,-0x70 / lui at,0x3F80
+            if (procWord == 0x27BDFF90u && dispatchWord == 0x3C013F80u && runtime.hasFunction(kRaymanFxProcAddr) &&
+                runtime.hasFunction(kRaymanFxDispatchAddr))
+            {
+                g_raymanFxProc = runtime.lookupFunction(kRaymanFxProcAddr);
+                g_raymanFxDispatch = runtime.lookupFunction(kRaymanFxDispatchAddr);
+                if (runtime.registerFunction(kRaymanFxProcAddr, &raymanFxProcTrace) &&
+                    runtime.registerFunction(kRaymanFxDispatchAddr, &raymanFxDispatchTrace))
+                    std::cerr << "[hle] Rayman: AI effect procedure trace installed at 0x2000A0 / 0x1DA3F0" << std::endl;
+            }
+            uint32_t tickWord = 0u;
+            std::memcpy(&tickWord, rdram + kRaymanEffectTickAddr, sizeof(tickWord));
+            // lui v0,0x25
+            if (tickWord == 0x3C020025u && runtime.hasFunction(kRaymanEffectTickAddr))
+            {
+                g_raymanEffectTick = runtime.lookupFunction(kRaymanEffectTickAddr);
+                if (runtime.registerFunction(kRaymanEffectTickAddr, &raymanEffectTickTrace))
+                    std::cerr << "[hle] Rayman: screen effect manager trace installed at 0x1D4FA8" << std::endl;
+            }
         }
     }
 

@@ -82,6 +82,13 @@ reference. Bank loading ("load" module + the SPU2 allocator) is where the bank's
   per tick calls every registered driver's update (0x941c -> driver vtable +0x34). Drivers registered in 0x9480:
   0xe184 (channels), 0x129ac, 0xa7c8, 0x2338, 0xc314, 0x6008, 0x43fc, 0x79c4, 0x10780.
 
+- Streams (from `[ubi-rpc]`, 2026-11-04): "load" command 6 registers a stream bank of `SOUND\VSC.BF` (in `{lsn, bytes}`, e.g.
+  BNK_0.VSC at LSN 0x1e634b, 0x668000 bytes; `SOUND\VSC.DSC` lists the banks with offsets). "play" command 9 (0x103c: class lookup
+  0x97cc, then class vtable +0x44) hands the driver one block: in `{class, instance, 0, bytes, lsn, bytes, 0x400}`, out `{class,
+  instance}`. In the menu the EE sends one ~55 KB block about every 2 s. A stream can also start with "play" command 2 carrying the
+  block descriptors (type word `02042256`: two channels), as at the first level's start; there the EE never sends a next block
+  (CLAUDE.md, Sound: background music missing). The IOP reads 9-sector chunks with sceCdRead + sceCdCallback meanwhile.
+
 ### Oracle bugs found and fixed (2026-11-04)
 1. **SSA = 0**: the IOP ran RPC handlers synchronously with a 2M-instruction cap. Load command 2 (1.8 MiB by PIO)
    needs far more, so it was cut off: a third of the bank in SPU2 RAM and an unwritten reply (`{0, 0}`), so the game
