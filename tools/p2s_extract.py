@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# Extract members of a PCSX2 .p2s (zip with zstd, method 93) using PCSX2's own zstd.dll.
+# Extract members of a PCSX2 save state (.p2s = zip with zstd, method 93) with PCSX2's own zstd.dll.
+# usage: python -I tools/p2s_extract.py <state.p2s> <out dir> [eeMemory.bin Screenshot.png ...]
+# eeMemory.bin is the 32 MiB EE RAM: compare it with our runs (same executable, same addresses).
 import ctypes, struct, sys, zipfile
 src, outdir, names = sys.argv[1], sys.argv[2], sys.argv[3:]
 zstd = ctypes.CDLL(r'D:/PCSX2/zstd.dll')
