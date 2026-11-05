@@ -591,9 +591,12 @@ namespace ps2x::iop::detail
     }
 }
 
-// Host audio: fill `frames` interleaved stereo int16 frames from the SPU2 output ring. When the
-// emulation runs slower than real time the ring drains; playback then slows down smoothly
-// (pitch drops) instead of stuttering. Returns the number of frames produced from SPU2 output.
+// Host audio: fill `frames` interleaved stereo int16 frames from the SPU2 output ring. Playback keeps the
+// original pitch: the rate only follows the ring's fill within +-0.5% (inaudible). When the emulation falls
+// behind (start-up, loading screens) and the ring runs dry, output fades to silence and waits until the ring
+// holds the target fill again, then resumes at normal speed: a short gap instead of slowed-down music (with a
+// +-10% correction the music audibly slowed down after every loading screen). Returns the frames produced from
+// SPU2 output.
 extern "C" int ps2xSpu2ReadSamples(int16_t *out, int frames)
 {
     using namespace ps2x::iop::detail;
@@ -605,8 +608,12 @@ extern "C" int ps2xSpu2ReadSamples(int16_t *out, int frames)
     constexpr double kTargetFill = 4800.0; // 100 ms
     const double fill = static_cast<double>(w - r);
     double target = 1.0 + (fill - kTargetFill) / (4.0 * kTargetFill);
-    target = std::clamp(target, 0.90, 1.10); // small drift correction only: underruns go silent, never slow-motion
+    target = std::clamp(target, 0.995, 1.005);
     ring.rate += (target - ring.rate) * 0.05;
+    // After running dry, wait for the ring to refill before playing again (no stop-start crackle).
+    static bool s_refilling = true;
+    if (s_refilling && fill >= kTargetFill)
+        s_refilling = false;
     int produced = 0;
     bool starved = false;
     // Last output sample, faded out when the emulator falls behind so a starved buffer does not click.
@@ -614,8 +621,9 @@ extern "C" int ps2xSpu2ReadSamples(int16_t *out, int frames)
     static int32_t s_lastR = 0;
     for (int i = 0; i < frames; ++i)
     {
-        if (r + 1u >= w)
+        if (s_refilling || r + 1u >= w)
         {
+            s_refilling = true;
             s_lastL = (s_lastL * 31) / 32;
             s_lastR = (s_lastR * 31) / 32;
             out[i * 2] = static_cast<int16_t>(s_lastL);

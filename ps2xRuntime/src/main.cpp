@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <thread>
 #include <array>
 
@@ -574,6 +575,100 @@ namespace
         }
     }
 
+    // 0x101B20(perso): the mechanics (dynamics) step of one actor: [sub+8] = dynamics, handler from the table at
+    // gp-0x74A8 indexed by 0x12B698(type), called with the frame time. With PS2X_RAYMAN_ACTOR_TRACE, every step that
+    // moves an actor by more than 10 units is logged (CLAUDE.md issue 7: the entrance marker jumps 60 units at 8346).
+    constexpr uint32_t kRaymanMechanicsAddr = 0x00101B20u;
+    PS2Runtime::RecompiledFunction g_raymanMechanics = nullptr;
+
+    void raymanMechanicsTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t s_logs = 0u;
+        const uint32_t perso = getRegU32(ctx, 4), sub = readGuest32(rdram, perso + 4u);
+        const float x0 = readGuestF32(rdram, sub + 0x74u), y0 = readGuestF32(rdram, sub + 0x78u), z0 = readGuestF32(rdram, sub + 0x7Cu);
+        const uint32_t dyn = readGuest32(rdram, sub + 8u);
+        g_raymanMechanics(rdram, ctx, runtime);
+        const float x1 = readGuestF32(rdram, sub + 0x74u), y1 = readGuestF32(rdram, sub + 0x78u), z1 = readGuestF32(rdram, sub + 0x7Cu);
+        const float moved = std::fabs(x1 - x0) + std::fabs(y1 - y0) + std::fabs(z1 - z0);
+        if (moved > 10.0f && s_logs < 100u)
+        {
+            ++s_logs;
+            const uint32_t mech = dyn ? readGuest32(rdram, dyn + 0x1Cu) : 0u;
+            std::fprintf(stderr,
+                         "[rayman-mechanics] vsync %llu perso 0x%x sub 0x%x moved %.2f %.2f %.2f -> %.2f %.2f %.2f | dynamics 0x%x mech 0x%x "
+                         "words %08x %08x %08x %08x\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), perso, sub, x0, y0, z0, x1, y1, z1, dyn, mech,
+                         mech ? readGuest32(rdram, mech) : 0u, mech ? readGuest32(rdram, mech + 4u) : 0u,
+                         mech ? readGuest32(rdram, mech + 8u) : 0u, mech ? readGuest32(rdram, mech + 0xCu) : 0u);
+        }
+    }
+
+    // Generic write probe: PS2X_RAYMAN_PROBE="addr:func1,func2,..." (hex) wraps up to 8 guest functions and logs every
+    // call after which the 3 words at addr differ from before: which function writes a value (the recompiled code has
+    // no data watchpoints). Bug hunt tool.
+    struct RaymanProbe
+    {
+        uint32_t addr = 0u;
+        uint32_t funcs[8] = {};
+        PS2Runtime::RecompiledFunction originals[8] = {};
+        uint32_t count = 0u, logs = 0u;
+    } g_raymanProbe;
+
+    float bitsToFloat(uint32_t bits)
+    {
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    template <int N>
+    void raymanProbeTrampoline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        auto &p = g_raymanProbe;
+        static bool s_first = true;
+        if (s_first)
+        {
+            s_first = false;
+            std::fprintf(stderr, "[rayman-probe] first call of 0x%x at vsync %llu, @%x = %08x\n", p.funcs[N],
+                         static_cast<unsigned long long>(ps2xGuestVsync()), p.addr, readGuest32(rdram, p.addr));
+        }
+        const uint32_t a0 = getRegU32(ctx, 4), ra = getRegU32(ctx, 31);
+        const uint32_t w0 = readGuest32(rdram, p.addr), w1 = readGuest32(rdram, p.addr + 4u), w2 = readGuest32(rdram, p.addr + 8u);
+        p.originals[N](rdram, ctx, runtime);
+        const uint32_t v0 = readGuest32(rdram, p.addr), v1 = readGuest32(rdram, p.addr + 4u), v2 = readGuest32(rdram, p.addr + 8u);
+        if ((w0 != v0 || w1 != v1 || w2 != v2) && p.logs < 200u)
+        {
+            ++p.logs;
+            std::fprintf(stderr, "[rayman-probe] vsync %llu func 0x%x (a0 0x%x ra 0x%x) changed @%x: %.2f %.2f %.2f -> %.2f %.2f %.2f\n",
+                         static_cast<unsigned long long>(ps2xGuestVsync()), p.funcs[N], a0, ra, p.addr, bitsToFloat(w0),
+                         bitsToFloat(w1), bitsToFloat(w2), bitsToFloat(v0), bitsToFloat(v1), bitsToFloat(v2));
+        }
+    }
+
+    void installRaymanProbe(PS2Runtime &runtime)
+    {
+        const char *spec = std::getenv("PS2X_RAYMAN_PROBE");
+        if (!spec)
+            return;
+        static constexpr PS2Runtime::RecompiledFunction kTrampolines[8] = {
+            &raymanProbeTrampoline<0>, &raymanProbeTrampoline<1>, &raymanProbeTrampoline<2>, &raymanProbeTrampoline<3>,
+            &raymanProbeTrampoline<4>, &raymanProbeTrampoline<5>, &raymanProbeTrampoline<6>, &raymanProbeTrampoline<7>};
+        auto &p = g_raymanProbe;
+        char *end = nullptr;
+        p.addr = static_cast<uint32_t>(std::strtoul(spec, &end, 16));
+        while (end && *end && p.count < 8u)
+        {
+            const uint32_t func = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+            if (func == 0u || !runtime.hasFunction(func))
+                continue;
+            p.funcs[p.count] = func;
+            p.originals[p.count] = runtime.lookupFunction(func);
+            if (runtime.registerFunction(func, kTrampolines[p.count]))
+                std::cerr << "[hle] Rayman: write probe on 0x" << std::hex << func << " for 0x" << p.addr << std::dec << std::endl;
+            ++p.count;
+        }
+    }
+
     // 0x1F5910: AI procedures 0xA6-0xA8 (0xA6(n, v): bit n-1 of an actor's flags word, engine+0x2C). With
     // PS2X_RAYMAN_ACTOR_TRACE, every call is logged with the flags of Rayman (engine 0x9711B0 in the first level) before
     // and after, the calling actor context and the node.
@@ -800,6 +895,8 @@ namespace
                 std::cerr << "[hle] Rayman: AI node trace installed at 0x1DF760" << std::endl;
         }
 
+        installRaymanProbe(runtime);
+
         uint32_t entranceWord = 0u;
         std::memcpy(&entranceWord, rdram + kRaymanEntranceByteAddr, sizeof(entranceWord));
         // lw v1,4(a0)
@@ -819,6 +916,15 @@ namespace
             g_raymanActorFrame = runtime.lookupFunction(kRaymanActorFrameAddr);
             if (g_raymanActorFrame && runtime.registerFunction(kRaymanActorFrameAddr, &raymanActorFrameTrace))
                 std::cerr << "[hle] Rayman: actor frame trace installed at 0x101BF0" << std::endl;
+            uint32_t mechanicsWord = 0u;
+            std::memcpy(&mechanicsWord, rdram + kRaymanMechanicsAddr, sizeof(mechanicsWord));
+            // addiu sp,sp,-0x60
+            if (mechanicsWord == 0x27BDFFA0u && runtime.hasFunction(kRaymanMechanicsAddr))
+            {
+                g_raymanMechanics = runtime.lookupFunction(kRaymanMechanicsAddr);
+                if (g_raymanMechanics && runtime.registerFunction(kRaymanMechanicsAddr, &raymanMechanicsTrace))
+                    std::cerr << "[hle] Rayman: mechanics step trace installed at 0x101B20" << std::endl;
+            }
             uint32_t sectorWord = 0u;
             std::memcpy(&sectorWord, rdram + kRaymanSectorChangeAddr, sizeof(sectorWord));
             // addiu sp,sp,-0x20
