@@ -1583,6 +1583,49 @@ void VU1Interpreter::finishXgkick()
         }
     }
 
+    // PS2X_VU1_DUMP_NEGQ=<guest vsync>: VU1 snapshot at the first XGKICK from that VSync on whose packet holds a PACKED
+    // STQ with Q < 0 (a vertex behind the camera reached the GS: the microcode's clipper let it through). Bug hunt:
+    // the black wedges of the menus' 3D background (CLAUDE.md issue 6).
+    static const char *dumpNegQEnv = std::getenv("PS2X_VU1_DUMP_NEGQ");
+    static const uint64_t dumpNegQFrom = dumpNegQEnv ? std::strtoull(dumpNegQEnv, nullptr, 10) : 0u;
+    static bool dumpedNegQ = false;
+    if (dumpNegQEnv && !dumpedNegQ && ps2xGuestVsync() >= dumpNegQFrom)
+    {
+        const uint8_t *p = m_xgkick.packet.data();
+        for (uint32_t off = 0u; off + 16u <= m_xgkick.totalBytes && !dumpedNegQ;)
+        {
+            uint64_t tagLo = 0u, regs = 0u;
+            std::memcpy(&tagLo, p + off, 8u);
+            std::memcpy(&regs, p + off + 8u, 8u);
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 3u);
+            const uint32_t nreg = ((tagLo >> 60) & 0xFu) ? static_cast<uint32_t>((tagLo >> 60) & 0xFu) : 16u;
+            off += 16u;
+            if (flg != 0u)
+            {
+                off += flg == 1u ? ((nloop * nreg + 1u) & ~1u) * 8u : nloop * 16u;
+                continue;
+            }
+            for (uint32_t i = 0u; i < nloop * nreg && off + 16u <= m_xgkick.totalBytes; ++i, off += 16u)
+            {
+                if (((regs >> (4u * (i % nreg))) & 0xFu) != 2u)
+                    continue;
+                float q = 0.0f;
+                std::memcpy(&q, p + off + 8u, 4u);
+                if (q < 0.0f)
+                {
+                    dumpedNegQ = true;
+                    g_ps2xDbgVu1DumpsRemaining = std::max(g_ps2xDbgVu1DumpsRemaining, 1);
+                    dumpVu1Snapshot("PS2X_VU1_DUMP_NEGQ match", m_state, m_cycle, m_xgkick.sourceAddress, m_xgkick.totalBytes,
+                                    m_xgkick.packet.data(), m_activeVuData, m_activeVuDataSize);
+                    std::fprintf(stderr, "[vu1-dump] Q %g < 0 in an XGKICK packet at vsync %llu (packet offset 0x%x): out/vu1dump*_info.txt\n",
+                                 q, static_cast<unsigned long long>(ps2xGuestVsync()), off);
+                    break;
+                }
+            }
+        }
+    }
+
     // PS2X_VU1_KICK_HASH=1: a running FNV-1a hash of every XGKICK packet, printed every 600 guest VSyncs
     // (`[vu1-hash]`). Two builds that print the same hashes sent the GS the same bytes: an equivalence check for
     // VU1 interpreter changes.
@@ -2579,13 +2622,28 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             const char *env = std::getenv("PS2X_VU0_TRACE");
             return (env && *env) ? std::strtoull(env, nullptr, 10) : ~0ull;
         }();
-        if (m_unit == Unit::VU0 && vu0TraceVsync != ~0ull && g_vu0TraceThisRun && ps2xGuestVsync() == vu0TraceVsync)
+        // PS2X_VU1_TRACE_CYCLES="from,to": the same trace for VU1 pairs whose cycle (m_cycle, as printed by the VU1
+        // dumps' info files) lies in that window (`[vu1-trace]`).
+        static uint64_t vu1TraceFrom = 0u, vu1TraceTo = 0u;
+        static const bool vu1Trace = []
+        {
+            const char *env = std::getenv("PS2X_VU1_TRACE_CYCLES");
+            if (!env || !*env)
+                return false;
+            char *end = nullptr;
+            vu1TraceFrom = std::strtoull(env, &end, 10);
+            vu1TraceTo = (end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : vu1TraceFrom + 10000u;
+            return true;
+        }();
+        const bool traceVu0 = m_unit == Unit::VU0 && vu0TraceVsync != ~0ull && g_vu0TraceThisRun && ps2xGuestVsync() == vu0TraceVsync;
+        const bool traceVu1 = vu1Trace && m_unit == Unit::VU1 && m_cycle >= vu1TraceFrom && m_cycle <= vu1TraceTo;
+        if (traceVu0 || traceVu1)
         {
             static uint32_t traced = 0u;
             if (traced++ < 60000u)
             {
-                std::fprintf(stderr, "[vu0-trace] pc %04x cyc %llu %08x %08x", m_state.pc, static_cast<unsigned long long>(m_cycle),
-                             decoded.upper, decoded.lower);
+                std::fprintf(stderr, "[%s-trace] pc %04x cyc %llu %08x %08x clip=%06x", traceVu1 ? "vu1" : "vu0", m_state.pc,
+                             static_cast<unsigned long long>(m_cycle), decoded.upper, decoded.lower, m_state.clip);
                 if (hasUpperWrite)
                     std::fprintf(stderr, " | vf%u=%g %g %g %g", upperWrite.reg, m_state.vf[upperWrite.reg][0],
                                  m_state.vf[upperWrite.reg][1], m_state.vf[upperWrite.reg][2], m_state.vf[upperWrite.reg][3]);
