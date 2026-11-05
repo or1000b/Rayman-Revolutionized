@@ -29,6 +29,10 @@
 #include <sstream>
 #include <cstdio>
 #include <filesystem>
+#include <cstdlib>
+#include <string>
+
+extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
 void ps2xDebugDumpSemaphoreHistory(int id); // EeScheduler.cpp (Rayman bring-up)
 extern "C" void ps2xRequestGsCapture();         // gs_cpu_backend.cpp
@@ -1485,6 +1489,206 @@ namespace
     // pending pc (recursion: f -> ... -> f hits a checkpoint while about to call f again) looked like
     // "callee returned without touching pc" and resumed after the call with garbage registers.
     thread_local bool t_guestYieldPending = false;
+
+    // Guest call stack of this thread (dispatchGuestBranch): the recursion guard's report and the watchpoint below.
+    struct GuestCallFrame
+    {
+        uint32_t target, source, a0, a1, a2, a3, sp, ra;
+    };
+    constexpr uint32_t kMaxGuestCallDepth = 4000u;
+    thread_local uint32_t t_guestCallDepth = 0u;
+    thread_local GuestCallFrame t_guestCallFrames[kMaxGuestCallDepth];
+
+    // Bug hunt: a memory watchpoint at call granularity. PS2X_EE_WATCH="addr[,addr...][;fromVsync,toVsync]" (hex
+    // addresses, decimal VSyncs, up to 4 words of EE RAM) logs `[ee-watch]` whenever a word changed since the last guest
+    // call / jump / return: "at entry" of a call from S means the code before S in S's function wrote it, "after
+    // return" of a call to T means T's own code (after its last nested call) did. Every guest call goes through
+    // dispatchGuestBranch, so unlike a wrapper around one function this sees writes wherever they happen.
+    struct EeWatch
+    {
+        uint32_t addr[4] = {};
+        uint32_t last[4] = {};
+        uint32_t count = 0u;
+        uint64_t from = 0u, to = ~0ull;
+        uint32_t logged = 0u;
+    };
+    EeWatch &eeWatch()
+    {
+        static EeWatch w = []
+        {
+            EeWatch r;
+            const char *env = std::getenv("PS2X_EE_WATCH");
+            if (!env || !*env)
+                return r;
+            std::string spec(env);
+            const size_t semi = spec.find(';');
+            std::string addrs = spec.substr(0, semi);
+            size_t pos = 0;
+            while (pos < addrs.size() && r.count < 4u)
+            {
+                const size_t comma = addrs.find(',', pos);
+                const std::string tok = addrs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!tok.empty())
+                    r.addr[r.count++] = static_cast<uint32_t>(std::strtoul(tok.c_str(), nullptr, 16)) & 0x1FFFFFCu;
+                if (comma == std::string::npos)
+                    break;
+                pos = comma + 1;
+            }
+            if (semi != std::string::npos)
+            {
+                const std::string range = spec.substr(semi + 1);
+                r.from = std::strtoull(range.c_str(), nullptr, 10);
+                const size_t comma = range.find(',');
+                if (comma != std::string::npos)
+                    r.to = std::strtoull(range.c_str() + comma + 1, nullptr, 10);
+            }
+            std::fprintf(stderr, "[ee-watch] watching %u word(s) from VSync %llu to %llu\n", r.count,
+                         static_cast<unsigned long long>(r.from), static_cast<unsigned long long>(r.to));
+            return r;
+        }();
+        return w;
+    }
+
+    void eeWatchCheck(const uint8_t *rdram, R5900Context *ctx, const char *where, uint32_t sourcePc, uint32_t targetPc)
+    {
+        EeWatch &w = eeWatch();
+        if (w.count == 0u)
+            return;
+        for (uint32_t i = 0; i < w.count; ++i)
+        {
+            uint32_t value;
+            std::memcpy(&value, rdram + w.addr[i], 4u);
+            if (value == w.last[i])
+                continue;
+            const uint32_t old = w.last[i];
+            w.last[i] = value;
+            const uint64_t vsync = ps2xGuestVsync();
+            if (vsync < w.from || vsync >= w.to || w.logged >= 4000u)
+                continue;
+            ++w.logged;
+            float oldF, newF;
+            std::memcpy(&oldF, &old, 4u);
+            std::memcpy(&newF, &value, 4u);
+            std::fprintf(stderr, "[ee-watch] vsync %llu [0x%x] 0x%08x (%g) -> 0x%08x (%g) %s 0x%x -> 0x%x ra=0x%x stack:",
+                         static_cast<unsigned long long>(vsync), w.addr[i], old, oldF, value, newF, where, sourcePc,
+                         targetPc, getRegU32(ctx, 31));
+            const uint32_t first = t_guestCallDepth > 12u ? t_guestCallDepth - 12u : 0u;
+            for (uint32_t f = first; f < t_guestCallDepth; ++f)
+                std::fprintf(stderr, " %x<-%x", t_guestCallFrames[f].target, t_guestCallFrames[f].source);
+            std::fprintf(stderr, "\n");
+        }
+    }
+
+    // Bug hunt: log the arguments of chosen guest functions at entry, with memory they point to.
+    // PS2X_EE_CALL_LOG="func[:reg:bytes...][,func...][;fromVsync,toVsync]" (hex; reg = a0-a3, t0-t3, s0-s7 or sp), e.g.
+    // "12e260:a3:1a0:a0:340" logs each call of 0x12e260 with 0x1a0 bytes at a3 and 0x340 bytes at a0 (words and floats).
+    struct EeCallLog
+    {
+        struct Dump
+        {
+            int reg = 0;
+            uint32_t bytes = 0u;
+        };
+        struct Func
+        {
+            uint32_t pc = 0u;
+            Dump dumps[4];
+            uint32_t dumpCount = 0u;
+        };
+        Func funcs[8];
+        uint32_t count = 0u;
+        uint64_t from = 0u, to = ~0ull;
+        uint32_t logged = 0u;
+    };
+    int eeRegisterByName(const std::string &name)
+    {
+        static const char *const kNames[32] = {"zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2",
+                                               "t3",   "t4", "t5", "t6", "t7", "s0", "s1", "s2", "s3", "s4", "s5",
+                                               "s6",   "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+        for (int i = 0; i < 32; ++i)
+            if (name == kNames[i])
+                return i;
+        return -1;
+    }
+    EeCallLog &eeCallLog()
+    {
+        static EeCallLog c = []
+        {
+            EeCallLog r;
+            const char *env = std::getenv("PS2X_EE_CALL_LOG");
+            if (!env || !*env)
+                return r;
+            std::string spec(env);
+            const size_t semi = spec.find(';');
+            std::stringstream funcs(spec.substr(0, semi));
+            std::string item;
+            while (std::getline(funcs, item, ',') && r.count < 8u)
+            {
+                std::stringstream parts(item);
+                std::string part;
+                if (!std::getline(parts, part, ':') || part.empty())
+                    continue;
+                EeCallLog::Func &f = r.funcs[r.count++];
+                f.pc = static_cast<uint32_t>(std::strtoul(part.c_str(), nullptr, 16));
+                std::string reg, bytes;
+                while (f.dumpCount < 4u && std::getline(parts, reg, ':') && std::getline(parts, bytes, ':'))
+                {
+                    const int index = eeRegisterByName(reg);
+                    if (index >= 0)
+                        f.dumps[f.dumpCount++] = {index, static_cast<uint32_t>(std::strtoul(bytes.c_str(), nullptr, 16))};
+                }
+            }
+            if (semi != std::string::npos)
+            {
+                const std::string range = spec.substr(semi + 1);
+                r.from = std::strtoull(range.c_str(), nullptr, 10);
+                const size_t comma = range.find(',');
+                if (comma != std::string::npos)
+                    r.to = std::strtoull(range.c_str() + comma + 1, nullptr, 10);
+            }
+            std::fprintf(stderr, "[ee-call] logging %u function(s) from VSync %llu to %llu\n", r.count,
+                         static_cast<unsigned long long>(r.from), static_cast<unsigned long long>(r.to));
+            return r;
+        }();
+        return c;
+    }
+
+    void eeCallLogCheck(const uint8_t *rdram, R5900Context *ctx, uint32_t sourcePc, uint32_t targetPc)
+    {
+        EeCallLog &c = eeCallLog();
+        if (c.count == 0u)
+            return;
+        for (uint32_t i = 0; i < c.count; ++i)
+        {
+            const EeCallLog::Func &f = c.funcs[i];
+            if (f.pc != targetPc)
+                continue;
+            const uint64_t vsync = ps2xGuestVsync();
+            if (vsync < c.from || vsync >= c.to || c.logged >= 2000u)
+                return;
+            ++c.logged;
+            std::fprintf(stderr,
+                         "[ee-call] vsync %llu 0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x t0=%x t1=%x t2=%x f12=%g sp=%x ra=%x\n",
+                         static_cast<unsigned long long>(vsync), targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5),
+                         getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10),
+                         ctx->f[12], getRegU32(ctx, 29), getRegU32(ctx, 31));
+            for (uint32_t d = 0; d < f.dumpCount; ++d)
+            {
+                const uint32_t base = getRegU32(ctx, f.dumps[d].reg) & 0x1FFFFFCu;
+                const uint32_t bytes = std::min<uint32_t>(f.dumps[d].bytes, 0x1000u);
+                for (uint32_t off = 0; off < bytes && base + off + 16u <= PS2_RAM_SIZE; off += 16u)
+                {
+                    uint32_t w[4];
+                    float v[4];
+                    std::memcpy(w, rdram + base + off, 16u);
+                    std::memcpy(v, rdram + base + off, 16u);
+                    std::fprintf(stderr, "[ee-call]   @%x+%03x: %08x %08x %08x %08x | %g %g %g %g\n", base, off, w[0], w[1], w[2],
+                                 w[3], v[0], v[1], v[2], v[3]);
+                }
+            }
+            return;
+        }
+    }
 }
 
 // Scheduler (EeScheduler::run): about to (re)enter guest code at the root of the host stack.
@@ -1517,6 +1721,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    eeWatchCheck(rdram, ctx, "at entry", sourcePc, targetPc);
+    if (isCall)
+        eeCallLogCheck(rdram, ctx, sourcePc, targetPc);
 
     BranchTraceEntry &trace = t_branchTrace[t_branchTracePos++ % 64u];
     trace = BranchTraceEntry{targetPc, sourcePc, getRegU32(ctx, 5), 0u, 0u, static_cast<int>(kind), '?'};
@@ -1581,13 +1788,6 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Runaway guest recursion guard. Each guest call is a nested host call, so a guest walk that never ends (Rayman's
     // AI evaluator on an uninitialised, all-zero tree) overflows the host stack and kills the process with no report.
     // Real guest call chains stay well below this depth.
-    struct GuestCallFrame
-    {
-        uint32_t target, source, a0, a1, a2, a3, sp, ra;
-    };
-    constexpr uint32_t kMaxGuestCallDepth = 4000u;
-    static thread_local uint32_t t_guestCallDepth = 0u;
-    static thread_local GuestCallFrame t_guestCallFrames[kMaxGuestCallDepth];
     if (t_guestCallDepth >= kMaxGuestCallDepth)
     {
         static std::atomic<bool> s_reported{false};
@@ -1630,6 +1830,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
+    eeWatchCheck(rdram, ctx, "after return", sourcePc, targetPc);
 
     if (isStopRequested() || ctx->pc == 0u || t_guestYieldPending)
     {

@@ -58,7 +58,10 @@ namespace ps2recomp
                                    "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
                                    ft, fd, fs, ft);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // The EE's SQRT.S is "SQRT.S fd, ft": the operand is in the ft field and fs is 0 (EE Core Instruction
+                // Set Manual; PCSX2 reads Ft too). Reading fs took sqrt(f0) for 107 of Rayman's 325 square roots (a
+                // collision response threw an entrance marker 60 units: CLAUDE.md issue 7).
+                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:

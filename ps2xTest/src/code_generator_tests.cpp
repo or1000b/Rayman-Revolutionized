@@ -1020,6 +1020,24 @@ void register_code_generator_tests()
             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
         });
 
+        tc.Run("SQRT.S reads its operand from ft, not fs", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            // 0x46010184 (Rayman, 0x12EE64): SQRT.S f6, f1 with fs = 0. The EE takes the root of ft.
+            Instruction sqrt{};
+            sqrt.opcode = OPCODE_COP1;
+            sqrt.rs = COP1_S;
+            sqrt.rt = 1;
+            sqrt.rd = 0;
+            sqrt.sa = 6;
+            sqrt.function = COP1_S_SQRT;
+
+            std::string code = gen.translateInstruction(sqrt);
+            printGeneratedCode("SQRT.S reads its operand from ft, not fs", code);
+            t.IsTrue(code.find("ctx->f[6] = FPU_SQRT_S(ctx->f[1])") != std::string::npos,
+                     "SQRT.S f6, f1 should write f6 from the root of f1 (ft)");
+        });
+
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)
             {
                 CodeGenerator gen({}, {});
