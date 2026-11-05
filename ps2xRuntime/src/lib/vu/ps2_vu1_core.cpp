@@ -38,6 +38,10 @@ namespace
         uint32_t viMask = 0;
         uint32_t accMask = 0;
         bool masksValid = false;
+        // Set by rebuildDecodedCodeCache when no instruction of the loaded microcode reads the MAC or status flags
+        // (FSEQ / FSAND / FSOR / FMEQ / FMAND / FMOR): updateFmacFlags then skips its pipeline entry (~5% of VU1 time
+        // plus the commits). Clip flags (CLIP / FC*) are not affected.
+        bool macStatusUnread = false;
     };
     VuSideState g_vuSide[4];
 
@@ -695,6 +699,12 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
 {
     if (dest == 0u)
         return;
+    if (m_decodedCodeCacheValid)
+    {
+        const VuSideState *flagSide = vuSide(this);
+        if (flagSide && flagSide->macStatusUnread)
+            return;
+    }
 
     uint32_t mac = 0u;
     uint32_t status = 0u;
@@ -2205,8 +2215,20 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
                                              const PS2Memory *memory, uint64_t generation)
 {
     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
+    bool readsMacStatus = codeSize / 8u > kMaxDecodedPairs; // code past the cache: unknown, keep the flags
     for (uint32_t i = 0; i < pairCount; ++i)
+    {
         m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+        const DecodedInstructionPair &pair = m_decodedCodeCache[i];
+        if (!pair.iBit)
+        {
+            const uint32_t op = pair.lower >> 25;
+            if (op == 0x14u || op == 0x16u || op == 0x17u || op == 0x18u || op == 0x1Au || op == 0x1Bu)
+                readsMacStatus = true;
+        }
+    }
+    if (VuSideState *side = vuSide(this))
+        side->macStatusUnread = !readsMacStatus;
 
     m_cachedVuCode = vuCode;
     m_cachedMemory = memory;

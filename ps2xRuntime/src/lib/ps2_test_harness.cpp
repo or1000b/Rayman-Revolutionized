@@ -26,6 +26,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -289,6 +290,112 @@ namespace
         std::fflush(stderr);
         return EXCEPTION_CONTINUE_SEARCH;
     }
+
+    // Native sampling profiler: PS2X_NATIVE_PROF="fromTick,toTick" samples the GameThread's native stack about every
+    // millisecond between those window ticks, then prints `[nprof]` tables: functions by exclusive samples (the
+    // function the thread was in) and by inclusive samples (anywhere on the stack). Bug hunt / performance tool.
+    void nativeProfilerLoop(uint64_t fromTick, uint64_t toTick)
+    {
+        DWORD gameThreadId = 0;
+        while (gameThreadId == 0 && !g_exiting.load())
+        {
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap != INVALID_HANDLE_VALUE)
+            {
+                THREADENTRY32 te = {};
+                te.dwSize = sizeof(te);
+                for (BOOL ok = Thread32First(snap, &te); ok && gameThreadId == 0; ok = Thread32Next(snap, &te))
+                {
+                    if (te.th32OwnerProcessID != GetCurrentProcessId())
+                        continue;
+                    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+                    if (!h)
+                        continue;
+                    PWSTR desc = nullptr;
+                    if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc)
+                    {
+                        if (std::wstring(desc) == L"GameThread")
+                            gameThreadId = te.th32ThreadID;
+                        LocalFree(desc);
+                    }
+                    CloseHandle(h);
+                }
+                CloseHandle(snap);
+            }
+            if (gameThreadId == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, gameThreadId);
+        if (!thread)
+            return;
+        while (g_tick.load() < fromTick && !g_exiting.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::fprintf(stderr, "[nprof] sampling GameThread %lu from tick %llu\n", gameThreadId,
+                     static_cast<unsigned long long>(g_tick.load()));
+        std::vector<std::vector<DWORD64>> samples;
+        samples.reserve(200000);
+        while (g_tick.load() < toTick && !g_exiting.load())
+        {
+            if (SuspendThread(thread) != static_cast<DWORD>(-1))
+            {
+                DWORD64 frames[24] = {};
+                const size_t n = captureStack(thread, frames, 24);
+                ResumeThread(thread);
+                if (n != 0)
+                    samples.emplace_back(frames, frames + n);
+            }
+            // Spin for ~1 ms: Sleep's default resolution (~15 ms) would give too few samples.
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(1000);
+            while (std::chrono::steady_clock::now() < until)
+                YieldProcessor();
+        }
+        CloseHandle(thread);
+
+        HANDLE process = GetCurrentProcess();
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymInitialize(process, nullptr, TRUE);
+        alignas(SYMBOL_INFO) char symBuf[sizeof(SYMBOL_INFO) + 512];
+        std::unordered_map<DWORD64, std::string> names;
+        auto nameOf = [&](DWORD64 addr) -> const std::string & {
+            auto it = names.find(addr);
+            if (it != names.end())
+                return it->second;
+            auto *sym = reinterpret_cast<SYMBOL_INFO *>(symBuf);
+            std::memset(symBuf, 0, sizeof(symBuf));
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 511;
+            DWORD64 disp = 0;
+            std::string name = SymFromAddr(process, addr, &disp, sym) ? std::string(sym->Name) : std::string("?");
+            return names.emplace(addr, std::move(name)).first->second;
+        };
+        std::unordered_map<std::string, uint32_t> exclusive, inclusive;
+        for (const auto &s : samples)
+        {
+            ++exclusive[nameOf(s[0])];
+            std::vector<const std::string *> seen;
+            for (DWORD64 a : s)
+            {
+                const std::string &n = nameOf(a);
+                if (std::find(seen.begin(), seen.end(), &n) == seen.end())
+                {
+                    seen.push_back(&n);
+                    ++inclusive[n];
+                }
+            }
+        }
+        SymCleanup(process);
+        auto print = [&](const char *title, const std::unordered_map<std::string, uint32_t> &table) {
+            std::vector<std::pair<std::string, uint32_t>> rows(table.begin(), table.end());
+            std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+            std::fprintf(stderr, "[nprof] %s (%zu samples):\n", title, samples.size());
+            for (size_t i = 0; i < rows.size() && i < 45; ++i)
+                std::fprintf(stderr, "[nprof]   %5.1f%%  %s\n", 100.0 * rows[i].second / std::max<size_t>(1, samples.size()),
+                             rows[i].first.c_str());
+        };
+        print("exclusive", exclusive);
+        print("inclusive", inclusive);
+        std::fflush(stderr);
+    }
 #else
     void dumpAllStacks(const char *reason)
     {
@@ -369,6 +476,13 @@ extern "C" void ps2xTestHarnessStart()
         std::thread(watchdogLoop).detach();
 #if defined(_WIN32)
     AddVectoredExceptionHandler(1, crashVectoredHandler);
+    if (const char *prof = std::getenv("PS2X_NATIVE_PROF"))
+    {
+        char *end = nullptr;
+        const uint64_t from = std::strtoull(prof, &end, 10);
+        const uint64_t to = (end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : from + 600u;
+        std::thread(nativeProfilerLoop, from, to).detach();
+    }
 #endif
 }
 
