@@ -15,6 +15,8 @@
 #include <limits>
 #include <ps2_log.h>
 
+extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
+
 namespace
 {
     constexpr uint8_t laneForComponent(uint32_t component)
@@ -1576,6 +1578,29 @@ void VU1Interpreter::finishXgkick()
         }
     }
 
+    // PS2X_VU1_KICK_HASH=1: a running FNV-1a hash of every XGKICK packet, printed every 600 guest VSyncs
+    // (`[vu1-hash]`). Two builds that print the same hashes sent the GS the same bytes: an equivalence check for
+    // VU1 interpreter changes.
+    static const bool kickHash = []
+    {
+        const char *env = std::getenv("PS2X_VU1_KICK_HASH");
+        return env && *env && *env != '0';
+    }();
+    if (kickHash)
+    {
+        static uint64_t hash = 1469598103934665603ull, kicks = 0, nextReport = 600;
+        for (uint32_t i = 0; i < m_xgkick.totalBytes; ++i)
+            hash = (hash ^ m_xgkick.packet[i]) * 1099511628211ull;
+        ++kicks;
+        const uint64_t vsync = ps2xGuestVsync();
+        if (vsync >= nextReport)
+        {
+            std::fprintf(stderr, "[vu1-hash] vsync %llu kicks %llu hash %016llx\n", static_cast<unsigned long long>(vsync),
+                         static_cast<unsigned long long>(kicks), static_cast<unsigned long long>(hash));
+            nextReport = (vsync / 600u + 1u) * 600u;
+        }
+    }
+
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
@@ -2326,6 +2351,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    // VF results are written at once (readers stall on m_vfReady anyway). PS2X_VU1_QUEUED_VF=1 restores the queued
+    // writes (commit at the ready cycle), for A/B checks with PS2X_VU1_KICK_HASH.
+    static const bool immediateVf = []
+    {
+        const char *env = std::getenv("PS2X_VU1_QUEUED_VF");
+        return !(env && *env && *env != '0');
+    }();
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
     while (m_cycle < budgetEnd && !m_stopRequested)
@@ -2391,9 +2423,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         float newLowerVf[4]{};
         float oldAcc[4]{};
         float newAcc[4]{};
-        if (hasUpperWrite)
+        if (!immediateVf && hasUpperWrite)
             std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
-        if (hasDistinctLowerWrite)
+        if (!immediateVf && hasDistinctLowerWrite)
             std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
         if (decoded.upperUsage.accWrite != 0u)
             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
@@ -2432,7 +2464,30 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         m_viBranchBackupValid = false;
 
-        if (hasUpperWrite)
+        if (immediateVf)
+        {
+            // The result stays in the register now. Readers still stall until the write's ready cycle
+            // (markPairWrites -> m_vfReady), and the VU interlocks VF reads, so they see the same value as with the
+            // queued write; the new sequence number makes older queued writes to these lanes stale.
+            auto noteImmediate = [this](uint8_t reg, uint8_t lanes)
+            {
+                const uint64_t sequence = ++m_nextWriteSequence;
+                std::array<uint64_t, 4> &latest = m_vfLatestWrite[reg];
+                if ((lanes & 0x8u) != 0u)
+                    latest[0] = sequence;
+                if ((lanes & 0x4u) != 0u)
+                    latest[1] = sequence;
+                if ((lanes & 0x2u) != 0u)
+                    latest[2] = sequence;
+                if ((lanes & 0x1u) != 0u)
+                    latest[3] = sequence;
+            };
+            if (hasUpperWrite)
+                noteImmediate(upperWrite.reg, upperWrite.lanes);
+            if (hasDistinctLowerWrite)
+                noteImmediate(lowerWrite.reg, lowerWrite.lanes);
+        }
+        if (!immediateVf && hasUpperWrite)
         {
             std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
             std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
@@ -2442,7 +2497,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                     : decoded.upperUsage.latency;
             queueVfWrite(upperWrite.reg, upperWrite.lanes, newUpperVf, latency);
         }
-        if (hasDistinctLowerWrite)
+        if (!immediateVf && hasDistinctLowerWrite)
         {
             std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
             std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
