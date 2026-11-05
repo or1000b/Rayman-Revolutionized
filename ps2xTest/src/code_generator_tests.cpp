@@ -1038,6 +1038,26 @@ void register_code_generator_tests()
                      "SQRT.S f6, f1 should write f6 from the root of f1 (ft)");
         });
 
+        tc.Run("CVT.W.S truncates and saturates like the EE", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction cvt{};
+            cvt.opcode = OPCODE_COP1;
+            cvt.rs = COP1_S;
+            cvt.rt = 0;
+            cvt.rd = 2;
+            cvt.sa = 4;
+            cvt.function = COP1_S_CVT_W;
+
+            std::string code = gen.translateInstruction(cvt);
+            printGeneratedCode("CVT.W.S truncates and saturates like the EE", code);
+            t.IsTrue(code.find("nearbyint") == std::string::npos && code.find("FPU_CVT_W_S") == std::string::npos,
+                     "CVT.W.S should not round to nearest");
+            t.IsTrue(code.find("static_cast<int32_t>(ctx->f[2])") != std::string::npos, "CVT.W.S should truncate fs (f2)");
+            t.IsTrue(code.find("0x7FFFFFFF") != std::string::npos, "CVT.W.S should saturate large values");
+            t.IsTrue(code.find("std::memcpy(&ctx->f[4]") != std::string::npos, "CVT.W.S should write fd (f4)");
+        });
+
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)
             {
                 CodeGenerator gen({}, {});
@@ -1281,6 +1301,41 @@ void register_code_generator_tests()
                          std::string(item.name) + " should read its source from rt");
                 t.IsTrue(out.find("GPR_VEC(ctx, 4)") == std::string::npos,
                          std::string(item.name) + " should not read its source from rs");
+            }
+        });
+
+        tc.Run("MMI word / halfword permutations use the EE lane orders (PCSX2)", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            struct PermutationCase
+            {
+                const char *name;
+                uint8_t function;
+                uint8_t subfunction;
+                const char *expected;
+            };
+
+            const std::vector<PermutationCase> cases = {
+                {"PEXEW (w2 w1 w0 w3)", MMI_MMI2, MMI2_PEXEW, "_MM_SHUFFLE(3,0,1,2)"},
+                {"PROT3W (w1 w2 w0 w3)", MMI_MMI2, MMI2_PROT3W, "_MM_SHUFFLE(3,0,2,1)"},
+                {"PEXCW (w0 w2 w1 w3)", MMI_MMI3, MMI3_PEXCW, "_MM_SHUFFLE(3,1,2,0)"},
+                {"PEXEH (h2 h1 h0 h3)", MMI_MMI2, MMI2_PEXEH, "_MM_SHUFFLE(3,0,1,2)"},
+                {"PEXCH (h0 h2 h1 h3)", MMI_MMI3, MMI3_PEXCH, "_MM_SHUFFLE(3,1,2,0)"},
+                {"PREVH (per doubleword)", MMI_MMI2, MMI2_PREVH, "_mm_setr_epi8(6,7, 4,5, 2,3, 0,1, 14,15, 12,13, 10,11, 8,9)"},
+            };
+
+            for (const PermutationCase &item : cases)
+            {
+                Instruction inst{};
+                inst.isMMI = true;
+                inst.opcode = OPCODE_MMI;
+                inst.function = item.function;
+                inst.sa = item.subfunction;
+                inst.rd = 3;
+                inst.rt = 5;
+
+                const std::string out = gen.translateInstruction(inst);
+                t.IsTrue(out.find(item.expected) != std::string::npos, std::string(item.name) + " should use " + item.expected);
             }
         });
 

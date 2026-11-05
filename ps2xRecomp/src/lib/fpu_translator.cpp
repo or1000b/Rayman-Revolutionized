@@ -77,7 +77,14 @@ namespace ps2recomp
             case COP1_S_FLOOR_W:
                 return fmt::format("{{ int32_t tmp = FPU_FLOOR_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_CVT_W:
-                return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+                // The EE's CVT.W.S truncates (its FPU only rounds toward zero) and saturates |x| >= 2^31 to
+                // 0x7FFFFFFF / 0x80000000 (PCSX2 CVT_W); GCC uses it for every (int)x. FPU_CVT_W_S rounded to nearest,
+                // so (int)0.6 gave 1. Emitted inline: the macro header is included by every generated file.
+                return fmt::format("{{ uint32_t bits; std::memcpy(&bits, &ctx->f[{}], sizeof(bits)); "
+                                   "int32_t tmp = ((bits & 0x7F800000u) <= 0x4E800000u) ? static_cast<int32_t>(ctx->f[{}]) "
+                                   ": ((bits & 0x80000000u) ? static_cast<int32_t>(0x80000000u) : 0x7FFFFFFF); "
+                                   "std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}",
+                                   fs, fs, fd);
             case COP1_S_RSQRT:
                 // RSQRT.S fd, fs, ft computes fs / sqrt(ft), not 1 / sqrt(fs).
                 return fmt::format("ctx->f[{}] = FPU_RSQRT_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
