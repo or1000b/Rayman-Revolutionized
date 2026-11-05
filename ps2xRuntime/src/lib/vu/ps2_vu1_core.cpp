@@ -19,6 +19,11 @@ extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
 namespace
 {
+    bool g_vu0TraceThisRun = false; // PS2X_VU0_TRACE: this VU0 run matched the filter
+}
+
+namespace
+{
     constexpr uint8_t laneForComponent(uint32_t component)
     {
         return static_cast<uint8_t>(1u << (3u - component));
@@ -2328,10 +2333,20 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         const char *env = std::getenv("PS2X_VU0_TRACE");
         return (env && *env) ? std::strtoull(env, nullptr, 10) : ~0ull;
     }();
+    g_vu0TraceThisRun = false;
     if (m_unit == Unit::VU0 && vu0TraceStartVsync != ~0ull)
     {
-        if (ps2xGuestVsync() == vu0TraceStartVsync)
+        // PS2X_VU0_TRACE_MATCH=<value>: only runs with a VF input lane within 0.01 of that value are traced.
+        static const char *matchEnv = std::getenv("PS2X_VU0_TRACE_MATCH");
+        static const float matchValue = (matchEnv && *matchEnv) ? std::strtof(matchEnv, nullptr) : 0.0f;
+        bool matches = !(matchEnv && *matchEnv);
+        for (uint32_t r = 1; r < 32u && !matches; ++r)
+            for (uint32_t lane = 0; lane < 4u; ++lane)
+                if (std::fabs(m_state.vf[r][lane] - matchValue) < 0.01f)
+                    matches = true;
+        if (ps2xGuestVsync() == vu0TraceStartVsync && matches)
         {
+            g_vu0TraceThisRun = true;
             static uint32_t starts = 0u;
             if (starts == 0u)
             {
@@ -2556,7 +2571,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             const char *env = std::getenv("PS2X_VU0_TRACE");
             return (env && *env) ? std::strtoull(env, nullptr, 10) : ~0ull;
         }();
-        if (m_unit == Unit::VU0 && vu0TraceVsync != ~0ull && ps2xGuestVsync() == vu0TraceVsync)
+        if (m_unit == Unit::VU0 && vu0TraceVsync != ~0ull && g_vu0TraceThisRun && ps2xGuestVsync() == vu0TraceVsync)
         {
             static uint32_t traced = 0u;
             if (traced++ < 60000u)
