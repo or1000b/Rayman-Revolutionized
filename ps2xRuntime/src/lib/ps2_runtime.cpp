@@ -1653,6 +1653,67 @@ namespace
         return c;
     }
 
+    // Bug hunt: PS2X_EE_CALL_TREE="rootFunc;vsync" (hex; decimal) prints every guest call made while rootFunc is on the
+    // guest call stack during that guest VSync (`[ee-tree]`, indented by depth): which functions a routine really runs,
+    // including calls through function pointers. Capped at 4000 lines.
+    void eeCallTreeCheck(R5900Context *ctx, uint32_t sourcePc, uint32_t targetPc)
+    {
+        static uint32_t root = 0u, logged = 0u;
+        static uint64_t at = 0u;
+        static const bool enabled = []
+        {
+            const char *env = std::getenv("PS2X_EE_CALL_TREE");
+            if (!env || !*env)
+                return false;
+            char *end = nullptr;
+            root = static_cast<uint32_t>(std::strtoul(env, &end, 16));
+            at = (end && *end == ';') ? std::strtoull(end + 1, nullptr, 10) : 0u;
+            return root != 0u;
+        }();
+        if (!enabled || logged >= 4000u || ps2xGuestVsync() != at)
+            return;
+        uint32_t rootDepth = 0u;
+        bool found = false;
+        for (uint32_t f = 0; f < t_guestCallDepth; ++f)
+        {
+            if (t_guestCallFrames[f].target == root)
+            {
+                rootDepth = f;
+                found = true;
+                break;
+            }
+        }
+        if (!found && targetPc != root)
+            return;
+        ++logged;
+        const uint32_t depth = found ? t_guestCallDepth - rootDepth : 0u;
+        std::fprintf(stderr, "[ee-tree] %*s0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x f12=%g\n", static_cast<int>(depth * 2u), "",
+                     targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), ctx->f[12]);
+    }
+
+    struct EeCallReturn
+    {
+        bool pending = false;
+        uint32_t target = 0u, source = 0u, depth = 0u;
+        uint32_t bases[4] = {};
+        uint32_t bytes[4] = {};
+        uint32_t count = 0u;
+    };
+    thread_local EeCallReturn t_eeCallReturns[8];
+
+    void eeCallDump(const uint8_t *rdram, const char *tag, uint32_t base, uint32_t bytes)
+    {
+        for (uint32_t off = 0; off < bytes && base + off + 16u <= PS2_RAM_SIZE; off += 16u)
+        {
+            uint32_t w[4];
+            float v[4];
+            std::memcpy(w, rdram + base + off, 16u);
+            std::memcpy(v, rdram + base + off, 16u);
+            std::fprintf(stderr, "%s   @%x+%03x: %08x %08x %08x %08x | %g %g %g %g\n", tag, base, off, w[0], w[1], w[2], w[3], v[0],
+                         v[1], v[2], v[3]);
+        }
+    }
+
     void eeCallLogCheck(const uint8_t *rdram, R5900Context *ctx, uint32_t sourcePc, uint32_t targetPc)
     {
         EeCallLog &c = eeCallLog();
@@ -1672,21 +1733,33 @@ namespace
                          static_cast<unsigned long long>(vsync), targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5),
                          getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10),
                          ctx->f[12], getRegU32(ctx, 29), getRegU32(ctx, 31));
+            EeCallReturn &ret = t_eeCallReturns[i];
+            ret = EeCallReturn{true, targetPc, sourcePc, t_guestCallDepth, {}, {}, f.dumpCount};
             for (uint32_t d = 0; d < f.dumpCount; ++d)
             {
                 const uint32_t base = getRegU32(ctx, f.dumps[d].reg) & 0x1FFFFFCu;
                 const uint32_t bytes = std::min<uint32_t>(f.dumps[d].bytes, 0x1000u);
-                for (uint32_t off = 0; off < bytes && base + off + 16u <= PS2_RAM_SIZE; off += 16u)
-                {
-                    uint32_t w[4];
-                    float v[4];
-                    std::memcpy(w, rdram + base + off, 16u);
-                    std::memcpy(v, rdram + base + off, 16u);
-                    std::fprintf(stderr, "[ee-call]   @%x+%03x: %08x %08x %08x %08x | %g %g %g %g\n", base, off, w[0], w[1], w[2],
-                                 w[3], v[0], v[1], v[2], v[3]);
-                }
+                ret.bases[d] = base;
+                ret.bytes[d] = bytes;
+                eeCallDump(rdram, "[ee-call]", base, bytes);
             }
             return;
+        }
+    }
+
+    // After a logged call returns normally (not unwound by a yield): the same memory again, as `[ee-ret]` lines.
+    void eeCallLogReturn(const uint8_t *rdram, uint32_t sourcePc, uint32_t targetPc)
+    {
+        EeCallLog &c = eeCallLog();
+        for (uint32_t i = 0; i < c.count; ++i)
+        {
+            EeCallReturn &ret = t_eeCallReturns[i];
+            if (!ret.pending || ret.target != targetPc || ret.source != sourcePc || ret.depth + 1u != t_guestCallDepth)
+                continue;
+            ret.pending = false;
+            std::fprintf(stderr, "[ee-ret] 0x%x from 0x%x returned\n", targetPc, sourcePc);
+            for (uint32_t d = 0; d < ret.count; ++d)
+                eeCallDump(rdram, "[ee-ret]", ret.bases[d], ret.bytes[d]);
         }
     }
 }
@@ -1723,7 +1796,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     eeWatchCheck(rdram, ctx, "at entry", sourcePc, targetPc);
     if (isCall)
+    {
         eeCallLogCheck(rdram, ctx, sourcePc, targetPc);
+        eeCallTreeCheck(ctx, sourcePc, targetPc);
+    }
 
     BranchTraceEntry &trace = t_branchTrace[t_branchTracePos++ % 64u];
     trace = BranchTraceEntry{targetPc, sourcePc, getRegU32(ctx, 5), 0u, 0u, static_cast<int>(kind), '?'};
@@ -1831,6 +1907,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
     eeWatchCheck(rdram, ctx, "after return", sourcePc, targetPc);
+    eeCallLogReturn(rdram, sourcePc, targetPc);
 
     if (isStopRequested() || ctx->pc == 0u || t_guestYieldPending)
     {

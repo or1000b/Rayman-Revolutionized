@@ -2323,6 +2323,39 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+    static const uint64_t vu0TraceStartVsync = []
+    {
+        const char *env = std::getenv("PS2X_VU0_TRACE");
+        return (env && *env) ? std::strtoull(env, nullptr, 10) : ~0ull;
+    }();
+    if (m_unit == Unit::VU0 && vu0TraceStartVsync != ~0ull)
+    {
+        if (ps2xGuestVsync() == vu0TraceStartVsync)
+        {
+            static uint32_t starts = 0u;
+            if (starts == 0u)
+            {
+                if (FILE *dump = std::fopen("out/vu0_micro_trace.bin", "wb"))
+                {
+                    std::fwrite(vuCode, 1u, codeSize, dump);
+                    std::fclose(dump);
+                    std::fprintf(stderr, "[vu0-trace] VU0 micro memory written to out/vu0_micro_trace.bin\n");
+                }
+            }
+            if (starts++ < 3000u)
+            {
+                std::fprintf(stderr, "[vu0-trace] start pc %04x status=%03x mac=%04x clip=%06x q=%g", m_state.pc, m_state.status,
+                             m_state.mac, m_state.clip, m_state.q);
+                for (uint32_t r = 1; r < 32u; ++r)
+                    if (m_state.vf[r][0] != 0.0f || m_state.vf[r][1] != 0.0f || m_state.vf[r][2] != 0.0f || m_state.vf[r][3] != 0.0f)
+                        std::fprintf(stderr, " vf%u=%g,%g,%g,%g", r, m_state.vf[r][0], m_state.vf[r][1], m_state.vf[r][2], m_state.vf[r][3]);
+                for (uint32_t r = 1; r < 16u; ++r)
+                    if (m_state.vi[r] != 0)
+                        std::fprintf(stderr, " vi%u=%d", r, m_state.vi[r]);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -2514,6 +2547,34 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             // flags still use the normal four-cycle FMAC timeline.
             queueAccWrite(decoded.upperUsage.accWrite, newAcc,
                           kAccForwardLatency);
+        }
+        // PS2X_VU0_TRACE=<guest vsync>: every VU0 microprogram pair executed during that VSync (`[vu0-trace]`: pc,
+        // cycle, raw upper / lower, the VF / VI written with their new values, ACC, Q and the flags as FSxx / FMxx read
+        // them now). Decode the words with tools/vudis.py. Bug hunt: Rayman's collision runs on VU0 (vcallms 0).
+        static const uint64_t vu0TraceVsync = []
+        {
+            const char *env = std::getenv("PS2X_VU0_TRACE");
+            return (env && *env) ? std::strtoull(env, nullptr, 10) : ~0ull;
+        }();
+        if (m_unit == Unit::VU0 && vu0TraceVsync != ~0ull && ps2xGuestVsync() == vu0TraceVsync)
+        {
+            static uint32_t traced = 0u;
+            if (traced++ < 60000u)
+            {
+                std::fprintf(stderr, "[vu0-trace] pc %04x cyc %llu %08x %08x", m_state.pc, static_cast<unsigned long long>(m_cycle),
+                             decoded.upper, decoded.lower);
+                if (hasUpperWrite)
+                    std::fprintf(stderr, " | vf%u=%g %g %g %g", upperWrite.reg, m_state.vf[upperWrite.reg][0],
+                                 m_state.vf[upperWrite.reg][1], m_state.vf[upperWrite.reg][2], m_state.vf[upperWrite.reg][3]);
+                if (hasDistinctLowerWrite)
+                    std::fprintf(stderr, " | vf%u=%g %g %g %g", lowerWrite.reg, m_state.vf[lowerWrite.reg][0],
+                                 m_state.vf[lowerWrite.reg][1], m_state.vf[lowerWrite.reg][2], m_state.vf[lowerWrite.reg][3]);
+                if (writtenVi != 0u)
+                    std::fprintf(stderr, " | vi%u=%d", writtenVi, m_state.vi[writtenVi]);
+                if (decoded.upperUsage.accWrite != 0u)
+                    std::fprintf(stderr, " | acc=%g %g %g %g", newAcc[0], newAcc[1], newAcc[2], newAcc[3]);
+                std::fprintf(stderr, " | q=%g status=%03x mac=%04x\n", m_state.q, m_state.status, m_state.mac);
+            }
         }
         if (writtenVi != 0u)
         {
