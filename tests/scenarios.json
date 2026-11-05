@@ -52,20 +52,22 @@
       "description": "NEW GAME, keep the name RAYMAN (START), loading screen, Ubi Soft logo, the intro cutscene, then the first level.",
       "renderer": "gpu",
       "input": "600:start:10,1300:cross:10,2400:cross:10,2600:start:10",
-      "frames": 10000,
-      "shots": [2500, 3100, 5000, 9600],
-      "env": { "PS2X_UBI_TRACE": "1" },
+      "frames": 13000,
+      "shots": [2500, 3100, 5000, 9600, 12900],
+      "env": { "PS2X_UBI_TRACE": "1", "PS2X_RAYMAN_ACTOR_TRACE": "12560,12561" },
       "_note": "Timeline (guest VSyncs): name entry from ~2450, loading screen ~2800, Ubi Soft logo ~3000, intro cutscene ~3400-7700, level from ~8000.",
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
         { "type": "log_absent", "pattern": "\\[guest-recursion\\]|\\[guest-branch:missing-target\\]|\\[rayman-ai\\]", "label": "no runaway recursion, bad branch or broken AI tree" },
         { "type": "log_absent", "pattern": "\\[IOP\\] guest call 0x[0-9a-f]+ did not return", "label": "IOP calls (RPC handlers, callbacks) run to the end" },
         { "type": "log_absent", "pattern": "\\[ubi-rpc\\] .* fn=2000[0-9a-f] .* out=ffffffff", "label": "UBISOUND bank / buffer loads succeed (needs PS2X_UBI_TRACE)" },
+        { "type": "log_absent", "pattern": "\\[rayman-sector\\] vsync 1[0-9]{4} ", "label": "Rayman stays in the ship once he gets control (no sector change after VSync 10000; false VU0 collision contacts threw him out until the branch-in-delay-slot fix)" },
         { "type": "shot", "tick": 2500, "min_variance": 300, "golden": "intro_name_entry.bmp", "max_diff": 20, "label": "name entry screen" },
         { "type": "shot", "tick": 3100, "min_variance": 150, "golden": "intro_ubisoft_logo.bmp", "max_diff": 20, "label": "Ubi Soft logo" },
         { "type": "shot", "tick": 5000, "min_variance": 100, "label": "intro cutscene draws" },
         { "type": "fps", "after_tick": 8500, "min": 10, "label": "first level runs" },
-        { "type": "shot", "tick": 9600, "min_variance": 100, "label": "first level is visible (the prison ship cinematic: was black until SQRT.S read ft, CLAUDE.md issue 7)" }
+        { "type": "shot", "tick": 9600, "min_variance": 100, "label": "first level is visible (the prison ship cinematic: was black until SQRT.S read ft, CLAUDE.md issue 7)" },
+        { "type": "shot", "tick": 12900, "min_variance": 100, "golden": "intro_rayman_on_grate.bmp", "max_diff": 20, "label": "Rayman stands on the grate with Murfy's hint (first moments of control)" }
       ]
     }
   ]

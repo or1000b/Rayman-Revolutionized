@@ -1729,10 +1729,13 @@ namespace
                 return;
             ++c.logged;
             std::fprintf(stderr,
-                         "[ee-call] vsync %llu 0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x t0=%x t1=%x t2=%x f12=%g sp=%x ra=%x\n",
+                         "[ee-call] vsync %llu 0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x t0=%x t1=%x t2=%x f12=%g sp=%x ra=%x "
+                         "s0=%x s1=%x s2=%x s3=%x s4=%x s5=%x s6=%x s7=%x fp=%x\n",
                          static_cast<unsigned long long>(vsync), targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5),
                          getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10),
-                         ctx->f[12], getRegU32(ctx, 29), getRegU32(ctx, 31));
+                         ctx->f[12], getRegU32(ctx, 29), getRegU32(ctx, 31), getRegU32(ctx, 16), getRegU32(ctx, 17),
+                         getRegU32(ctx, 18), getRegU32(ctx, 19), getRegU32(ctx, 20), getRegU32(ctx, 21), getRegU32(ctx, 22),
+                         getRegU32(ctx, 23), getRegU32(ctx, 30));
             EeCallReturn &ret = t_eeCallReturns[i];
             ret = EeCallReturn{true, targetPc, sourcePc, t_guestCallDepth, {}, {}, f.dumpCount};
             for (uint32_t d = 0; d < f.dumpCount; ++d)

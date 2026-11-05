@@ -2478,6 +2478,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (decoded.upperUsage.accWrite != 0u)
             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
 
+        // A taken branch whose delay slot is this pair: the jump happens after this pair. If this pair issues another
+        // taken branch ("branch in a branch delay slot"), the hardware jumps to the first target, runs that one
+        // instruction as the second branch's delay slot, then jumps to the second target (PCSX2: takedelaybranch).
+        // Rayman's VU0 collision microcode relies on it (0x0718 IBEQ with B 0x0438 in its delay slot: the first
+        // target 0x0C58 clears vi13 = "no contact"); without it every triangle edge reported a contact.
+        const bool inTakenDelaySlot = m_state.branchPending && m_state.branchDelay == 0u;
+        const uint32_t pendingFirstTarget = m_state.branchTarget;
+
         if (decoded.iBit)
         {
             execUpper(decoded.upper);
@@ -2617,7 +2625,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             nextPc = 0u;
         m_state.pc = nextPc;
 
-        if (m_state.branchPending)
+        if (inTakenDelaySlot && m_state.branchPending && m_state.branchDelay != 0u)
+        {
+            // Branch in the delay slot of a taken branch: go to the first target now; the second branch (just
+            // issued, delay 1) fires after the instruction there.
+            m_state.pc = pendingFirstTarget & microAddressMask();
+            m_state.branchDelay = 0u;
+        }
+        else if (m_state.branchPending)
         {
             if (m_state.branchDelay == 0u)
             {
