@@ -41,6 +41,11 @@ while off + 16 <= len(blob):
         if t == 3: tris = [(i, i+1, i+2) for i in range(0, len(verts) - 2, 3)]
         elif t == 4: tris = [(i, i+1, i+2) for i in range(len(verts) - 2)]
         elif t == 5: tris = [(0, i, i+1) for i in range(1, len(verts) - 1)]
+        elif t == 6:
+            for i in range(0, len(verts) - 1, 2):
+                A, B = verts[i]['xy'], verts[i+1]['xy']
+                if min(A[0], B[0]) <= px <= max(A[0], B[0]) and min(A[1], B[1]) <= py <= max(A[1], B[1]) and not verts[i+1].get('adc', 0):
+                    print(f'kick {kick} path {ident} prim {prim:#x} sprite {i},{i+1}: ' + ' '.join(f'({V["xy"][0]:.0f},{V["xy"][1]:.0f} z{V["xy"][2]:x} rgba={V.get("rgba")})' for V in (verts[i], verts[i+1])))
         for a, b, c in tris:
             A, B, C = verts[a]['xy'], verts[b]['xy'], verts[c]['xy']
             area = (B[0]-A[0])*(C[1]-A[1]) - (C[0]-A[0])*(B[1]-A[1])

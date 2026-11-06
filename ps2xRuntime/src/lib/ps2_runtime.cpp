@@ -1499,7 +1499,7 @@ namespace
     thread_local uint32_t t_guestCallDepth = 0u;
     thread_local GuestCallFrame t_guestCallFrames[kMaxGuestCallDepth];
 
-    // Bug hunt: a memory watchpoint at call granularity. PS2X_EE_WATCH="addr[,addr...][;fromVsync,toVsync]" (hex
+    // Bug hunt: a memory watchpoint at call granularity. PS2X_EE_WATCH="addr[,addr...][;fromVsync,toVsync]" (hex; 0x70000000+ = scratchpad
     // addresses, decimal VSyncs, up to 4 words of EE RAM) logs `[ee-watch]` whenever a word changed since the last guest
     // call / jump / return: "at entry" of a call from S means the code before S in S's function wrote it, "after
     // return" of a call to T means T's own code (after its last nested call) did. Every guest call goes through
@@ -1529,7 +1529,10 @@ namespace
                 const size_t comma = addrs.find(',', pos);
                 const std::string tok = addrs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
                 if (!tok.empty())
-                    r.addr[r.count++] = static_cast<uint32_t>(std::strtoul(tok.c_str(), nullptr, 16)) & 0x1FFFFFCu;
+                {
+                    const uint32_t a = static_cast<uint32_t>(std::strtoul(tok.c_str(), nullptr, 16));
+                    r.addr[r.count++] = (a & 0xF0000000u) == 0x70000000u ? (a & 0x70003FFCu) : (a & 0x1FFFFFCu);
+                }
                 if (comma == std::string::npos)
                     break;
                 pos = comma + 1;
@@ -1549,6 +1552,8 @@ namespace
         return w;
     }
 
+    const uint8_t *g_eeWatchScratchpad = nullptr; // set by dispatchGuestBranch: watch addresses 0x70000000+ read it
+
     void eeWatchCheck(const uint8_t *rdram, R5900Context *ctx, const char *where, uint32_t sourcePc, uint32_t targetPc)
     {
         EeWatch &w = eeWatch();
@@ -1557,7 +1562,14 @@ namespace
         for (uint32_t i = 0; i < w.count; ++i)
         {
             uint32_t value;
-            std::memcpy(&value, rdram + w.addr[i], 4u);
+            if ((w.addr[i] & 0xF0000000u) == 0x70000000u)
+            {
+                if (!g_eeWatchScratchpad)
+                    continue;
+                std::memcpy(&value, g_eeWatchScratchpad + (w.addr[i] & 0x3FFCu), 4u);
+            }
+            else
+                std::memcpy(&value, rdram + w.addr[i], 4u);
             if (value == w.last[i])
                 continue;
             const uint32_t old = w.last[i];
@@ -1797,6 +1809,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    g_eeWatchScratchpad = m_memory.getScratchpad();
     eeWatchCheck(rdram, ctx, "at entry", sourcePc, targetPc);
     if (isCall)
     {

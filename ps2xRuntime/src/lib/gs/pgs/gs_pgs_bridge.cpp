@@ -683,7 +683,8 @@ namespace ps2x::pgs
         //   4 = do not draw context-1 primitives (Rayman: lightmap, fog and shadow passes);
         //   8 = do not draw textured context-0 primitives (Rayman: the base pass of the world);
         //  16 = draw textured context-0 primitives without alpha blending (opaque);
-        //  32 = do not draw untextured, alpha-blended black primitives (fades and dimming overlays).
+        //  32 = do not draw untextured, alpha-blended black primitives (fades and dimming overlays);
+        //  64 = TEST AFAIL FB_ONLY becomes KEEP (pixels failing the alpha test are not written at all).
         uint32_t experimentMask()
         {
             static const uint32_t mask = watchBound("PS2X_PGS_EXPERIMENT", 0u);
@@ -759,6 +760,11 @@ namespace ps2x::pgs
                                 if ((mask & 1u) != 0u && (adReg == 0x42u || adReg == 0x43u) && (qlo & 0xFFu) == 0x89u)
                                 {
                                     qlo = (qlo & ~0xFFull) | 0x65u; // (Cd - Cd) * FIX + Cd = Cd
+                                    std::memcpy(q, &qlo, 8u);
+                                }
+                                if ((mask & 64u) != 0u && (adReg == 0x47u || adReg == 0x48u) && ((qlo >> 12) & 3u) == 1u)
+                                {
+                                    qlo &= ~(3ull << 12); // AFAIL FB_ONLY -> KEEP: pixels failing the alpha test are not written
                                     std::memcpy(q, &qlo, 8u);
                                 }
                                 if ((adReg == 0x04u || adReg == 0x05u) && experimentSkips(mask))

@@ -40,6 +40,7 @@
 
 extern "C" void ps2xDumpCrashContext(); // ps2_runtime.cpp: last guest function, dispatch history
 extern "C" void ps2xSpu2DebugDump();    // ps2xIOP iop_memory.cpp: SPU2 mixer state
+extern "C" void ps2xRequestGsCapture(); // gs_cpu_backend.cpp: F11 capture (CPU renderer)
 
 namespace
 {
@@ -657,6 +658,16 @@ extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uin
             std::fclose(f);
             std::fprintf(stderr, "[ee-dump] guest vsync %llu -> %s\n", static_cast<unsigned long long>(vsync), path);
         }
+    }
+
+    // PS2X_GS_CAPTURE_AT="1400": the CPU renderer's GS capture (out/gscapture.bin: 40-byte header, then the whole
+    // 4 MiB of GS local memory, then one frame of commands) at that guest VSync, as F11 does. Needs
+    // PS2X_GS_RENDERER=cpu (the GPU renderer keeps VRAM on the GPU).
+    static const std::vector<uint64_t> gsCaptureAt = vsyncList("PS2X_GS_CAPTURE_AT");
+    if (std::find(gsCaptureAt.begin(), gsCaptureAt.end(), vsync) != gsCaptureAt.end())
+    {
+        ps2xRequestGsCapture();
+        std::fprintf(stderr, "[gs] capture requested at guest vsync %llu\n", static_cast<unsigned long long>(vsync));
     }
 
     if (!ps2xDeterministic() || !rdram || (vsync % 60u) != 0u)

@@ -18,6 +18,8 @@
 #include <vector>
 #include <cmath>
 #include <cstdio>
+
+extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -1219,9 +1221,39 @@ namespace
         return static_cast<uint32_t>(z);
     }
 
+    // PS2X_GS_TRACE_PIXEL="x,y[,fromVsync]" (frame coordinates): every write attempt to that pixel of any frame buffer, with the
+    // incoming colour / depth, the blend selectors and the result or the reason it was dropped (`[gs-pixel]`). Bug hunt:
+    // which pass of which primitive makes a pixel black (CLAUDE.md issue 6).
+    struct GsPixelTrace
+    {
+        int x = -1, y = -1;
+        unsigned long long fromVsync = 0u;
+        uint32_t logged = 0u;
+    };
+    GsPixelTrace &gsPixelTrace()
+    {
+        static GsPixelTrace t = []
+        {
+            GsPixelTrace r;
+            if (const char *env = std::getenv("PS2X_GS_TRACE_PIXEL"))
+                std::sscanf(env, "%d,%d,%llu", &r.x, &r.y, &r.fromVsync);
+            return r;
+        }();
+        return t;
+    }
+
     inline void gsWritePixel(const GSCpuBackend::PixelPipe &p, int x, int y, uint32_t z,
                              uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
     {
+        GsPixelTrace &trace = gsPixelTrace();
+        const bool traced = x == trace.x && y == trace.y && trace.logged < 4000u && ps2xGuestVsync() >= trace.fromVsync;
+        if (traced)
+        {
+            ++trace.logged;
+            std::fprintf(stderr, "[gs-pixel] fbp %#x fbmsk %08x src %u,%u,%u,%u z %#x abe %d sel %u%u%u%u fix %u atst %d ztst %u zmask %d\n",
+                         p.fbp, p.fbmsk, r, g, b, a, z, p.abe ? 1 : 0, p.asel, p.bsel, p.csel, p.dsel, p.fix, p.alphaTest ? 1 : 0,
+                         p.ztst, p.zmask ? 1 : 0);
+        }
         if (x < p.scx0 || x > p.scx1 || y < p.scy0 || y > p.scy1)
             return;
 
@@ -1273,7 +1305,11 @@ namespace
             break;
         case 2:
             if (z < p.zRead(p.vram, p.zbp, p.fbw, ux, uy))
+            {
+                if (traced)
+                    std::fprintf(stderr, "[gs-pixel]    z test failed (buffer %#x)\n", p.zRead(p.vram, p.zbp, p.fbw, ux, uy));
                 return;
+            }
             break;
         default:
             if (z <= p.zRead(p.vram, p.zbp, p.fbw, ux, uy))
@@ -1313,7 +1349,11 @@ namespace
             if (p.frame16)
                 pixel = Rgba8888ToRgba5551(pixel);
             p.frameWrite(p.vram, p.fbp, p.fbw, ux, uy, pixel);
+            if (traced)
+                std::fprintf(stderr, "[gs-pixel]    dst %08x -> %08x\n", fbrgba, pixel);
         }
+        else if (traced)
+            std::fprintf(stderr, "[gs-pixel]    no frame write (alpha test)\n");
 
         if (writeMask.writeDepth && !p.zmask)
             p.zWrite(p.vram, p.zbp, p.fbw, ux, uy, z);

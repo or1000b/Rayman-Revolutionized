@@ -1058,6 +1058,28 @@ void register_code_generator_tests()
             t.IsTrue(code.find("std::memcpy(&ctx->f[4]") != std::string::npos, "CVT.W.S should write fd (f4)");
         });
 
+        tc.Run("MOVZ/MOVN copy only the lower 64 bits", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            for (uint32_t function : {SPECIAL_MOVZ, SPECIAL_MOVN})
+            {
+                Instruction mov{};
+                mov.opcode = OPCODE_SPECIAL;
+                mov.function = function;
+                mov.rs = 4;
+                mov.rt = 2;
+                mov.rd = 16;
+                mov.raw = (OPCODE_SPECIAL << 26) | (4u << 21) | (2u << 16) | (16u << 11) | function;
+
+                std::string code = gen.translateInstruction(mov);
+                printGeneratedCode("MOVZ/MOVN copy only the lower 64 bits", code);
+                t.IsTrue(code.find("SET_GPR_VEC") == std::string::npos,
+                         "MOVZ/MOVN must keep the upper 64 bits of rd");
+                t.IsTrue(code.find("SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4))") != std::string::npos,
+                         "MOVZ/MOVN should copy the lower 64 bits of rs into rd");
+            }
+        });
+
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)
             {
                 CodeGenerator gen({}, {});
