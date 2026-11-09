@@ -1770,7 +1770,7 @@ namespace
     }
 
     // After a logged call returns normally (not unwound by a yield): the same memory again, as `[ee-ret]` lines.
-    void eeCallLogReturn(const uint8_t *rdram, uint32_t sourcePc, uint32_t targetPc)
+    void eeCallLogReturn(const uint8_t *rdram, const R5900Context *ctx, uint32_t sourcePc, uint32_t targetPc)
     {
         EeCallLog &c = eeCallLog();
         for (uint32_t i = 0; i < c.count; ++i)
@@ -1779,7 +1779,8 @@ namespace
             if (!ret.pending || ret.target != targetPc || ret.source != sourcePc || ret.depth + 1u != t_guestCallDepth)
                 continue;
             ret.pending = false;
-            std::fprintf(stderr, "[ee-ret] 0x%x from 0x%x returned\n", targetPc, sourcePc);
+            std::fprintf(stderr, "[ee-ret] 0x%x from 0x%x returned v0=%x v1=%x f0=%g\n", targetPc, sourcePc,
+                         getRegU32(ctx, 2), getRegU32(ctx, 3), static_cast<double>(ctx->f[0]));
             for (uint32_t d = 0; d < ret.count; ++d)
                 eeCallDump(rdram, "[ee-ret]", ret.bases[d], ret.bytes[d]);
         }
@@ -1930,7 +1931,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
     eeWatchCheck(rdram, ctx, "after return", sourcePc, targetPc);
-    eeCallLogReturn(rdram, sourcePc, targetPc);
+    eeCallLogReturn(rdram, ctx, sourcePc, targetPc);
 
     if (isStopRequested() || ctx->pc == 0u || t_guestYieldPending)
     {
