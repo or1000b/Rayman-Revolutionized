@@ -13,7 +13,14 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <utility>
+#include <vector>
 #include <ps2_log.h>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
@@ -90,6 +97,146 @@ namespace
     // Set by applyFmacDest*: a product of the current product-sum op overflowed in some lane, so
     // the float result may be saturated and the exact path must classify it.
     thread_local bool t_fmacProductOverflow = false;
+
+    // PS2X_VU1_PROFILE=1 (survey for the VU1 ahead-of-time translation): per distinct VU1 micro memory image (FNV-1a
+    // of all 16 KiB), the runs started through MSCAL (execute) / MSCNT (resume), their entry PCs, the JR / JALR
+    // targets, the cycles spent and the runs that used up the cycle budget. Each new image is written to
+    // out/vu1prof/code_<hash>.bin; the report out/vu1prof/profile_<pid>.txt is rewritten every 600 guest VSyncs.
+    struct Vu1Profile
+    {
+        struct Image
+        {
+            uint64_t runs = 0, resumes = 0, cycles = 0, budgetHits = 0, unfinished = 0, firstVsync = 0;
+            std::vector<std::pair<uint32_t, uint64_t>> entries;            // pc, count
+            std::vector<std::pair<uint64_t, uint64_t>> jumps;              // (site << 32) | target, count
+        };
+        std::vector<std::pair<uint64_t, Image>> images;
+        uint64_t codeGeneration = ~0ull;
+        size_t current = 0;
+        uint64_t nextReport = 600;
+        uint64_t runStartCycle = 0;
+
+        static bool enabled()
+        {
+            static const bool on = []
+            {
+                const char *env = std::getenv("PS2X_VU1_PROFILE");
+                return env && *env && *env != '0';
+            }();
+            return on;
+        }
+
+        template <typename T>
+        static void bump(std::vector<std::pair<T, uint64_t>> &list, T key)
+        {
+            for (auto &entry : list)
+                if (entry.first == key)
+                {
+                    ++entry.second;
+                    return;
+                }
+            list.emplace_back(key, 1u);
+        }
+
+        // Returns the hash of a code image seen for the first time (0 otherwise): run() then writes the interpreter's
+        // decode table for it (decode_<hash>.txt), so the translator uses exactly the interpreter's timing data.
+        uint64_t begin(const uint8_t *code, uint32_t codeSize, const PS2Memory *memory, uint32_t pc, bool resume, uint64_t cycle)
+        {
+            uint64_t newImage = 0u;
+            const uint64_t generation = memory ? memory->getVU1CodeGeneration() : 0u;
+            if (generation != codeGeneration || images.empty())
+            {
+                codeGeneration = generation;
+                uint64_t hash = 1469598103934665603ull;
+                for (uint32_t i = 0; i < codeSize; ++i)
+                    hash = (hash ^ code[i]) * 1099511628211ull;
+                current = images.size();
+                for (size_t i = 0; i < images.size(); ++i)
+                    if (images[i].first == hash)
+                        current = i;
+                if (current == images.size())
+                {
+                    images.emplace_back(hash, Image{});
+                    images.back().second.firstVsync = ps2xGuestVsync();
+                    std::error_code ec;
+                    std::filesystem::create_directories("out/vu1prof", ec);
+                    char path[64];
+                    std::snprintf(path, sizeof(path), "out/vu1prof/code_%016llx.bin", static_cast<unsigned long long>(hash));
+                    if (!std::filesystem::exists(path))
+                    {
+                        if (FILE *f = std::fopen(path, "wb"))
+                        {
+                            std::fwrite(code, 1u, codeSize, f);
+                            std::fclose(f);
+                        }
+                        newImage = hash;
+                    }
+                }
+            }
+            Image &image = images[current].second;
+            ++(resume ? image.resumes : image.runs);
+            bump(image.entries, pc);
+            runStartCycle = cycle;
+            return newImage;
+        }
+
+        void jump(uint32_t site, uint32_t target)
+        {
+            if (current < images.size())
+                bump(images[current].second.jumps, (static_cast<uint64_t>(site) << 32) | target);
+        }
+
+        void end(uint64_t cycle, bool ended, bool budgetHit)
+        {
+            if (current >= images.size())
+                return;
+            Image &image = images[current].second;
+            image.cycles += cycle - runStartCycle;
+            if (budgetHit)
+                ++image.budgetHits;
+            if (!ended)
+                ++image.unfinished;
+            if (ps2xGuestVsync() >= nextReport)
+            {
+                nextReport = ps2xGuestVsync() + 600u;
+                report();
+            }
+        }
+
+        void report() const
+        {
+            char path[64];
+            std::snprintf(path, sizeof(path), "out/vu1prof/profile_%lu.txt", static_cast<unsigned long>(
+#ifdef _WIN32
+                                                                                     _getpid()
+#else
+                                                                                     getpid()
+#endif
+                                                                                         ));
+            FILE *f = std::fopen(path, "w");
+            if (!f)
+                return;
+            std::fprintf(f, "# vsync %llu\n", static_cast<unsigned long long>(ps2xGuestVsync()));
+            for (const auto &[hash, image] : images)
+            {
+                std::fprintf(f, "code %016llx runs %llu resumes %llu cycles %llu budget_hits %llu unfinished %llu first_vsync %llu\n",
+                             static_cast<unsigned long long>(hash), static_cast<unsigned long long>(image.runs),
+                             static_cast<unsigned long long>(image.resumes), static_cast<unsigned long long>(image.cycles),
+                             static_cast<unsigned long long>(image.budgetHits), static_cast<unsigned long long>(image.unfinished),
+                             static_cast<unsigned long long>(image.firstVsync));
+                for (const auto &[pc, count] : image.entries)
+                    std::fprintf(f, "entry %016llx %04x %llu\n", static_cast<unsigned long long>(hash), pc,
+                                 static_cast<unsigned long long>(count));
+                for (const auto &[key, count] : image.jumps)
+                    std::fprintf(f, "jr %016llx %04x %04x %llu\n", static_cast<unsigned long long>(hash),
+                                 static_cast<unsigned>(key >> 32), static_cast<unsigned>(key & 0xFFFFFFFFu),
+                                 static_cast<unsigned long long>(count));
+            }
+            std::fclose(f);
+        }
+    };
+    Vu1Profile g_vu1Profile;
+    bool g_vu1ProfileResume = false; // set by resume() for the next run()
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
@@ -2428,7 +2575,9 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+    g_vu1ProfileResume = true;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    g_vu1ProfileResume = false;
 }
 
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
@@ -2453,6 +2602,42 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     }();
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
+    const bool vu1Profile = m_unit == Unit::VU1 && Vu1Profile::enabled();
+    if (vu1Profile)
+    {
+        if (const uint64_t newImage = g_vu1Profile.begin(vuCode, codeSize, memory, m_state.pc, g_vu1ProfileResume, m_cycle))
+        {
+            // One line per pair: words, I/E/M/D/T bits, the pair's shadow / suppressed VF, then for the upper and the
+            // lower instruction: pipeline, latency, vfLatency, viLatency, VF reads (reg:lanes), VF write, VI read /
+            // write masks, ACC read / write lanes, waitQ, waitP, readsClip, writesClip, delaysNextBranchRead, reserved.
+            char path[64];
+            std::snprintf(path, sizeof(path), "out/vu1prof/decode_%016llx.txt", static_cast<unsigned long long>(newImage));
+            if (FILE *f = std::fopen(path, "w"))
+            {
+                auto usageText = [](FILE *out, const InstructionUsage &u)
+                {
+                    std::fprintf(out, " %u %u %u %u", static_cast<unsigned>(u.pipeline), u.latency, u.vfLatency, u.viLatency);
+                    for (uint32_t r = 0; r < 2u; ++r)
+                        std::fprintf(out, " %u:%x", r < u.vfReadCount ? u.vfRead[r].reg : 0u, r < u.vfReadCount ? u.vfRead[r].lanes : 0u);
+                    std::fprintf(out, " %u:%x %04x %04x %x %x %u %u %u %u %u %u", u.vfWrite.reg, u.vfWrite.lanes, u.viRead, u.viWrite,
+                                 u.accRead, u.accWrite, u.waitQ, u.waitP, u.readsClip, u.writesClip, u.delaysNextBranchRead,
+                                 u.reserved);
+                };
+                std::fprintf(f, "# pc lower upper ibit ebit mbit dbit tbit shadow suppressed | upper usage | lower usage\n");
+                for (uint32_t pc = 0; pc + 8u <= codeSize; pc += 8u)
+                {
+                    const DecodedInstructionPair d = decodeInstructionPair(vuCode, pc);
+                    std::fprintf(f, "%04x %08x %08x %u %u %u %u %u %u %u |", pc, d.lower, d.upper, d.iBit, d.eBit, d.mBit, d.dBit,
+                                 d.tBit, d.upperVfShadowReg, d.suppressedLowerVf);
+                    usageText(f, d.upperUsage);
+                    std::fprintf(f, " |");
+                    usageText(f, d.lowerUsage);
+                    std::fprintf(f, "\n");
+                }
+                std::fclose(f);
+            }
+        }
+    }
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         commitReadyPipelines();
@@ -2564,6 +2749,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
 
         m_viBranchBackupValid = false;
+        if (vu1Profile && !decoded.iBit && ((decoded.lower >> 25) == 0x24u || (decoded.lower >> 25) == 0x25u)) // JR / JALR
+            g_vu1Profile.jump(m_state.pc, m_state.branchTarget);
 
         if (immediateVf)
         {
@@ -2746,6 +2933,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltD = false;
         m_pendingHaltT = false;
     }
+    if (vu1Profile)
+        g_vu1Profile.end(m_cycle, programEnded, !programEnded && m_cycle >= budgetEnd);
     m_state.cycles = m_cycle;
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
