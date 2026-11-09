@@ -6,6 +6,7 @@
 #include <string>
 
 extern "C" uint16_t ps2xTestPadButtons(int port); // ps2_test_harness.cpp (scripted input for unattended runs)
+extern "C" bool ps2xTestPadAxes(int port, uint8_t axes[4]); // same: scripted analog sticks (rx, ry, lx, ly)
 extern "C" bool ps2xTestMode();                  // ps2_test_harness.cpp: unattended run, ignore real input
 // --- Rayman debug: log the first calls of each libpad entry point to stderr ---
 namespace
@@ -340,6 +341,14 @@ namespace ps2_stubs
                     applyKeyboardState(state, portState.analogMode);
                 }
                 state.buttons = static_cast<uint16_t>(state.buttons & ~ps2xTestPadButtons(port));
+                uint8_t scriptedAxes[4];
+                if (ps2xTestPadAxes(port, scriptedAxes))
+                {
+                    state.rx = scriptedAxes[0];
+                    state.ry = scriptedAxes[1];
+                    state.lx = scriptedAxes[2];
+                    state.ly = scriptedAxes[3];
+                }
             }
 
             fillPadStatus(outData, state, portState);

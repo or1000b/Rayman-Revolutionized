@@ -1,6 +1,7 @@
 // Unattended runs: scripted pad input, a fixed frame budget and a hang watchdog.
 // Everything is driven by environment variables so a normal run behaves exactly as before:
-//   PS2X_TEST_INPUT    pad script, "tick:button[:holdTicks],..." e.g. "600:start:10,1500:cross"
+//   PS2X_TEST_INPUT    pad script, "tick:button[:holdTicks],..." e.g. "600:start:10,1500:cross"; analog sticks at
+//                      full deflection: lleft / lright / lup / ldown (left stick), rleft / rright / rup / rdown
 //                      (tick = window frame, ~60 per second; buttons: start select cross circle square
 //                      triangle up down left right l1 r1 l2 r2 l3 r3; holdTicks defaults to 8)
 //   PS2X_TEST_FRAMES   stop the run after this many window frames
@@ -49,7 +50,32 @@ namespace
         uint64_t tick = 0;
         uint64_t hold = 8;
         uint16_t mask = 0;
+        int8_t axis = -1; // analog stick: 0 rx, 1 ry, 2 lx, 3 ly (full deflection), -1 = a button
+        uint8_t value = 0x80;
     };
+
+    // Analog stick directions for the pad script: "lleft" / "lright" / "lup" / "ldown" (left stick) and the same
+    // with "r" (right stick), held at full deflection.
+    bool stickEvent(const std::string &name, PadEvent &ev)
+    {
+        static const struct
+        {
+            const char *name;
+            int8_t axis;
+            uint8_t value;
+        } kSticks[] = {{"rleft", 0, 0x00}, {"rright", 0, 0xFF}, {"rup", 1, 0x00}, {"rdown", 1, 0xFF},
+                       {"lleft", 2, 0x00}, {"lright", 2, 0xFF}, {"lup", 3, 0x00}, {"ldown", 3, 0xFF}};
+        for (const auto &s : kSticks)
+        {
+            if (name == s.name)
+            {
+                ev.axis = s.axis;
+                ev.value = s.value;
+                return true;
+            }
+        }
+        return false;
+    }
 
     std::vector<PadEvent> g_padScript;
     std::vector<uint64_t> g_shotTicks;
@@ -112,10 +138,11 @@ namespace
             const size_t c2 = item.find(':', c1 + 1);
             PadEvent ev;
             ev.tick = std::strtoull(item.substr(0, c1).c_str(), nullptr, 10);
-            ev.mask = buttonMask(item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1));
+            const std::string name = item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1);
+            ev.mask = buttonMask(name);
             if (c2 != std::string::npos)
                 ev.hold = std::strtoull(item.substr(c2 + 1).c_str(), nullptr, 10);
-            if (ev.mask == 0)
+            if (ev.mask == 0 && !stickEvent(name, ev))
             {
                 std::fprintf(stderr, "[test] unknown button in PS2X_TEST_INPUT item '%s'\n", item.c_str());
                 continue;
@@ -520,10 +547,31 @@ extern "C" uint16_t ps2xTestPadButtons(int port)
     uint16_t mask = 0;
     for (const PadEvent &ev : g_padScript)
     {
-        if (tick >= ev.tick && tick < ev.tick + ev.hold)
+        if (ev.axis < 0 && tick >= ev.tick && tick < ev.tick + ev.hold)
             mask = static_cast<uint16_t>(mask | ev.mask);
     }
     return mask;
+}
+
+// EE thread (scePadRead): analog sticks the script holds now (axes = rx, ry, lx, ly; 0x80 = centred).
+// Returns false when no stick event is active, so the caller keeps its own values.
+extern "C" bool ps2xTestPadAxes(int port, uint8_t axes[4])
+{
+    if (port != 0 || g_padScript.empty())
+        return false;
+    const uint64_t tick = scriptClock();
+    bool any = false;
+    for (int i = 0; i < 4; ++i)
+        axes[i] = 0x80;
+    for (const PadEvent &ev : g_padScript)
+    {
+        if (ev.axis >= 0 && tick >= ev.tick && tick < ev.tick + ev.hold)
+        {
+            axes[ev.axis] = ev.value;
+            any = true;
+        }
+    }
+    return any;
 }
 
 // Window thread, whenever a new picture goes to the window (RGBA, rowPixels per row). Saves the
