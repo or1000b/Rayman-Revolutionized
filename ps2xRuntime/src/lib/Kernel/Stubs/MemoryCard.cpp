@@ -1,5 +1,7 @@
 #include "Common.h"
 #include "MemoryCard.h"
+#include <cstdio>
+#include <cstdlib>
 
 namespace ps2_stubs
 {
@@ -157,13 +159,15 @@ namespace ps2_stubs
             std::filesystem::create_directories(getMcRootPath(port), ec);
         }
 
+        // The memory card file system (mcman) separates path components with '/' only: '\' is an ordinary
+        // character in a file name. Rayman Revolution writes its save icons as "<dir>/\EXT\A.ICO;1".
         std::vector<std::string> splitMcPathComponents(const std::string &value)
         {
             std::vector<std::string> parts;
             std::string current;
             for (char c : value)
             {
-                if (c == '/' || c == '\\')
+                if (c == '/')
                 {
                     if (!current.empty())
                     {
@@ -206,7 +210,6 @@ namespace ps2_stubs
 
         std::string normalizeGuestMcPathLocked(int32_t port, std::string path)
         {
-            std::replace(path.begin(), path.end(), '\\', '/');
             const std::string lower = toLowerAscii(path);
             if (lower.rfind("mc0:", 0) == 0 || lower.rfind("mc1:", 0) == 0)
             {
@@ -242,12 +245,74 @@ namespace ps2_stubs
             return joinMcPathComponents(parts);
         }
 
+        // Guest file names may hold characters a host file name cannot (on Windows: \ : * ? " < > | and
+        // control characters). They are stored as %XX in the host folder ('%' itself too, so the mapping
+        // is reversible) and decoded again when a directory is listed.
+        bool mcHostNeedsEscape(unsigned char c)
+        {
+            return c < 0x20u || c == '%' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' ||
+                   c == '<' || c == '>' || c == '|';
+        }
+
+        std::string encodeMcHostComponent(const std::string &name)
+        {
+            static const char kHex[] = "0123456789ABCDEF";
+            std::string encoded;
+            encoded.reserve(name.size());
+            for (char ch : name)
+            {
+                const unsigned char c = static_cast<unsigned char>(ch);
+                if (mcHostNeedsEscape(c))
+                {
+                    encoded.push_back('%');
+                    encoded.push_back(kHex[c >> 4]);
+                    encoded.push_back(kHex[c & 0x0Fu]);
+                }
+                else
+                {
+                    encoded.push_back(ch);
+                }
+            }
+            return encoded;
+        }
+
+        std::string decodeMcHostComponent(const std::string &name)
+        {
+            auto hexValue = [](char c) -> int
+            {
+                if (c >= '0' && c <= '9')
+                    return c - '0';
+                if (c >= 'A' && c <= 'F')
+                    return c - 'A' + 10;
+                if (c >= 'a' && c <= 'f')
+                    return c - 'a' + 10;
+                return -1;
+            };
+
+            std::string decoded;
+            decoded.reserve(name.size());
+            for (size_t i = 0; i < name.size(); ++i)
+            {
+                if (name[i] == '%' && i + 2u < name.size() && hexValue(name[i + 1u]) >= 0 &&
+                    hexValue(name[i + 2u]) >= 0)
+                {
+                    decoded.push_back(static_cast<char>(hexValue(name[i + 1u]) * 16 + hexValue(name[i + 2u])));
+                    i += 2u;
+                }
+                else
+                {
+                    decoded.push_back(name[i]);
+                }
+            }
+            return decoded;
+        }
+
         std::filesystem::path guestMcPathToHostPath(int32_t port, const std::string &guestPath)
         {
             std::filesystem::path resolved = getMcRootPath(port);
-            if (guestPath.size() > 1u)
+            for (const std::string &part : splitMcPathComponents(guestPath))
             {
-                resolved /= std::filesystem::path(guestPath.substr(1));
+                resolved /= std::filesystem::path(encodeMcHostComponent(part));
             }
             return resolved.lexically_normal();
         }
@@ -360,8 +425,29 @@ namespace ps2_stubs
             return patternPos == pattern.size();
         }
 
+        // PS2X_MC_TRACE=1 logs every memory card call (`[mc]` lines on stderr) and its result.
+        bool mcTraceEnabled()
+        {
+            static const bool enabled = []
+            {
+                const char *value = std::getenv("PS2X_MC_TRACE");
+                return value && *value && *value != '0';
+            }();
+            return enabled;
+        }
+
+#define MC_TRACE(...)                           \
+    do                                          \
+    {                                           \
+        if (mcTraceEnabled())                   \
+        {                                       \
+            std::fprintf(stderr, __VA_ARGS__);  \
+        }                                       \
+    } while (0)
+
         void setMcCommandResultLocked(int32_t cmd, int32_t result)
         {
+            MC_TRACE("[mc]   cmd 0x%02x -> result %d\n", cmd, result);
             g_mcLastCmd = cmd;
             g_mcLastResult = result;
             g_mcCommandPending = true;
@@ -522,6 +608,7 @@ namespace ps2_stubs
         const uint32_t currentDirAddr = getRegU32(ctx, 7);
         const std::string requestedDir =
             (pathAddr != 0u) ? readPs2CStringBounded(rdram, pathAddr, kMcMaxPathLen) : std::string{};
+        MC_TRACE("[mc] Chdir port %d slot %d [%s]\n", port, slot, requestedDir.c_str());
 
         std::string currentDir = "/";
         int32_t result = kMcResultNoEntry;
@@ -563,6 +650,7 @@ namespace ps2_stubs
 
     void sceMcClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] Close a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         int32_t result = kMcResultNoEntry;
         {
@@ -586,6 +674,7 @@ namespace ps2_stubs
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        MC_TRACE("[mc] Delete port %d slot %d [%s]\n", port, slot, path.c_str());
 
         int32_t result = kMcResultNoEntry;
         {
@@ -631,6 +720,7 @@ namespace ps2_stubs
 
     void sceMcEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] End a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
             closeMcFilesLocked();
@@ -650,6 +740,7 @@ namespace ps2_stubs
 
     void sceMcFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] Flush a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         int32_t result = kMcResultNoEntry;
         {
@@ -666,6 +757,7 @@ namespace ps2_stubs
 
     void sceMcFormat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] Format a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
 
@@ -701,6 +793,8 @@ namespace ps2_stubs
         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
         const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
         const uint32_t tableAddr = getRegU32(ctx, 9);
+        MC_TRACE("[mc] GetDir port %d slot %d '%s' flags 0x%x max %d\n", port, slot, rawPath.c_str(),
+                 getRegU32(ctx, 7), maxEntries);
 
         std::vector<SceMcTblGetDir> entries;
         int32_t result = kMcResultNoEntry;
@@ -721,15 +815,20 @@ namespace ps2_stubs
                     const bool hasWildcard =
                         guestQuery.find('*') != std::string::npos || guestQuery.find('?') != std::string::npos;
 
-                    const std::filesystem::path queryRel =
-                        (guestQuery.size() > 1u) ? std::filesystem::path(guestQuery.substr(1)) : std::filesystem::path{};
+                    // Split the (normalised, absolute) guest query into its directory and its last component.
+                    const size_t lastSlash = guestQuery.find_last_of('/');
+                    const std::string queryLeaf =
+                        (lastSlash == std::string::npos) ? guestQuery : guestQuery.substr(lastSlash + 1u);
+                    const std::string queryParent =
+                        (lastSlash == std::string::npos || lastSlash == 0u) ? std::string("/")
+                                                                            : guestQuery.substr(0, lastSlash);
 
-                    std::filesystem::path parentRel;
+                    std::string parentGuest;
                     std::string pattern;
                     if (hasWildcard)
                     {
-                        parentRel = queryRel.parent_path();
-                        pattern = queryRel.filename().string();
+                        parentGuest = queryParent;
+                        pattern = queryLeaf;
                     }
                     else
                     {
@@ -738,13 +837,13 @@ namespace ps2_stubs
                         if (std::filesystem::exists(queryHostPath, queryEc) && !queryEc &&
                             std::filesystem::is_directory(queryHostPath, queryEc))
                         {
-                            parentRel = queryRel;
+                            parentGuest = guestQuery;
                             pattern = "*";
                         }
                         else
                         {
-                            parentRel = queryRel.parent_path();
-                            pattern = queryRel.filename().string();
+                            parentGuest = queryParent;
+                            pattern = queryLeaf;
                         }
                     }
 
@@ -753,12 +852,7 @@ namespace ps2_stubs
                         pattern = "*";
                     }
 
-                    std::filesystem::path hostDir = getMcRootPath(port);
-                    if (!parentRel.empty())
-                    {
-                        hostDir /= parentRel;
-                    }
-                    hostDir = hostDir.lexically_normal();
+                    const std::filesystem::path hostDir = guestMcPathToHostPath(port, parentGuest);
 
                     std::error_code ec;
                     if (std::filesystem::exists(hostDir, ec) && !ec &&
@@ -794,13 +888,13 @@ namespace ps2_stubs
                                   [](const std::filesystem::directory_entry &lhs,
                                      const std::filesystem::directory_entry &rhs)
                                   {
-                                      return toLowerAscii(lhs.path().filename().string()) <
-                                             toLowerAscii(rhs.path().filename().string());
+                                      return toLowerAscii(decodeMcHostComponent(lhs.path().filename().string())) <
+                                             toLowerAscii(decodeMcHostComponent(rhs.path().filename().string()));
                                   });
 
                         for (const auto &entry : dirEntries)
                         {
-                            const std::string name = entry.path().filename().string();
+                            const std::string name = decodeMcHostComponent(entry.path().filename().string());
                             if (!wildcardMatch(pattern, name))
                             {
                                 continue;
@@ -849,6 +943,7 @@ namespace ps2_stubs
 
     void sceMcGetEntSpace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] GetEntSpace a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
             setMcCommandResultLocked(kMcCmdGetEntSpace, 1024);
@@ -863,6 +958,7 @@ namespace ps2_stubs
         const uint32_t typePtr = getRegU32(ctx, 6);
         const uint32_t freePtr = getRegU32(ctx, 7);
         const uint32_t formatPtr = getRegU32(ctx, 8);
+        MC_TRACE("[mc] GetInfo port %d slot %d\n", port, slot);
 
         int32_t cardType = 0;
         int32_t freeBlocks = 0;
@@ -918,6 +1014,7 @@ namespace ps2_stubs
 
     void sceMcInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] Init a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
             closeMcFilesLocked();
@@ -941,6 +1038,7 @@ namespace ps2_stubs
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        MC_TRACE("[mc] Mkdir port %d slot %d [%s]\n", port, slot, path.c_str());
 
         int32_t result = kMcResultNoEntry;
         {
@@ -986,6 +1084,7 @@ namespace ps2_stubs
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
         const uint32_t flags = getRegU32(ctx, 7);
+        MC_TRACE("[mc] Open port %d slot %d '%s' flags 0x%x\n", port, slot, path.c_str(), flags);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1049,6 +1148,7 @@ namespace ps2_stubs
         const uint32_t dstAddr = getRegU32(ctx, 5);
         const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
         uint8_t *dst = (size > 0) ? getMemPtr(rdram, dstAddr) : nullptr;
+        MC_TRACE("[mc] Read fd %d to 0x%x size %d\n", fd, dstAddr, size);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1083,6 +1183,7 @@ namespace ps2_stubs
 
     void sceMcRename(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] Rename a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string oldPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
@@ -1124,6 +1225,7 @@ namespace ps2_stubs
         const int32_t fd = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t offset = static_cast<int32_t>(getRegU32(ctx, 5));
         const int32_t origin = static_cast<int32_t>(getRegU32(ctx, 6));
+        MC_TRACE("[mc] Seek fd %d offset %d origin %d\n", fd, offset, origin);
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1159,6 +1261,7 @@ namespace ps2_stubs
 
     void sceMcSetFileInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] SetFileInfo a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
@@ -1236,6 +1339,7 @@ namespace ps2_stubs
 
     void sceMcUnformat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        MC_TRACE("[mc] Unformat a0 0x%x a1 0x%x a2 0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6));
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
 
@@ -1270,6 +1374,7 @@ namespace ps2_stubs
         const uint32_t srcAddr = getRegU32(ctx, 5);
         const int32_t size = static_cast<int32_t>(getRegU32(ctx, 6));
         const uint8_t *src = (size > 0) ? getConstMemPtr(rdram, srcAddr) : nullptr;
+        MC_TRACE("[mc] Write fd %d from 0x%x size %d\n", fd, srcAddr, size);
 
         int32_t result = kMcResultNoEntry;
         {

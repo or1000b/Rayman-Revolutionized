@@ -583,6 +583,69 @@ void register_ps2_runtime_io_tests()
                      "sceMcGetDir file entries should carry the closed-file attribute");
         });
 
+        tc.Run("sceMc keeps backslashes as part of file names", [](TestCase &t)
+        {
+            // mcman separates components with '/' only. Rayman Revolution saves its icons as
+            // "<dir>/\EXT\A.ICO;1"; treating '\' as a separator made the open fail (no "EXT" folder).
+            TestContext test;
+
+            const uint32_t dirAddr = GUEST_STRING_AREA_START + 0x400;
+            const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x500;
+            const uint32_t patternAddr = GUEST_STRING_AREA_START + 0x600;
+            const uint32_t writeBufAddr = GUEST_BUFFER_AREA_START + 0x300;
+            const std::string payload = "icon";
+
+            writeGuestString(test.rdram.data(), dirAddr, "BESLES-50044TEST");
+            writeGuestString(test.rdram.data(), fileAddr, "BESLES-50044TEST/\\EXT\\A.ICO;1");
+            writeGuestString(test.rdram.data(), patternAddr, "BESLES-50044TEST/*");
+            std::memcpy(test.rdram.data() + writeBufAddr, payload.data(), payload.size());
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, dirAddr);
+            ps2_stubs::sceMcMkdir(test.rdram.data(), &test.ctx, nullptr);
+            int32_t cmd = 0;
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcMkdir should create the save directory");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, fileAddr);
+            setRegU32(test.ctx, 7, PS2_FIO_O_WRONLY | PS2_FIO_O_CREAT);
+            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            const int32_t fd = syncMc(test.rdram, &cmd);
+            t.IsTrue(fd > 0, "sceMcOpen should create a file whose name contains backslashes");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            setRegU32(test.ctx, 5, writeBufAddr);
+            setRegU32(test.ctx, 6, static_cast<uint32_t>(payload.size()));
+            ps2_stubs::sceMcWrite(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), static_cast<int32_t>(payload.size()), "sceMcWrite should write the icon");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcClose should finish successfully");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, patternAddr);
+            setRegU32(test.ctx, 7, 0u);
+            setRegU32(test.ctx, 8, 8u);
+            setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
+            ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), 3, "sceMcGetDir should list '.', '..' and the icon");
+            const auto *entries = reinterpret_cast<const SceMcTblGetDir *>(test.rdram.data() + GUEST_MC_TABLE_ADDR);
+            t.Equals(std::string(entries[2].entryName), std::string("\\EXT\\A.ICO;1"),
+                     "sceMcGetDir should report the guest name with its backslashes");
+            t.Equals(entries[2].fileSizeByte, static_cast<uint32_t>(payload.size()), "sceMcGetDir should report the size");
+            t.IsFalse(std::filesystem::exists(test.paths.mcRoot / "BESLES-50044TEST" / "EXT"),
+                      "a backslash must not create a host sub-folder");
+        });
+
         tc.Run("sceMcGetInfo reports formatted and unformatted states", [](TestCase &t)
         {
             TestContext test;
