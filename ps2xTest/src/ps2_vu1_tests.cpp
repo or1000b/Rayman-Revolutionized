@@ -807,11 +807,12 @@ void register_ps2_vu1_tests()
                 uint8_t opcode;
                 uint32_t latency;
             };
+            // PCSX2 VULowerOP_T3 tables: 0x78 ESQRT, 0x79 ERSQRT, 0x7A ERCPR, 0x7C ESIN, 0x7D EATAN, 0x7E EEXP.
             constexpr EfuCase cases[] = {
                 {0x70u, 11u}, {0x71u, 18u}, {0x72u, 18u}, {0x73u, 24u},
-                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x77u, 18u},
-                {0x78u, 12u}, {0x79u, 29u}, {0x7Au, 12u}, {0x7Cu, 54u},
-                {0x7Du, 44u}};
+                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x78u, 12u},
+                {0x79u, 18u}, {0x7Au, 12u}, {0x7Cu, 29u}, {0x7Du, 54u},
+                {0x7Eu, 44u}};
 
             for (const EfuCase &efu : cases)
             {
@@ -839,6 +840,45 @@ void register_ps2_vu1_tests()
                          "WAITP should count every EFU stall as an elapsed VU cycle");
                 t.IsTrue(std::isfinite(vu1.state().p),
                          "architected EFU opcode should commit a finite P result");
+            }
+        });
+
+        tc.Run("EFU scalar opcodes compute the right function", [](TestCase &t)
+        {
+            // Rayman's point-light microcode lights the middle vertex of each triple with ERSQRT P, vf12y; with the
+            // opcodes shifted by one it ran ESIN and those vertices came out white or black.
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            struct ScalarCase
+            {
+                uint8_t opcode;
+                float input;
+                float expected;
+                const char *what;
+            };
+            const ScalarCase cases[] = {
+                {0x78u, 4.0f, 2.0f, "ESQRT (0x78) should give sqrt(x)"},
+                {0x79u, 4.0f, 0.5f, "ERSQRT (0x79) should give 1/sqrt(x)"},
+                {0x7Au, 4.0f, 0.25f, "ERCPR (0x7A) should give 1/x"},
+                {0x7Cu, 0.5f, std::sin(0.5f), "ESIN (0x7C) should give sin(x)"},
+                // EATAN takes t = (x - 1) / (x + 1) and returns pi/4 + atan(t) (PCSX2 _vuCalculateEATAN).
+                {0x7Du, 0.5f, 0.785398185f + std::atan(0.5f), "EATAN (0x7D) should give pi/4 + atan(t)"},
+                {0x7Eu, 0.5f, std::exp(-0.5f), "EEXP (0x7E) should give exp(-x)"},
+            };
+            for (const ScalarCase &c : cases)
+            {
+                std::memset(fx.code, 0, PS2_VU1_CODE_SIZE);
+                // fsf = y (bits 21-22 = 1): the operand is vf1.y.
+                writeVuInstructionPair(fx.code, 0u, makeVuLowerSpecial(c.opcode, 1u, 0u, 0u, 0x1u), kVuUpperNop);
+                writeVuInstructionPair(fx.code, 8u, makeVuLowerSpecial(0x7Bu, 0u), kVuUpperNop);
+
+                VU1Interpreter vu1;
+                vu1.state().vf[1][0] = 100.0f;
+                vu1.state().vf[1][1] = c.input;
+                vu1.state().vf[1][2] = 200.0f;
+                vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+                t.IsTrue(std::fabs(vu1.state().p - c.expected) < 1e-3f, c.what);
             }
         });
 

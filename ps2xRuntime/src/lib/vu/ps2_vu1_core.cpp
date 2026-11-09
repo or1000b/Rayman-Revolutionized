@@ -2189,18 +2189,20 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
     case 0x74:
     case 0x75:
     case 0x76:
-    case 0x77:
     case 0x78:
     case 0x79:
     case 0x7A:
     case 0x7C:
     case 0x7D:
+    case 0x7E:
         if (m_unit == Unit::VU0)
         {
             usage.reserved = true;
             break;
         }
         usage.pipeline = PipelineEfu;
+        // Latencies from the VU manual / PCSX2: ESADD 11, ERSADD / ELENG / ERSQRT 18, ERLENG 24, EATANxy / EATANxz /
+        // EATAN 54, ESUM / ESQRT / ERCPR 12, ESIN 29, EEXP 44 (0x79 ERSQRT, 0x7C ESIN, 0x7D EATAN, 0x7E EEXP).
         switch (special)
         {
         case 0x70:
@@ -2208,7 +2210,7 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
             break;
         case 0x71:
         case 0x72:
-        case 0x77:
+        case 0x79:
             usage.latency = 18u;
             break;
         case 0x73:
@@ -2216,7 +2218,7 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
             break;
         case 0x74:
         case 0x75:
-        case 0x7C:
+        case 0x7D:
             usage.latency = 54u;
             break;
         case 0x76:
@@ -2224,10 +2226,10 @@ VU1Interpreter::InstructionUsage VU1Interpreter::decodeLowerUsage(uint32_t lower
         case 0x7A:
             usage.latency = 12u;
             break;
-        case 0x79:
+        case 0x7C:
             usage.latency = 29u;
             break;
-        case 0x7D:
+        case 0x7E:
             usage.latency = 44u;
             break;
         default:
