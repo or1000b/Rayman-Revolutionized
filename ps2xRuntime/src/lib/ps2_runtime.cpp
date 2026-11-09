@@ -1171,6 +1171,13 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
+    // PS2X_MC_ROOT=<folder>: memory card slot 1 lives there instead of <elf dir>/mc0 (slot 2 next to it,
+    // "mc1" if the folder is called mc0). run_tests gives every run an empty card of its own this way.
+    if (const char *mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot && *mcRoot)
+    {
+        paths.mcRoot = std::filesystem::path(mcRoot);
+    }
+
     setIoPaths(paths);
 }
 

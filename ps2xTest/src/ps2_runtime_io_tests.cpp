@@ -10,6 +10,7 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <thread>
 
 using namespace ps2_syscalls;
 
@@ -581,6 +582,81 @@ void register_ps2_runtime_io_tests()
                      "sceMcGetDir should report the host file size");
             t.IsTrue((entries[2].attrFile & 0x0080u) != 0u,
                      "sceMcGetDir file entries should carry the closed-file attribute");
+        });
+
+        tc.Run("sceMcGetDir on a folder name returns the folder's own entry with a stable time", [](TestCase &t)
+        {
+            // mcman matches the last path component against the parent's entries. Rayman Revolution reads
+            // its save folder's time right after the mkdir, stores it, and on load refuses the save unless
+            // the folder still reports that time (files are written into the folder in between).
+            TestContext test;
+
+            const uint32_t dirAddr = GUEST_STRING_AREA_START + 0x400;
+            const uint32_t fileAddr = GUEST_STRING_AREA_START + 0x500;
+            writeGuestString(test.rdram.data(), dirAddr, "BESLES-50044TIME");
+            writeGuestString(test.rdram.data(), fileAddr, "BESLES-50044TIME/data.add");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, dirAddr);
+            ps2_stubs::sceMcMkdir(test.rdram.data(), &test.ctx, nullptr);
+            int32_t cmd = 0;
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcMkdir should create the folder");
+
+            auto getFolderEntry = [&](SceMcTblGetDir &out) -> int32_t
+            {
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, 0u);
+                setRegU32(test.ctx, 5, 0u);
+                setRegU32(test.ctx, 6, dirAddr);
+                setRegU32(test.ctx, 7, 0u);
+                setRegU32(test.ctx, 8, 1u);
+                setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
+                ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+                const int32_t count = syncMc(test.rdram, &cmd);
+                std::memcpy(&out, test.rdram.data() + GUEST_MC_TABLE_ADDR, sizeof(out));
+                return count;
+            };
+
+            SceMcTblGetDir before{};
+            t.Equals(getFolderEntry(before), 1, "sceMcGetDir on the folder name should find one entry");
+            t.Equals(std::string(before.entryName), std::string("BESLES-50044TIME"),
+                     "the entry should be the folder itself, not its '.' entry");
+            t.IsTrue((before.attrFile & 0x0020u) != 0u, "the entry should carry the sub-directory attribute");
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, fileAddr);
+            setRegU32(test.ctx, 7, PS2_FIO_O_WRONLY | PS2_FIO_O_CREAT);
+            ps2_stubs::sceMcOpen(test.rdram.data(), &test.ctx, nullptr);
+            const int32_t fd = syncMc(test.rdram, &cmd);
+            t.IsTrue(fd > 0, "sceMcOpen should create a file in the folder");
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, static_cast<uint32_t>(fd));
+            ps2_stubs::sceMcClose(test.rdram.data(), &test.ctx, nullptr);
+            syncMc(test.rdram, &cmd);
+
+            SceMcTblGetDir after{};
+            t.Equals(getFolderEntry(after), 1, "the folder should still be found");
+            t.IsTrue(std::memcmp(&before.modify, &after.modify, sizeof(before.modify)) == 0,
+                     "adding a file must not change the folder's reported modification time");
+
+            // The folder's time is kept in a hidden file: it must neither block deleting the folder nor
+            // survive it.
+            for (uint32_t addr : {fileAddr, dirAddr})
+            {
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, 0u);
+                setRegU32(test.ctx, 5, 0u);
+                setRegU32(test.ctx, 6, addr);
+                ps2_stubs::sceMcDelete(test.rdram.data(), &test.ctx, nullptr);
+                t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcDelete should remove the file, then the folder");
+            }
+            t.IsFalse(std::filesystem::exists(test.paths.mcRoot / "BESLES-50044TIME"),
+                      "the folder should be gone from the host");
         });
 
         tc.Run("sceMc keeps backslashes as part of file names", [](TestCase &t)

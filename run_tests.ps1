@@ -127,6 +127,12 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     $env:PS2X_DETERMINISTIC = '1'
     if ($sc.PSObject.Properties['deterministic'] -and -not $sc.deterministic) { $env:PS2X_DETERMINISTIC = '0' }
     if ($sc.renderer -eq 'cpu') { $env:PS2X_GS_RENDERER = 'cpu' } else { Remove-Item Env:PS2X_GS_RENDERER -ErrorAction SilentlyContinue }
+    # Every run gets an empty memory card of its own (<shot dir>\mc0): the user's saves in
+    # "Rayman revolution files\mc0" neither change the tests nor get touched by them.
+    $mcRoot = Join-Path $shotDir 'mc0'
+    if (Test-Path $mcRoot) { Remove-Item -Recurse -Force $mcRoot }
+    New-Item -ItemType Directory -Force $mcRoot | Out-Null
+    $env:PS2X_MC_ROOT = $mcRoot
     # Extra variables of this scenario ("env": { "PS2X_UBI_TRACE": "1" }); cleared again after the run.
     $extraEnv = @()
     if ($sc.PSObject.Properties['env']) {

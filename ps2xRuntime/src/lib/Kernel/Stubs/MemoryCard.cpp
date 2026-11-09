@@ -3,6 +3,18 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define NOUSER // raylib (through the runtime headers) declares CloseWindow, ShowCursor, Rectangle...
+#define NOGDI
+#include <windows.h> // GetFileAttributesExW: a directory's creation time (see mcEntryTime)
+#endif
+
 namespace ps2_stubs
 {
     namespace
@@ -328,9 +340,85 @@ namespace ps2_stubs
 
         std::time_t fileTimeToTimeTMc(std::filesystem::file_time_type value)
         {
-            const auto systemTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                value - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
-            return std::chrono::system_clock::to_time_t(systemTime);
+            // clock_cast is exact. The former "value - file_clock::now() + system_clock::now()" could move by a
+            // second between two calls, and games compare these times.
+            const auto systemTime = std::chrono::clock_cast<std::chrono::system_clock>(value);
+            return std::chrono::system_clock::to_time_t(
+                std::chrono::time_point_cast<std::chrono::system_clock::duration>(systemTime));
+        }
+
+        // Time reported for a host entry. A directory reports its creation time: on the card a folder's own
+        // entry keeps its time when files are added inside it, while a host folder's write time changes.
+        // Rayman Revolution keeps its save folder's time (taken right after the mkdir, before the files are
+        // written) and refuses to load the save when the folder reports another one.
+        // The folder's time is written into this hidden file at mkdir, so it survives copying the card folder
+        // (a copied host folder gets a new creation time). Never listed; removed with the folder.
+        constexpr const char *kMcDirTimeFile = ".ps2x-dir-time";
+
+        bool isMcHiddenEntry(const std::filesystem::path &hostPath)
+        {
+            return hostPath.filename() == kMcDirTimeFile;
+        }
+
+        void writeMcDirTime(const std::filesystem::path &hostDir, std::time_t value)
+        {
+            std::ofstream out(hostDir / kMcDirTimeFile, std::ios::binary | std::ios::trunc);
+            out << static_cast<long long>(value) << '\n';
+        }
+
+        bool readMcDirTime(const std::filesystem::path &hostDir, std::time_t &value)
+        {
+            std::ifstream in(hostDir / kMcDirTimeFile, std::ios::binary);
+            long long stored = 0;
+            if (!(in >> stored) || stored <= 0)
+            {
+                return false;
+            }
+            value = static_cast<std::time_t>(stored);
+            return true;
+        }
+
+        // A folder holding nothing but the hidden time file counts as empty.
+        bool isMcDirEmpty(const std::filesystem::path &hostDir)
+        {
+            std::error_code ec;
+            for (const auto &entry : std::filesystem::directory_iterator(hostDir, ec))
+            {
+                if (!isMcHiddenEntry(entry.path()))
+                {
+                    return false;
+                }
+            }
+            return !ec;
+        }
+
+        std::time_t mcEntryTime(const std::filesystem::path &hostPath, bool isDirectory, std::time_t fallback)
+        {
+            std::time_t stored = 0;
+            if (isDirectory && readMcDirTime(hostPath, stored))
+            {
+                return stored;
+            }
+#if defined(_WIN32)
+            if (isDirectory)
+            {
+                WIN32_FILE_ATTRIBUTE_DATA data{};
+                if (GetFileAttributesExW(hostPath.wstring().c_str(), GetFileExInfoStandard, &data))
+                {
+                    ULARGE_INTEGER created{};
+                    created.LowPart = data.ftCreationTime.dwLowDateTime;
+                    created.HighPart = data.ftCreationTime.dwHighDateTime;
+                    constexpr uint64_t kUnixEpochIn100ns = 116444736000000000ull;
+                    if (created.QuadPart >= kUnixEpochIn100ns)
+                    {
+                        return static_cast<std::time_t>((created.QuadPart - kUnixEpochIn100ns) / 10000000ull);
+                    }
+                }
+            }
+#endif
+            std::error_code ec;
+            const auto writeTime = std::filesystem::last_write_time(hostPath, ec);
+            return ec ? fallback : fileTimeToTimeTMc(writeTime);
         }
 
         void writeMcCString(uint8_t *rdram, uint32_t addr, const std::string &value)
@@ -695,18 +783,20 @@ namespace ps2_stubs
                         std::error_code ec;
                         if (std::filesystem::exists(hostPath, ec) && !ec)
                         {
-                            if (std::filesystem::is_directory(hostPath, ec) &&
-                                !std::filesystem::is_empty(hostPath, ec))
+                            const bool isDirectory = std::filesystem::is_directory(hostPath, ec);
+                            if (isDirectory && !isMcDirEmpty(hostPath))
                             {
                                 result = kMcResultNotEmpty;
                             }
-                            else if (std::filesystem::remove(hostPath, ec) && !ec)
-                            {
-                                result = kMcResultSucceed;
-                            }
                             else
                             {
-                                result = kMcResultDeniedPermit;
+                                if (isDirectory)
+                                {
+                                    std::filesystem::remove(hostPath / kMcDirTimeFile, ec);
+                                    ec.clear();
+                                }
+                                result = (std::filesystem::remove(hostPath, ec) && !ec) ? kMcResultSucceed
+                                                                                         : kMcResultDeniedPermit;
                             }
                         }
                     }
@@ -812,40 +902,16 @@ namespace ps2_stubs
                     ensureMcRootExists(port);
                     const std::string guestQuery =
                         normalizeGuestMcPathLocked(port, rawPath.empty() ? "." : rawPath);
-                    const bool hasWildcard =
-                        guestQuery.find('*') != std::string::npos || guestQuery.find('?') != std::string::npos;
-
-                    // Split the (normalised, absolute) guest query into its directory and its last component.
+                    // Like mcman: the last component is a name pattern matched against the entries of the
+                    // directory before it. "SAVE/*" lists SAVE's contents ('.', '..', files); "SAVE" without a
+                    // wildcard returns SAVE's own entry from its parent (Rayman reads its save folder's time so).
                     const size_t lastSlash = guestQuery.find_last_of('/');
                     const std::string queryLeaf =
                         (lastSlash == std::string::npos) ? guestQuery : guestQuery.substr(lastSlash + 1u);
-                    const std::string queryParent =
+                    const std::string parentGuest =
                         (lastSlash == std::string::npos || lastSlash == 0u) ? std::string("/")
                                                                             : guestQuery.substr(0, lastSlash);
-
-                    std::string parentGuest;
-                    std::string pattern;
-                    if (hasWildcard)
-                    {
-                        parentGuest = queryParent;
-                        pattern = queryLeaf;
-                    }
-                    else
-                    {
-                        const std::filesystem::path queryHostPath = guestMcPathToHostPath(port, guestQuery);
-                        std::error_code queryEc;
-                        if (std::filesystem::exists(queryHostPath, queryEc) && !queryEc &&
-                            std::filesystem::is_directory(queryHostPath, queryEc))
-                        {
-                            parentGuest = guestQuery;
-                            pattern = "*";
-                        }
-                        else
-                        {
-                            parentGuest = queryParent;
-                            pattern = queryLeaf;
-                        }
-                    }
+                    std::string pattern = queryLeaf;
 
                     if (pattern.empty())
                     {
@@ -859,19 +925,19 @@ namespace ps2_stubs
                         std::filesystem::is_directory(hostDir, ec))
                     {
                         const std::time_t now = std::time(nullptr);
-                        auto appendSpecial = [&](const std::string &name)
+                        auto appendSpecial = [&](const std::string &name, const std::filesystem::path &dirPath)
                         {
                             if (!wildcardMatch(pattern, name))
                             {
                                 return;
                             }
                             SceMcTblGetDir entry{};
-                            fillMcDirTableEntry(entry, name, true, 0u, now);
+                            fillMcDirTableEntry(entry, name, true, 0u, mcEntryTime(dirPath, true, now));
                             entries.push_back(entry);
                         };
 
-                        appendSpecial(".");
-                        appendSpecial("..");
+                        appendSpecial(".", hostDir);
+                        appendSpecial("..", hostDir.parent_path());
 
                         std::vector<std::filesystem::directory_entry> dirEntries;
                         for (const auto &entry : std::filesystem::directory_iterator(
@@ -894,6 +960,10 @@ namespace ps2_stubs
 
                         for (const auto &entry : dirEntries)
                         {
+                            if (isMcHiddenEntry(entry.path()))
+                            {
+                                continue;
+                            }
                             const std::string name = decodeMcHostComponent(entry.path().filename().string());
                             if (!wildcardMatch(pattern, name))
                             {
@@ -904,14 +974,12 @@ namespace ps2_stubs
                             const bool isDirectory = entry.is_directory(entryEc) && !entryEc;
                             const uint32_t sizeBytes =
                                 isDirectory ? 0u : static_cast<uint32_t>(entry.file_size(entryEc));
-                            entryEc.clear();
-                            const std::time_t modifiedTime = fileTimeToTimeTMc(entry.last_write_time(entryEc));
                             SceMcTblGetDir tableEntry{};
                             fillMcDirTableEntry(tableEntry,
                                                 name,
                                                 isDirectory,
                                                 sizeBytes,
-                                                entryEc ? now : modifiedTime);
+                                                mcEntryTime(entry.path(), isDirectory, now));
                             entries.push_back(tableEntry);
                         }
 
@@ -1062,6 +1130,7 @@ namespace ps2_stubs
                     }
                     else if (std::filesystem::create_directory(hostPath, ec) && !ec)
                     {
+                        writeMcDirTime(hostPath, std::time(nullptr));
                         result = kMcResultSucceed;
                     }
                     else
