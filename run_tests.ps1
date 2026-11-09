@@ -60,13 +60,25 @@ public static class ShotMath
     // Mean absolute difference per colour channel (0-255); -1 if the sizes differ.
     public static double MeanDiff(string a, string b)
     {
+        return MeanDiffRegion(a, b, 0, 0, int.MaxValue, int.MaxValue);
+    }
+    // The same over the rectangle x, y, w, h only (clipped to the picture): a small object stays visible in the number.
+    public static double MeanDiffRegion(string a, string b, int x0, int y0, int rw, int rh)
+    {
         int wa, ha, wb, hb;
         var pa = Load(a, out wa, out ha); var pb = Load(b, out wb, out hb);
         if (wa != wb || ha != hb) return -1;
-        double total = 0; long n = (long)wa * ha;
-        for (long i = 0; i < n; i++)
-            for (int c = 0; c < 3; c++)
-                total += Math.Abs(pa[i * 4 + c] - pb[i * 4 + c]);
+        int x1 = (int)Math.Min((long)wa, (long)x0 + rw), y1 = (int)Math.Min((long)ha, (long)y0 + rh);
+        x0 = Math.Max(0, x0); y0 = Math.Max(0, y0);
+        if (x1 <= x0 || y1 <= y0) return -1;
+        double total = 0; long n = 0;
+        for (int y = y0; y < y1; y++)
+            for (int x = x0; x < x1; x++, n++)
+            {
+                long i = (long)y * wa + x;
+                for (int c = 0; c < 3; c++)
+                    total += Math.Abs(pa[i * 4 + c] - pb[i * 4 + c]);
+            }
         return total / (n * 3);
     }
 }
@@ -125,6 +137,8 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     $env:PS2X_TEST_SHOTS = (@($sc.shots) -join ',')
     $env:PS2X_WATCHDOG_SEC = '15'
     $env:PS2X_DETERMINISTIC = '1'
+    # [vu1-hash] every 600 VSyncs: hash of every byte VU1 sent to the GS (check type vu1_hash).
+    $env:PS2X_VU1_KICK_HASH = '1'
     if ($sc.PSObject.Properties['deterministic'] -and -not $sc.deterministic) { $env:PS2X_DETERMINISTIC = '0' }
     if ($sc.renderer -eq 'cpu') { $env:PS2X_GS_RENDERER = 'cpu' } else { Remove-Item Env:PS2X_GS_RENDERER -ErrorAction SilentlyContinue }
     # Every run gets an empty memory card of its own (<shot dir>\mc0): the user's saves in
@@ -237,6 +251,27 @@ if ($buildOk) {
                     if ($missing) { Write-CheckResult $sc.name $check $false ("after " + ($(if ($found.Count) { $found[-1] } else { 'the start' })) + " no line matches '$missing'") }
                     else { Write-CheckResult $sc.name $check $true ("in order at " + ($found -join ', ')) }
                 }
+                'vu1_hash' {
+                    # Every [vu1-hash] line must equal the reference (tests\golden\<golden>): VU1 sent the GS the same
+                    # bytes. The reference is written by -UpdateGolden, or from this run when it does not exist yet.
+                    $got = @($lines | ForEach-Object { if ($_ -match '\[vu1-hash\] vsync \d+ kicks \d+ hash [0-9a-f]+') { $Matches[0] } })
+                    if ($got.Count -eq 0) { Write-CheckResult $sc.name $check $false 'no [vu1-hash] lines (PS2X_VU1_KICK_HASH)'; break }
+                    $golden = Join-Path $GoldenDir $check.golden
+                    if ($UpdateGolden -or -not (Test-Path $golden)) {
+                        New-Item -ItemType Directory -Force $GoldenDir | Out-Null
+                        $what = $(if ($UpdateGolden) { 'reference updated' } else { 'no reference yet: written from this run' })
+                        Set-Content -Path $golden -Value $got -Encoding ascii
+                        Write-CheckResult $sc.name $check $true "$($got.Count) hashes; $what"
+                        break
+                    }
+                    $ref = @(Get-Content $golden)
+                    $n = [math]::Min($ref.Count, $got.Count)
+                    $split = -1
+                    for ($i = 0; $i -lt $n; $i++) { if ($ref[$i] -ne $got[$i]) { $split = $i; break } }
+                    if ($split -ge 0) { Write-CheckResult $sc.name $check $false ("differs at $($split + 1) of $($ref.Count)`n  reference: $($ref[$split])`n  this run:  $($got[$split])") }
+                    elseif ($ref.Count -ne $got.Count) { Write-CheckResult $sc.name $check $false "same for $n hashes, then $($got.Count) vs $($ref.Count) in the reference" }
+                    else { Write-CheckResult $sc.name $check $true "$n hashes identical (last: $($got[$n - 1]))" }
+                }
                 'shot' {
                     $shot = $shotFiles | Where-Object { $_.Tick -ge $check.tick } | Select-Object -First 1
                     if (-not $shot) { Write-CheckResult $sc.name $check $false "no picture at tick $($check.tick) (the run ended earlier?)"; break }
@@ -255,7 +290,12 @@ if ($buildOk) {
                         $detail += "; golden updated"
                     }
                     elseif (Test-Path $golden) {
-                        $diff = [ShotMath]::MeanDiff($shot.Path, $golden)
+                        if ($check.PSObject.Properties['region']) {
+                            $r = @($check.region)
+                            $diff = [ShotMath]::MeanDiffRegion($shot.Path, $golden, [int]$r[0], [int]$r[1], [int]$r[2], [int]$r[3])
+                            $detail += "; region $($r -join ',')"
+                        }
+                        else { $diff = [ShotMath]::MeanDiff($shot.Path, $golden) }
                         if ($diff -lt 0) { $ok = $false; $detail += "; size differs from golden" }
                         else {
                             if ($diff -gt $check.max_diff) { $ok = $false }

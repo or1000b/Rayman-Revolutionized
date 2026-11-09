@@ -216,7 +216,8 @@
 ## Test automation (built 2026-11-02)
 - `run_tests.bat [-NoBuild] [-Only <scenario>] [-UpdateGolden]` (logic in `run_tests.ps1`, Windows PowerShell 5.1): builds, runs each scenario of `tests\scenarios.json` unattended (minimised window, no focus), checks it, writes `out\test_report.txt`, exit code 0 = no FAIL. No `pause`, so Claude can run it.
   - Per scenario: `out\tests\<name>\run.log` and the checkpoint pictures.
-  - Check types: `exit_code`, `log_absent` / `log_present` (regex), `log_sequence` (`patterns`: each must match a later line than the previous one), `shot` (luma variance + mean difference to a golden picture), `fps`, `iopcd`, `audio_peak`.
+  - Check types: `exit_code`, `log_absent` / `log_present` (regex), `log_sequence` (`patterns`: each must match a later line than the previous one), `shot` (luma variance + mean difference to a golden picture; optional `"region": [x, y, w, h]` compares only that box, so a small object counts: the energy ball gives 14-15 when missing), `vu1_hash` (every `[vu1-hash]` line equals `tests\golden\<golden>`; written by -UpdateGolden or by the first run without a reference), `fps`, `iopcd`, `audio_peak`.
+  - Every run sets `PS2X_VU1_KICK_HASH=1`. The references (pictures + VU1 hashes of all 5 scenarios) were taken from the interpreter on 2026-11-10, before the VU1 translation: a translated VU1 must reproduce them exactly.
   - `memcard`: a folder under `tests\` copied onto the run's empty memory card. `tests\fixtures\` is local only (the user's save holds game icons; git-ignored): `fixtures\mc_swim\mc0` = the user's save of 2026-11-09 15:42 (Minisaurus Plain beach), with `.ps2x-dir-time` keeping the folder time.
   - `known_fail` on a check = expected failure with a known cause: reported as KNOWN-FAIL, does not fail the run; if it passes it shows as `FIXED?`.
   - Golden pictures: `tests\golden\` (game content, git-ignored). Refresh with `-UpdateGolden` after an intended visual change.

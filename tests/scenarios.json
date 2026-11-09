@@ -18,6 +18,7 @@
       "shots": [590, 1400],
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "vu1_hash", "golden": "boot_to_language_menu.vu1hash", "label": "VU1 sent the GS the same bytes as the reference (hash every 600 VSyncs)" },
         { "type": "log_absent", "pattern": "\\[guest-branch:missing-target\\]", "label": "no bad indirect branch in game code" },
         { "type": "log_absent", "pattern": "\\[pgs-gif\\] anomaly", "label": "GIF stream stays in step (no garbage registers)" },
         { "type": "shot", "tick": 590, "min_variance": 1000, "golden": "boot_press_start.bmp", "max_diff": 6, "label": "PRESS START screen" },
@@ -39,6 +40,7 @@
       "_note": "Regression test for the dispatchGuestBranch recursion bug (fixed 2026-11-02): before it, this run crashed in the AI evaluator every time in deterministic mode.",
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "vu1_hash", "golden": "choose_english.vu1hash", "label": "VU1 sent the GS the same bytes as the reference (hash every 600 VSyncs)" },
         { "type": "log_absent", "pattern": "\\[guest-recursion\\]", "label": "no runaway recursion in game code" },
         { "type": "log_absent", "pattern": "\\[guest-branch:missing-target\\]", "label": "no bad indirect branch in game code" },
         { "type": "log_absent", "pattern": "\\[rayman-ai\\]", "label": "AI trees stay valid (no NULL / low-memory nodes)" },
@@ -58,15 +60,16 @@
       "_note": "Timeline (guest VSyncs): name entry from ~2450, loading screen ~2800, Ubi Soft logo ~3000, intro cutscene ~3400-7700, level from ~8000.",
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "vu1_hash", "golden": "intro_to_first_level.vu1hash", "label": "VU1 sent the GS the same bytes as the reference (hash every 600 VSyncs)" },
         { "type": "log_absent", "pattern": "\\[guest-recursion\\]|\\[guest-branch:missing-target\\]|\\[rayman-ai\\]", "label": "no runaway recursion, bad branch or broken AI tree" },
         { "type": "log_absent", "pattern": "\\[IOP\\] guest call 0x[0-9a-f]+ did not return", "label": "IOP calls (RPC handlers, callbacks) run to the end" },
         { "type": "log_absent", "pattern": "\\[ubi-rpc\\] .* fn=2000[0-9a-f] .* out=ffffffff", "label": "UBISOUND bank / buffer loads succeed (needs PS2X_UBI_TRACE)" },
         { "type": "log_absent", "pattern": "\\[rayman-sector\\] vsync 1[0-9]{4} ", "label": "Rayman stays in the ship once he gets control (no sector change after VSync 10000; false VU0 collision contacts threw him out until the branch-in-delay-slot fix)" },
         { "type": "shot", "tick": 2500, "min_variance": 300, "golden": "intro_name_entry.bmp", "max_diff": 20, "label": "name entry screen" },
         { "type": "shot", "tick": 3100, "min_variance": 150, "golden": "intro_ubisoft_logo.bmp", "max_diff": 20, "label": "Ubi Soft logo" },
-        { "type": "shot", "tick": 5000, "min_variance": 100, "label": "intro cutscene draws" },
+        { "type": "shot", "tick": 5000, "min_variance": 100, "golden": "intro_cutscene.bmp", "max_diff": 20, "label": "intro cutscene draws" },
         { "type": "fps", "after_tick": 8500, "min": 10, "label": "first level runs" },
-        { "type": "shot", "tick": 9600, "min_variance": 100, "label": "first level is visible (the prison ship cinematic: was black until SQRT.S read ft, CLAUDE.md issue 7)" },
+        { "type": "shot", "tick": 9600, "min_variance": 100, "golden": "intro_ship_cinematic.bmp", "max_diff": 20, "label": "first level is visible (the prison ship cinematic: was black until SQRT.S read ft, CLAUDE.md issue 7)" },
         { "type": "shot", "tick": 12900, "min_variance": 100, "golden": "intro_rayman_on_grate.bmp", "max_diff": 20, "label": "Rayman stands on the grate with Murfy's hint (first moments of control)" }
       ]
     },
@@ -81,12 +84,30 @@
       "_note": "Fixture = the user's save of 2026-11-09 15:42 (local only, tests\\fixtures). After Murfy's dialogue the camera faces away from the pool: stick down 7400 walks into the water (~7640, surface), L2 7900 dives (air falls 4/s from 100), stick up swims under water, X 8200 rises (surface ~8268, air back to 100 within ~12 VSyncs), stick down swims back and X jumps (behaviour 35) until Rayman lands on the beach (~8812). [rayman-state] lines: main.cpp readRaymanState (CLAUDE.md issue 13).",
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "vu1_hash", "golden": "swim_tutorial.vu1hash", "label": "VU1 sent the GS the same bytes as the reference (hash every 600 VSyncs)" },
         { "type": "log_sequence", "patterns": ["\\[rayman-state\\] .*state=surface from=(ground|air)", "\\[rayman-state\\] .*state=diving from=surface air=100\\.00", "\\[rayman-state\\] .*state=diving .*trend=falling", "\\[rayman-state\\] .*state=surface from=diving", "\\[rayman-state\\] .*state=surface .*air=100\\.00 trend=steady", "\\[rayman-state\\] .*state=air from=surface", "\\[rayman-state\\] .*state=ground from=air"], "label": "states in order: enters the water, dives with full air, air falls, surfaces, air back to 100, jumps out, lands" },
         { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=(surface|ground|air) from=(surface|ground|air|-) .*trend=falling", "label": "air falls only while diving" },
         { "type": "log_absent", "pattern": "water=32767", "label": "the water plane stays detected (CLAUDE.md issue 13: VCALLMSR started VU0 at a garbage address, every ray test missed)" },
         { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=surface .*depth=[1-9]", "label": "Rayman does not sink through the water plane while swimming on the surface" },
-        { "type": "shot", "tick": 7950, "min_variance": 100, "label": "Rayman diving, air bar shown" },
-        { "type": "shot", "tick": 8850, "min_variance": 100, "label": "Rayman back on the beach after jumping out" }
+        { "type": "shot", "tick": 7950, "min_variance": 100, "golden": "swim_diving.bmp", "max_diff": 20, "label": "Rayman diving, air bar shown" },
+        { "type": "shot", "tick": 8850, "min_variance": 100, "golden": "swim_back_on_beach.bmp", "max_diff": 20, "label": "Rayman back on the beach after jumping out" }
+      ]
+    },
+    {
+      "name": "shoot_minisaurus",
+      "description": "Load the user's save (Minisaurus Plain beach), skip Murfy's dialogue and throw three energy balls.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7400:square:5,7520:square:5,7640:square:5",
+      "frames": 7700,
+      "shots": [7420, 7432, 7652],
+      "_note": "Fixture = the user's save (Minisaurus Plain beach, where Rayman has the energy ball). Square at 7400: the ball is at his hand at 7420 (about 365, 212) and flies away (about 351, 162 at 7432). The region checks compare a small box around the ball, so a missing ball shows up as a large difference.",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "vu1_hash", "golden": "shoot_minisaurus.vu1hash", "label": "VU1 sent the GS the same bytes as the reference (hash every 600 VSyncs)" },
+        { "type": "shot", "tick": 7420, "min_variance": 100, "golden": "shoot_ball_at_hand.bmp", "region": [345, 192, 40, 40], "max_diff": 3, "label": "the energy ball at Rayman's hand" },
+        { "type": "shot", "tick": 7432, "min_variance": 100, "golden": "shoot_ball_flying.bmp", "region": [333, 144, 36, 36], "max_diff": 3, "label": "the energy ball flying away" },
+        { "type": "shot", "tick": 7652, "min_variance": 100, "golden": "shoot_third_throw.bmp", "max_diff": 20, "label": "third throw (whole picture)" }
       ]
     }
   ]
