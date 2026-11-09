@@ -23,6 +23,7 @@
 #include <array>
 
 extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
+extern "C" void ps2xSetGameStatsLine(int (*fn)(const uint8_t *rdram, char *buffer, int size)); // ps2_runtime.cpp
 
 #if defined(_WIN32)
 // Rayman bring-up: report crashes in out\run.log. Declared by hand so <windows.h> (which clashes
@@ -852,10 +853,45 @@ namespace
         g_raymanNodeDispatch(rdram, ctx, runtime);
     }
 
+    // Appended to the `[threads]` line: the main character's position and swim state (CLAUDE.md issue 13).
+    // Main character superobject [0x252398]; position = its global matrix [so+0x24] + 0x30; Rayman's dsgvars
+    // (data [so+4] -> brain [data+0xC] -> mind [brain] -> dsgmem [mind+0xC] -> current values [dsgmem+8]):
+    // +0x74 water plane height (32767 = no plane), +0x60 depth below it, +0x64 underwater time (ms).
+    int raymanGameStatsLine(const uint8_t *rdram, char *buffer, int size)
+    {
+        auto inRam = [](uint32_t a) { return a >= 0x00100000u && a < 0x02000000u; };
+        auto rd32 = [&](uint32_t a) -> uint32_t
+        {
+            uint32_t v = 0u;
+            std::memcpy(&v, rdram + (a & 0x01FFFFFFu), 4u);
+            return v;
+        };
+        auto rdf = [&](uint32_t a) -> float
+        {
+            float v = 0.0f;
+            std::memcpy(&v, rdram + (a & 0x01FFFFFFu), 4u);
+            return v;
+        };
+        const uint32_t so = rd32(0x00252398u);
+        if (!inRam(so) || !inRam(rd32(so + 0x24u)))
+            return 0;
+        const uint32_t matrix = rd32(so + 0x24u);
+        int n = std::snprintf(buffer, static_cast<size_t>(size), "rayman so=0x%x pos=%.2f,%.2f,%.2f", so,
+                              rdf(matrix + 0x30u), rdf(matrix + 0x34u), rdf(matrix + 0x38u));
+        const uint32_t data = rd32(so + 4u), brain = inRam(data) ? rd32(data + 0xCu) : 0u;
+        const uint32_t mind = inRam(brain) ? rd32(brain) : 0u, dsgmem = inRam(mind) ? rd32(mind + 0xCu) : 0u;
+        const uint32_t cur = inRam(dsgmem) ? rd32(dsgmem + 8u) : 0u;
+        if (inRam(cur) && n > 0 && n < size)
+            n += std::snprintf(buffer + n, static_cast<size_t>(size - n), " water=%.3f depth=%.3f uwtime=%u",
+                               rdf(cur + 0x74u), rdf(cur + 0x60u), rd32(cur + 0x64u));
+        return n;
+    }
+
     void installGameHle(PS2Runtime &runtime, const std::string &gameId)
     {
         if (gameId != "SLES-50044")
             return;
+        ps2xSetGameStatsLine(&raymanGameStatsLine);
 
         uint8_t *rdram = runtime.memory().getRDRAM();
         if (!rdram)

@@ -69,6 +69,21 @@
         { "type": "shot", "tick": 9600, "min_variance": 100, "label": "first level is visible (the prison ship cinematic: was black until SQRT.S read ft, CLAUDE.md issue 7)" },
         { "type": "shot", "tick": 12900, "min_variance": 100, "golden": "intro_rayman_on_grate.bmp", "max_diff": 20, "label": "Rayman stands on the grate with Murfy's hint (first moments of control)" }
       ]
+    },
+    {
+      "name": "swim_tutorial",
+      "description": "Load the user's save (fixture: The Minisaurus Plain beach), skip Murfy's dialogue, walk into the water of the swim tutorial with the left stick.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7400:lleft:100,7500:lup:400,7950:lleft:30,7980:lup:220",
+      "frames": 9200,
+      "shots": [8150, 9100],
+      "_note": "Fixture = the user's save of 2026-11-09 15:42 (local only, tests\\fixtures). Rayman enters the water at ~8052. Spec (user): surface swimming has no air meter; L2 dives, X rises / jumps out. The [threads] line carries 'rayman ... water=<plane height> depth=<below plane> uwtime=<ms>'.",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "log_absent", "pattern": "rayman so=0x[0-9a-f]+ pos=[^|]* water=32767", "known_fail": "CLAUDE.md issue 13: two frames after entering, the water plane is lost (dsgvar 0x3F contact normal null -> water height 32767), so Rayman counts as diving and drowns", "label": "the water plane stays detected while Rayman swims" },
+        { "type": "shot", "tick": 8150, "min_variance": 100, "label": "Rayman in the water of the swim tutorial" }
+      ]
     }
   ]
 }

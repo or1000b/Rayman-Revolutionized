@@ -48,6 +48,14 @@ void ps2xInstallIopToEeRpcHooks(PS2Runtime *runtime);       // Kernel/Syscalls/R
 void ps2xInstallIopCdReader(bool install);                  // Kernel/Stubs/CD.cpp
 int ps2xIopToEeRpcStatsLine(char *buffer, int size);
 
+// Game-specific part of the `[threads]` line (main.cpp registers one per game, e.g. Rayman's swim state).
+using Ps2xGameStatsLineFn = int (*)(const uint8_t *rdram, char *buffer, int size);
+static Ps2xGameStatsLineFn g_gameStatsLine = nullptr;
+extern "C" void ps2xSetGameStatsLine(Ps2xGameStatsLineFn fn)
+{
+    g_gameStatsLine = fn;
+}
+
 namespace
 {
 #if !defined(PLATFORM_VITA)
@@ -3024,6 +3032,12 @@ void PS2Runtime::run()
                     threadLine << " | " << soundStats;
                 if (ps2xIopToEeRpcStatsLine(soundStats, static_cast<int>(sizeof(soundStats))) > 0)
                     threadLine << " | " << soundStats;
+                if (g_gameStatsLine)
+                {
+                    char gameStats[256];
+                    if (g_gameStatsLine(m_memory.getRDRAM(), gameStats, static_cast<int>(sizeof(gameStats))) > 0)
+                        threadLine << " | " << gameStats;
+                }
                 std::cerr << threadLine.str() << std::endl;
                 for (int semaId : blockedSemas)
                     ps2xDebugDumpSemaphoreHistory(semaId);

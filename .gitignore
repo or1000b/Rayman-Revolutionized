@@ -33,6 +33,8 @@ android/.gradle/
 /screenshot*.png
 # Golden pictures for run_tests are game content: local only
 /tests/golden/
+# Memory card fixtures (user saves, hold game icons): local only
+/tests/fixtures/
 
 # Python bytecode (tools/*.py imported by scratch scripts)
 __pycache__/

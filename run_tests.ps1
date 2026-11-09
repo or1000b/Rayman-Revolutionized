@@ -132,6 +132,13 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     $mcRoot = Join-Path $shotDir 'mc0'
     if (Test-Path $mcRoot) { Remove-Item -Recurse -Force $mcRoot }
     New-Item -ItemType Directory -Force $mcRoot | Out-Null
+    # "memcard": "fixtures\mc_swim\mc0" (relative to tests\) starts the run from a copy of that card: a save to
+    # load. The save folders keep their time in a hidden .ps2x-dir-time file, so the copy still loads.
+    if ($sc.PSObject.Properties['memcard']) {
+        $fixture = Join-Path (Join-Path $Root 'tests') $sc.memcard
+        if (Test-Path $fixture) { Copy-Item -Recurse -Force (Join-Path $fixture '*') $mcRoot }
+        else { Write-Host "  WARNING: memory card fixture $fixture is missing (local only, see CLAUDE.md); empty card" }
+    }
     $env:PS2X_MC_ROOT = $mcRoot
     # Extra variables of this scenario ("env": { "PS2X_UBI_TRACE": "1" }); cleared again after the run.
     $extraEnv = @()
