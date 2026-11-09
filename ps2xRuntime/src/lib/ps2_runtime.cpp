@@ -1710,12 +1710,30 @@ namespace
                 break;
             }
         }
+        // A scheduler yield inside the root unwinds the host stack; the guest then resumes without the root's frame.
+        // Keep following (lines marked '~', absolute host depth) so the rest of the root's work stays visible.
+        static bool following = false;
+        static uint32_t followed = 0u;
+        if (targetPc == root)
+        {
+            following = true;
+            followed = 0u;
+        }
         if (!found && targetPc != root)
+        {
+            if (!following || ++followed > 1500u)
+                return;
+            ++logged;
+            std::fprintf(stderr, "[ee-tree] ~%u %*s0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x t0=%x t1=%x f12=%g\n", t_guestCallDepth,
+                         static_cast<int>(t_guestCallDepth * 2u), "", targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5),
+                         getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 8), getRegU32(ctx, 9), ctx->f[12]);
             return;
+        }
         ++logged;
         const uint32_t depth = found ? t_guestCallDepth - rootDepth : 0u;
-        std::fprintf(stderr, "[ee-tree] %*s0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x f12=%g\n", static_cast<int>(depth * 2u), "",
-                     targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), ctx->f[12]);
+        std::fprintf(stderr, "[ee-tree] %*s0x%x from 0x%x a0=%x a1=%x a2=%x a3=%x t0=%x t1=%x f12=%g\n", static_cast<int>(depth * 2u), "",
+                     targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7),
+                     getRegU32(ctx, 8), getRegU32(ctx, 9), ctx->f[12]);
     }
 
     struct EeCallReturn

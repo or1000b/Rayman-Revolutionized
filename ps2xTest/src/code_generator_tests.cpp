@@ -2,6 +2,7 @@
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -1078,6 +1079,22 @@ void register_code_generator_tests()
                 t.IsTrue(code.find("SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4))") != std::string::npos,
                          "MOVZ/MOVN should copy the lower 64 bits of rs into rd");
             }
+        });
+
+        tc.Run("VCALLMSR starts VU0 at CMSAR0 written by CTC2", [](TestCase &t) {
+            // Rayman 0x14C398: ctc2.ni $a0, $vi27 / vcallmsr $vi27. VCALLMSR used to read ctx->vi[27], past the end
+            // of vi[16], while CTC2 stores CMSAR0 in ctx->vu0_cmsar0 (CLAUDE.md issue 13).
+            CodeGenerator gen({}, {});
+            R5900Decoder decoder;
+            const std::string ctc2 = gen.translateInstruction(decoder.decodeInstruction(0x14C398u, 0x48C4D800u));
+            const std::string call = gen.translateInstruction(decoder.decodeInstruction(0x14C3A4u, 0x4A00D839u));
+            printGeneratedCode("VCALLMSR starts VU0 at CMSAR0 (CTC2)", ctc2);
+            printGeneratedCode("VCALLMSR starts VU0 at CMSAR0 (VCALLMSR)", call);
+            t.IsTrue(ctc2.find("ctx->vu0_cmsar0 = GPR_U32(ctx, 4)") != std::string::npos, "CTC2 to VI27 writes CMSAR0");
+            t.IsTrue(call.find("ctx->vi[27]") == std::string::npos, "VCALLMSR must not read vi[27] (vi has 16 entries)");
+            t.IsTrue(call.find("(ctx->vu0_cmsar0 & 0x1FFu) << 3") != std::string::npos,
+                     "VCALLMSR starts at (CMSAR0 & 0x1FF) * 8 like PCSX2 vu0ExecMicro");
+            t.IsTrue(call.find("vu0StartMicroProgram") != std::string::npos, "VCALLMSR starts the VU0 microprogram");
         });
 
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)

@@ -217,6 +217,26 @@ if ($buildOk) {
                     if ($hit) { Write-CheckResult $sc.name $check $false ("line " + $hit.LineNumber + ": " + $hit.Line.Substring(0, [math]::Min(160, $hit.Line.Length))) }
                     else { Write-CheckResult $sc.name $check $true 'not in the log' }
                 }
+                'log_present' {
+                    $hit = $lines | Select-String -Pattern $check.pattern | Select-Object -First 1
+                    if ($hit) { Write-CheckResult $sc.name $check $true ("line " + $hit.LineNumber + ": " + $hit.Line.Substring(0, [math]::Min(160, $hit.Line.Length))) }
+                    else { Write-CheckResult $sc.name $check $false 'not in the log' }
+                }
+                'log_sequence' {
+                    # Every pattern must match a line after the line that matched the previous pattern.
+                    $from = 0
+                    $found = @()
+                    $missing = $null
+                    foreach ($p in $check.patterns) {
+                        $at = -1
+                        for ($i = $from; $i -lt $lines.Count; $i++) { if ($lines[$i] -match $p) { $at = $i; break } }
+                        if ($at -lt 0) { $missing = $p; break }
+                        $found += "line $($at + 1)"
+                        $from = $at + 1
+                    }
+                    if ($missing) { Write-CheckResult $sc.name $check $false ("after " + ($(if ($found.Count) { $found[-1] } else { 'the start' })) + " no line matches '$missing'") }
+                    else { Write-CheckResult $sc.name $check $true ("in order at " + ($found -join ', ')) }
+                }
                 'shot' {
                     $shot = $shotFiles | Where-Object { $_.Tick -ge $check.tick } | Select-Object -First 1
                     if (-not $shot) { Write-CheckResult $sc.name $check $false "no picture at tick $($check.tick) (the run ended earlier?)"; break }

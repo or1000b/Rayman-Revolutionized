@@ -789,6 +789,8 @@ namespace
     RaymanNodeTrace g_raymanNodeRing[64];
     uint32_t g_raymanNodeRingPos = 0u;
 
+    void raymanStateSample(const uint8_t *rdram);
+
     void raymanNodeDispatchTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t node = getRegU32(ctx, 5);
@@ -814,6 +816,7 @@ namespace
                 ps2xDumpCrashContext();
             }
         }
+        raymanStateSample(rdram);
         RaymanNodeTrace &slot = g_raymanNodeRing[g_raymanNodeRingPos++ % 64u];
         slot.ra = getRegU32(ctx, 31);
         slot.actor = getRegU32(ctx, 4);
@@ -853,38 +856,136 @@ namespace
         g_raymanNodeDispatch(rdram, ctx, runtime);
     }
 
-    // Appended to the `[threads]` line: the main character's position and swim state (CLAUDE.md issue 13).
-    // Main character superobject [0x252398]; position = its global matrix [so+0x24] + 0x30; Rayman's dsgvars
-    // (data [so+4] -> brain [data+0xC] -> mind [brain] -> dsgmem [mind+0xC] -> current values [dsgmem+8]):
-    // +0x74 water plane height (32767 = no plane), +0x60 depth below it, +0x64 underwater time (ms).
-    int raymanGameStatsLine(const uint8_t *rdram, char *buffer, int size)
+    // Rayman's swim state, read from game memory (CLAUDE.md issue 13). Main character superobject [0x252398];
+    // position = its global matrix [so+0x24] + 0x30. Perso data [so+4]: +0x8 dynam -> dynamics [dynam+0x1C]
+    // (flags +0xC, 0x800000 = on ground; the water surface counts as ground), +0xC brain -> mind [brain]:
+    // +0 AI model (+0 normal / +4 reflex behaviour list: {table, count}, 12-byte entries), +4 / +8 normal / reflex
+    // intelligence (+8 current behaviour), +0xC dsgmem -> current dsgvar values [dsgmem+8]: +0x74 water plane
+    // height (32767 = no plane found by the ray from the head up), +0x60 depth below it, +0x64 ms in the current
+    // swim / move mode, byte +0x217 = 1 at the surface, 0 diving. Behaviour 5 = swimming. Air (0..100, the bar
+    // shown while diving) is the float at 0x380B80; it falls 4 per second while diving and is 100 again at the
+    // surface.
+    struct RaymanState
     {
+        bool valid = false;
+        uint32_t so = 0u;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        int behaviour = -1, reflex = -1;
+        uint32_t dynFlags = 0u;
+        bool hasDsg = false;
+        float water = 0.0f, depth = 0.0f, air = 0.0f;
+        int surfaceFlag = -1;
+        const char *state = "none";
+    };
+
+    RaymanState readRaymanState(const uint8_t *rdram)
+    {
+        RaymanState s;
         auto inRam = [](uint32_t a) { return a >= 0x00100000u && a < 0x02000000u; };
         auto rd32 = [&](uint32_t a) -> uint32_t
         {
             uint32_t v = 0u;
-            std::memcpy(&v, rdram + (a & 0x01FFFFFFu), 4u);
+            std::memcpy(&v, rdram + (a & 0x01FFFFFCu), 4u);
             return v;
         };
         auto rdf = [&](uint32_t a) -> float
         {
             float v = 0.0f;
-            std::memcpy(&v, rdram + (a & 0x01FFFFFFu), 4u);
+            std::memcpy(&v, rdram + (a & 0x01FFFFFCu), 4u);
             return v;
         };
-        const uint32_t so = rd32(0x00252398u);
-        if (!inRam(so) || !inRam(rd32(so + 0x24u)))
+        s.so = rd32(0x00252398u);
+        if (!inRam(s.so) || !inRam(rd32(s.so + 0x24u)) || !inRam(rd32(s.so + 4u)))
+            return s;
+        const uint32_t matrix = rd32(s.so + 0x24u), data = rd32(s.so + 4u);
+        s.x = rdf(matrix + 0x30u);
+        s.y = rdf(matrix + 0x34u);
+        s.z = rdf(matrix + 0x38u);
+        s.air = rdf(0x00380B80u);
+        const uint32_t dynam = rd32(data + 8u), dynamics = inRam(dynam) ? rd32(dynam + 0x1Cu) : 0u;
+        s.dynFlags = inRam(dynamics) ? rd32(dynamics + 0xCu) : 0u;
+        const uint32_t brain = rd32(data + 0xCu), mind = inRam(brain) ? rd32(brain) : 0u;
+        if (inRam(mind))
+        {
+            const uint32_t model = rd32(mind);
+            auto behaviourIndex = [&](uint32_t list, uint32_t intel) -> int
+            {
+                if (!inRam(list) || !inRam(intel))
+                    return -1;
+                const uint32_t table = rd32(list), count = rd32(list + 4u), current = rd32(intel + 8u);
+                if (current < table || (current - table) % 12u != 0u || (current - table) / 12u >= count)
+                    return -1;
+                return static_cast<int>((current - table) / 12u);
+            };
+            if (inRam(model))
+            {
+                s.behaviour = behaviourIndex(rd32(model), rd32(mind + 4u));
+                s.reflex = behaviourIndex(rd32(model + 4u), rd32(mind + 8u));
+            }
+            const uint32_t dsgmem = rd32(mind + 0xCu), cur = inRam(dsgmem) ? rd32(dsgmem + 8u) : 0u;
+            if (inRam(cur))
+            {
+                s.hasDsg = true;
+                s.water = rdf(cur + 0x74u);
+                s.depth = rdf(cur + 0x60u);
+                s.surfaceFlag = rdram[(cur + 0x217u) & 0x01FFFFFFu];
+            }
+        }
+        // Dynamics flags seen (2026-11-09, Minisaurus Plain): 0x0180E007 walking, 0x0300E007 in the air on land,
+        // 0x01906007 swimming, 0x01806007 jumping out of the water (behaviours 35 -> 26 -> 4). 0x8000 is only set
+        // with the land mechanics; 0x800000 stays set during the jump out of the water, so it means "on ground"
+        // only with the land mechanics.
+        if (s.behaviour == 5)
+            s.state = s.surfaceFlag == 0 ? "diving" : "surface";
+        else if ((s.dynFlags & 0x00008000u) == 0u)
+            s.state = "air";
+        else
+            s.state = ((s.dynFlags & 0x00800000u) != 0u && (s.dynFlags & 0x02000000u) == 0u) ? "ground" : "air";
+        s.valid = true;
+        return s;
+    }
+
+    // Appended to the `[threads]` line.
+    int raymanGameStatsLine(const uint8_t *rdram, char *buffer, int size)
+    {
+        const RaymanState s = readRaymanState(rdram);
+        if (!s.valid)
             return 0;
-        const uint32_t matrix = rd32(so + 0x24u);
-        int n = std::snprintf(buffer, static_cast<size_t>(size), "rayman so=0x%x pos=%.2f,%.2f,%.2f", so,
-                              rdf(matrix + 0x30u), rdf(matrix + 0x34u), rdf(matrix + 0x38u));
-        const uint32_t data = rd32(so + 4u), brain = inRam(data) ? rd32(data + 0xCu) : 0u;
-        const uint32_t mind = inRam(brain) ? rd32(brain) : 0u, dsgmem = inRam(mind) ? rd32(mind + 0xCu) : 0u;
-        const uint32_t cur = inRam(dsgmem) ? rd32(dsgmem + 8u) : 0u;
-        if (inRam(cur) && n > 0 && n < size)
-            n += std::snprintf(buffer + n, static_cast<size_t>(size - n), " water=%.3f depth=%.3f uwtime=%u",
-                               rdf(cur + 0x74u), rdf(cur + 0x60u), rd32(cur + 0x64u));
-        return n;
+        return std::snprintf(buffer, static_cast<size_t>(size),
+                             "rayman state=%s behaviour=%d air=%.2f water=%.3f depth=%.3f pos=%.2f,%.2f,%.2f", s.state,
+                             s.behaviour, s.air, s.water, s.depth, s.x, s.y, s.z);
+    }
+
+    // `[rayman-state]` line whenever the state or the air trend (falling / steady / rising) changes, sampled once per
+    // guest VSync from the AI node dispatcher. The [threads] line is too sparse for short states (a jump).
+    void raymanStateSample(const uint8_t *rdram)
+    {
+        static uint64_t lastVsync = ~0ull;
+        const uint64_t vsync = ps2xGuestVsync();
+        if (vsync == lastVsync)
+            return;
+        lastVsync = vsync;
+        const RaymanState s = readRaymanState(rdram);
+        static const char *lastState = "";
+        static const char *lastTrend = "";
+        static float lastAir = 0.0f;
+        static uint32_t lastSo = 0u;
+        if (!s.valid)
+            return;
+        const char *trend = "steady";
+        if (s.so == lastSo && s.air < lastAir)
+            trend = "falling";
+        else if (s.so == lastSo && s.air > lastAir)
+            trend = "rising";
+        lastAir = s.air;
+        lastSo = s.so;
+        if (std::strcmp(s.state, lastState) == 0 && std::strcmp(trend, lastTrend) == 0)
+            return;
+        std::fprintf(stderr, "[rayman-state] vsync=%llu state=%s from=%s air=%.2f trend=%s behaviour=%d dyn=%08x water=%.3f depth=%.3f pos=%.2f,%.2f,%.2f\n",
+                     static_cast<unsigned long long>(vsync), s.state, *lastState ? lastState : "-", s.air, trend, s.behaviour,
+                     s.dynFlags, s.water, s.depth, s.x, s.y, s.z);
+        lastState = s.state;
+        lastTrend = trend;
     }
 
     void installGameHle(PS2Runtime &runtime, const std::string &gameId)
