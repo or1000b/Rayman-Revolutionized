@@ -1080,14 +1080,20 @@ namespace ps2_stubs
         setReturnU32(ctx, 0u);
     }
 
+    // The EE newlib's rand: next = next * 1103515245 + 12345, result next & RAND_MAX with RAND_MAX = 0x7FFFFFFF.
+    // The host's std::rand() & 0x7FFF was 65536 times too small for games that divide by RAND_MAX (Rayman's
+    // particles all lined up). Prefer not stubbing rand at all so the game's own state (its srand) is used.
+    static uint32_t g_newlibRandNext = 1u;
+
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, std::rand() & 0x7FFF);
+        g_newlibRandNext = g_newlibRandNext * 1103515245u + 12345u;
+        setReturnS32(ctx, static_cast<int32_t>(g_newlibRandNext & 0x7FFFFFFFu));
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::srand(getRegU32(ctx, 4));
+        g_newlibRandNext = getRegU32(ctx, 4);
         setReturnS32(ctx, 0);
     }
 

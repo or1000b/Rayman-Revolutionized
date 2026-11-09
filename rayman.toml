@@ -237,7 +237,8 @@ stubs = [
   "memcpy@0x002249D4",
   "memmove@0x00224A84",
   "memset@0x00224B88",
-  "rand@0x002256F0",
+  # rand@0x002256F0 is not stubbed: the game's own newlib rand returns 31 bits (RAND_MAX 0x7FFFFFFF) from
+  # the state its srand writes; the host stub returned 15 bits and particles lost their spread.
   "_realloc_r@0x00225750",
   "sprintf@0x00226310",
   "strcasecmp@0x00226580",
