@@ -139,7 +139,7 @@ class Gs:
         a = self.attrs()
         ctxt = (a >> 9) & 1
         ofs = self.xyoffset[ctxt]
-        self.verts = (self.verts + [((x16 - (ofs & 0xFFFF)) >> 4, (y16 - ((ofs >> 32) & 0xFFFF)) >> 4, z)])[-3:]
+        self.verts = (self.verts + [((x16 - (ofs & 0xFFFF)) >> 4, (y16 - ((ofs >> 32) & 0xFFFF)) >> 4, z, self.rgba)])[-3:]
         ptype = self.prim & 7
         need = {1: 2, 2: 2, 3: 3, 4: 3, 5: 3, 6: 2}.get(ptype, 1)
         if not kick or self.vcount < need:
@@ -176,9 +176,13 @@ class Gs:
             s = self.timeline[-1]
         else:
             s = dict(sig=sig, count=0, x0=1 << 30, y0=1 << 30, x1=-(1 << 30), y1=-(1 << 30), z0=1 << 40, z1=-1,
-                     rgba=self.rgba, uploads_before=len(self.uploads))
+                     rgba=self.rgba, uploads_before=len(self.uploads), tris=0, flat=0)
             self.timeline.append(s)
         s['count'] += 1
+        if len(verts) == 3:
+            # "flat": the three vertices carry the same RGB (lighting per face, or one colour for the whole mesh).
+            s['tris'] += 1
+            s['flat'] += int(verts[0][3][:3] == verts[1][3][:3] == verts[2][3][:3])
         s['x0'], s['x1'] = min(s['x0'], *xs), max(s['x1'], *xs)
         s['y0'], s['y1'] = min(s['y0'], *ys), max(s['y1'], *ys)
         s['z0'], s['z1'] = min(s['z0'], *zs), max(s['z1'], *zs)
@@ -388,10 +392,10 @@ def main():
         for s in gs.timeline:
             path, ptype, ctxt, tme, attrs, frame, test, alpha, zbuf, tbp = s['sig']
             r, g, b, a = s['rgba']
-            print(f"  [{s['uploads_before']:3d} uploads] path {path} type {ptype} ctxt {ctxt} tme {tme} abe {(attrs >> 6) & 1} "
+            print(f"  [{s['uploads_before']:3d} uploads] path {path} type {ptype} ctxt {ctxt} tme {tme} iip {(attrs >> 3) & 1} abe {(attrs >> 6) & 1} "
                   f"fge {(attrs >> 5) & 1} x{s['count']:5d} box {s['x0']},{s['y0']}..{s['x1']},{s['y1']} "
                   f"Z {s['z0']:#x}..{s['z1']:#x} rgba {r:02x}{g:02x}{b:02x}{a:02x} FBP {frame & 0x1FF:#x} "
-                  f"FBMSK {frame >> 32:08x} TEST {test:#x} ALPHA {alpha:#x} ZBUF {zbuf:#x}"
+                  f"FBMSK {frame >> 32:08x} TEST {test:#x} ALPHA {alpha:#x} ZBUF {zbuf:#x} flat {s['flat']}/{s['tris']}"
                   + (f" tbp {tbp:#x}" if tme else ''))
     if args.sheet:
         sheet(args.sheet, gs.groups)
