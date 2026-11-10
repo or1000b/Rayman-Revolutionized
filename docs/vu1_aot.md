@@ -162,3 +162,20 @@ code per image: from the profiled entries, following branches and the profiled J
   redoes only the object files that changed.
 - The generated programs are compiled with `/GL-` (code generated at compile time, in parallel, not again at the link)
   and `/Z7` (line numbers for the `[nprof] exclusive by line` table of `PS2X_NATIVE_PROF`; the code is the same).
+
+## Other levels, self-check, merged programs (2026-11-10)
+
+- The user's first `run_rayman_profile.bat` session (~31700 VSyncs, other places than the tests): 4.4 million VU1
+  runs native, ~930 on the interpreter (314 entries not generated, 266 JR targets not seen, 349 runs longer than the
+  65536-cycle budget that `ps2_runtime.cpp` gives MSCAL / MSCNT; the native code bails on those and the interpreter
+  redoes them, still to improve). One new code image.
+- Its new image held the same code as program 9ed834b59a07 with two more pairs reached: it became an 11th program,
+  and the runtime picked the bigger one even for entries it lacked (intro under PAL: 99277 runs not covered, 8465 JR
+  bails). Two fixes: the generator now merges images whose code agrees on everything their entries and JR targets
+  together reach (one program knows all of them; 39 images -> 9 programs; stale `prog_*.cpp` files are removed), and
+  the runtime takes the first matching program that has the entry (`vu1AotSelect` keeps all matches).
+- Self-check in native mode (`vu1AotDispatch`): the first 2 finished runs of every (program, entry) also run on the
+  interpreter and are compared (the interpreter's result is kept); a difference switches that program off for the
+  session (`[vu1aot] self-check: ... switched off`, counter `disabled`). This covers entries the tests never reach.
+- PAL timing (CLAUDE.md issue 15) changed the VSync rate, so the references were renewed; the suite was profiled again
+  under PAL. Diff mode, all 5 scenarios: 2.90 million runs, 0 differences, 0 not covered, 0 JR bails.

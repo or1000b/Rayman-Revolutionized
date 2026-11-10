@@ -16,6 +16,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 #include <ps2_log.h>
 #ifdef _WIN32
@@ -304,7 +305,7 @@ namespace
 
     struct Vu1AotStats
     {
-        uint64_t native = 0, compared = 0, mismatches = 0, notCovered = 0, notIdle = 0;
+        uint64_t native = 0, compared = 0, mismatches = 0, notCovered = 0, notIdle = 0, disabled = 0;
         uint64_t bails[8]{};
         uint64_t nextReport = 600;
         uint32_t reported = 0;
@@ -320,33 +321,35 @@ namespace
         const Vu1AotStats &s = g_vu1AotStats;
         std::fprintf(stderr,
                      "[vu1aot] vsync %llu native %llu compared %llu mismatches %llu not_covered %llu not_idle %llu bails budget %llu "
-                     "kick_busy %llu jr %llu kick_error %llu unsupported %llu flags %llu runaway %llu\n",
+                     "kick_busy %llu jr %llu kick_error %llu unsupported %llu flags %llu runaway %llu disabled %llu\n",
                      static_cast<unsigned long long>(vsync), static_cast<unsigned long long>(s.native),
                      static_cast<unsigned long long>(s.compared), static_cast<unsigned long long>(s.mismatches),
                      static_cast<unsigned long long>(s.notCovered), static_cast<unsigned long long>(s.notIdle),
                      static_cast<unsigned long long>(s.bails[1]), static_cast<unsigned long long>(s.bails[2]),
                      static_cast<unsigned long long>(s.bails[3]), static_cast<unsigned long long>(s.bails[4]),
                      static_cast<unsigned long long>(s.bails[5]), static_cast<unsigned long long>(s.bails[6]),
-                     static_cast<unsigned long long>(s.bails[7]));
+                     static_cast<unsigned long long>(s.bails[7]), static_cast<unsigned long long>(s.disabled));
     }
 
-    // The program whose reachable pairs equal the micro memory (checked once per code generation), and whether the
-    // loaded code reads MAC / status flags (the interpreter's rebuildDecodedCodeCache rule).
+    // The programs whose reachable pairs equal the micro memory, the biggest first (checked once per code generation;
+    // two programs can both match: the same code profiled from different images, with different entries), and
+    // whether the loaded code reads MAC / status flags (the interpreter's rebuildDecodedCodeCache rule).
     struct Vu1AotSelection
     {
         uint64_t generation = ~0ull;
-        const vu1aot::Program *program = nullptr;
+        std::vector<const vu1aot::Program *> programs;
         bool flagsLive = true;
     };
     Vu1AotSelection g_vu1AotSelection;
 
-    const vu1aot::Program *vu1AotSelect(const uint8_t *code, uint32_t codeSize, const PS2Memory *memory, bool &flagsLive)
+    const std::vector<const vu1aot::Program *> &vu1AotSelect(const uint8_t *code, uint32_t codeSize, const PS2Memory *memory,
+                                                             bool &flagsLive)
     {
         const uint64_t generation = memory ? memory->getVU1CodeGeneration() : ~1ull;
         if (generation != g_vu1AotSelection.generation || !memory)
         {
             g_vu1AotSelection.generation = generation;
-            g_vu1AotSelection.program = nullptr;
+            g_vu1AotSelection.programs.clear();
             bool readsMacStatus = false;
             for (uint32_t pc = 0; pc + 8u <= codeSize; pc += 8u)
             {
@@ -375,12 +378,14 @@ namespace
                     std::memcpy(&words, code + prog.pcs[k], 8u);
                     same = words == prog.words[k];
                 }
-                if (same && (!g_vu1AotSelection.program || prog.pairCount > g_vu1AotSelection.program->pairCount))
-                    g_vu1AotSelection.program = &prog;
+                if (same)
+                    g_vu1AotSelection.programs.push_back(&prog);
             }
+            std::stable_sort(g_vu1AotSelection.programs.begin(), g_vu1AotSelection.programs.end(),
+                             [](const vu1aot::Program *x, const vu1aot::Program *y) { return x->pairCount > y->pairCount; });
         }
         flagsLive = g_vu1AotSelection.flagsLive;
-        return g_vu1AotSelection.program;
+        return g_vu1AotSelection.programs;
     }
 
     // References to the interpreter's private timing state, built inside execute() / resume().
@@ -408,16 +413,19 @@ namespace
                        uint32_t codeSize, uint8_t *data, uint32_t dataSize, PS2Memory *memory, uint32_t maxCycles)
     {
         bool flagsLive = true;
-        program = vu1AotSelect(code, codeSize, memory, flagsLive);
-        if (!program || (program->flagsFree && flagsLive)) // flag-free code: only when no instruction reads the flags
+        program = nullptr;
+        // The first matching program that has this entry (flag-free code only when no instruction reads the flags).
+        for (const vu1aot::Program *candidate : vu1AotSelect(code, codeSize, memory, flagsLive))
         {
-            ++g_vu1AotStats.notCovered;
-            return false;
+            if (candidate->flagsFree && flagsLive)
+                continue;
+            for (uint32_t e = 0; e < candidate->entryCount && !program; ++e)
+                if (candidate->entries[e] == a.state.pc)
+                    program = candidate;
+            if (program)
+                break;
         }
-        bool covered = false;
-        for (uint32_t e = 0; e < program->entryCount && !covered; ++e)
-            covered = program->entries[e] == a.state.pc;
-        if (!covered)
+        if (!program)
         {
             ++g_vu1AotStats.notCovered;
             return false;
@@ -490,8 +498,8 @@ namespace
     }
 
     // PS2X_VU1AOT=diff: report what differs between the native run (c, its data in t_vu1AotDataCopy) and the
-    // interpreter's (a, data, capture).
-    void vu1AotCompare(const vu1aot::Ctx &c, bool nativeOk, const Vu1AotAccess &a, uint64_t interpCycles, const uint8_t *data,
+    // interpreter's (a, data, capture). Returns false on a difference (a bailed native run is not compared).
+    bool vu1AotCompare(const vu1aot::Ctx &c, bool nativeOk, const Vu1AotAccess &a, uint64_t interpCycles, const uint8_t *data,
                        uint32_t dataSize, const Vu1AotCapture &capture, const vu1aot::Program *program, uint32_t entryPc)
     {
         ++g_vu1AotStats.compared;
@@ -502,7 +510,7 @@ namespace
                 std::snprintf(what, sizeof(what), fmt, args...);
         };
         if (!nativeOk)
-            return; // bails are counted, not compared (the interpreter ran the run)
+            return true; // bails are counted, not compared (the interpreter ran the run)
         if (c.cycles != interpCycles)
             differ("cycles native %llu interpreter %llu", static_cast<unsigned long long>(c.cycles),
                    static_cast<unsigned long long>(interpCycles));
@@ -580,7 +588,15 @@ namespace
                 std::fprintf(stderr, "[vu1aot-diff] vsync %llu program %s entry %04x: %s\n",
                              static_cast<unsigned long long>(ps2xGuestVsync()), program->key, entryPc, what);
         }
+        return what[0] == 0;
     }
+
+    // Native mode checks itself: the first kVu1AotSelfChecks finished runs of every (program, entry) take the diff
+    // path (the interpreter's result is kept). A difference turns that program off for the rest of the session
+    // (interpreter only) and says so in the log. This covers entries the test scenarios never reach (other levels).
+    constexpr uint8_t kVu1AotSelfChecks = 2u;
+    std::unordered_map<uint64_t, uint8_t> g_vu1AotSelfChecked; // (program index << 32) | entry -> runs compared
+    std::vector<bool> g_vu1AotProgramOff;
 
     // execute() / resume(): native code when it covers the run, else (or in diff mode, also) the interpreter.
     template <typename RunInterpreter>
@@ -613,7 +629,24 @@ namespace
                     std::fesetround(previous);
             }
         };
+        const size_t programIndex = static_cast<size_t>(program - vu1aot::kPrograms);
+        if (g_vu1AotProgramOff.size() < vu1aot::kProgramCount)
+            g_vu1AotProgramOff.resize(vu1aot::kProgramCount, false);
+        if (g_vu1AotProgramOff[programIndex])
+        {
+            ++g_vu1AotStats.disabled;
+            runInterpreter();
+            vu1AotReport();
+            return;
+        }
+        uint8_t *selfChecked = nullptr;
         if (mode == Vu1AotMode::Native)
+        {
+            uint8_t &count = g_vu1AotSelfChecked[(static_cast<uint64_t>(programIndex) << 32) | entryPc];
+            if (count < kVu1AotSelfChecks)
+                selfChecked = &count;
+        }
+        if (mode == Vu1AotMode::Native && !selfChecked)
         {
             c.logUndo = true;
             c.bail = vu1aot::BailNone;
@@ -636,7 +669,7 @@ namespace
             vu1AotReport();
             return;
         }
-        // Diff: native code on a copy of the data memory, then the interpreter for real, then compare.
+        // Diff (or a self-check): native code on a copy of the data memory, then the interpreter for real, then compare.
         t_vu1AotDataCopy.assign(data, data + dataSize);
         c.data = t_vu1AotDataCopy.data();
         c.logUndo = false;
@@ -653,7 +686,18 @@ namespace
         const uint64_t startCycle = a.cycle;
         runInterpreter();
         g_vu1AotCapture = nullptr;
-        vu1AotCompare(c, nativeOk, a, a.cycle - startCycle, data, dataSize, capture, program, entryPc);
+        const bool same = vu1AotCompare(c, nativeOk, a, a.cycle - startCycle, data, dataSize, capture, program, entryPc);
+        if (selfChecked)
+        {
+            if (nativeOk)
+                ++*selfChecked;
+            if (!same)
+            {
+                g_vu1AotProgramOff[programIndex] = true;
+                std::fprintf(stderr, "[vu1aot] self-check: program %s entry %04x differs from the interpreter; "
+                                     "program switched off (interpreter only)\n", program->key, entryPc);
+            }
+        }
         vu1AotReport();
     }
 }
