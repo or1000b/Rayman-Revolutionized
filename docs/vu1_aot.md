@@ -90,6 +90,9 @@ code per image: from the profiled entries, following branches and the profiled J
   (round toward zero) during native runs: without it every float differed by 1-3 ULP.
 - `PS2X_VU1AOT`: unset / `1` native, `0` interpreter only, `diff` native on a copy + interpreter for real, compared
   (`[vu1aot-diff]` first difference, `[vu1aot]` counters every 600 VSyncs).
+- Recording new levels: `run_rayman_profile.bat` plays the game with `PS2X_VU1_PROFILE=1` (translated programs stay
+  native; untranslated ones run on the interpreter and are recorded; the report is written every 600 VSyncs and by
+  `ps2xVu1ProfileFlush` when the game exits). Then regenerate, rebuild, `PS2X_VU1AOT=diff` run_tests.
 - Generator: `python tools/vu1aot/vu1gen.py [--keys K,...]` reads `out/vu1prof` (run the game with
   `PS2X_VU1_PROFILE=1` first) and writes `ps2xRuntime/src/lib/vu/aot/` (prog_<key>.cpp + aot_programs.cpp). That
   folder is local (derived from the game's microcode, like `src/runner`); without it the build uses

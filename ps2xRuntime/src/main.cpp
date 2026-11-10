@@ -24,6 +24,7 @@
 
 extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 extern "C" void ps2xSetGameStatsLine(int (*fn)(const uint8_t *rdram, char *buffer, int size)); // ps2_runtime.cpp
+void ps2xVu1ProfileFlush(); // ps2_vu1_core.cpp
 
 #if defined(_WIN32)
 // Rayman bring-up: report crashes in out\run.log. Declared by hand so <windows.h> (which clashes
@@ -1272,6 +1273,7 @@ int main(int argc, char *argv[])
         installGameHle(runtime, normalizedId);
 
         runtime.run();
+        ps2xVu1ProfileFlush();
 
 #ifdef _DEBUG
         ps2_log::print_saved_location();

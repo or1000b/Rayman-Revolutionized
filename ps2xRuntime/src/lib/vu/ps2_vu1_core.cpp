@@ -127,7 +127,6 @@ namespace
             }();
             return on;
         }
-
         template <typename T>
         static void bump(std::vector<std::pair<T, uint64_t>> &list, T key)
         {
@@ -657,6 +656,14 @@ namespace
         vu1AotCompare(c, nativeOk, a, a.cycle - startCycle, data, dataSize, capture, program, entryPc);
         vu1AotReport();
     }
+}
+
+// PS2X_VU1_PROFILE: the last report, called by main once the game thread has finished (main ends with std::_Exit, so
+// no static destructor would run; the periodic report can be up to 600 VSyncs old).
+void ps2xVu1ProfileFlush()
+{
+    if (Vu1Profile::enabled() && !g_vu1Profile.images.empty())
+        g_vu1Profile.report();
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
