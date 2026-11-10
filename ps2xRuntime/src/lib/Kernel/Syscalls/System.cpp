@@ -36,6 +36,9 @@ namespace ps2_syscalls
         RUNTIME_LOG("PS2 GsSetCrt: interlaced=" << interlaced
                                                 << ", videoMode=" << videoMode
                                                 << ", frameMode=" << frameMode << std::endl);
+        // Once per mode change (rare): the VSync rate follows it (PAL 50 Hz, NTSC 60 Hz; EeScheduler.cpp).
+        std::fprintf(stderr, "[gs] SetGsCrt interlaced=%d mode=%d (%s) ffmd=%d\n", interlaced, videoMode,
+                     videoMode == 3 ? "PAL, 50 Hz" : videoMode == 2 ? "NTSC, 60 Hz" : "other", frameMode);
 
         setReturnS32(ctx, 0);
     }

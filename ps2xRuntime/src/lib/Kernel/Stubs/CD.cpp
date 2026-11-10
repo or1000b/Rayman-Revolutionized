@@ -31,6 +31,23 @@ namespace ps2_stubs
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
 
+        // The field clock the stream timing counts in (VSync ticks): PAL 50 Hz, NTSC 60000/1001 Hz (the video mode
+        // the game set: SMODE1 CMOD 3 = PAL).
+        bool palFields(PS2Runtime *runtime)
+        {
+            return runtime != nullptr && ((runtime->memory().gs().smode1 >> 13) & 3ull) == 3ull;
+        }
+
+        uint64_t fieldsPerSecondNumerator(PS2Runtime *runtime)
+        {
+            return palFields(runtime) ? 50u : kNtScFieldsPerSecondNumerator;
+        }
+
+        uint64_t fieldsPerSecondDenominator(PS2Runtime *runtime)
+        {
+            return palFields(runtime) ? 1u : kNtScFieldsPerSecondDenominator;
+        }
+
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
             return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
@@ -88,11 +105,12 @@ namespace ps2_stubs
             const uint64_t elapsedTicks = tick - g_cdStreamTiming.lastVSyncTick;
             g_cdStreamTiming.lastVSyncTick = tick;
 
-            // 59.94 Hz field clock: sectors = fields * sectors/s * 1001 / 60000.
-            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * kNtScFieldsPerSecondDenominator;
+            // Field clock (59.94 Hz NTSC, 50 Hz PAL): sectors = fields * sectors/s * denominator / numerator.
+            const uint64_t fieldsNumerator = fieldsPerSecondNumerator(runtime);
+            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * fieldsPerSecondDenominator(runtime);
             const uint64_t accumulated = g_cdStreamTiming.productionRemainder + elapsedTicks * unitsPerTick;
-            const uint64_t elapsedProduction = accumulated / kNtScFieldsPerSecondNumerator;
-            g_cdStreamTiming.productionRemainder = accumulated % kNtScFieldsPerSecondNumerator;
+            const uint64_t elapsedProduction = accumulated / fieldsNumerator;
+            g_cdStreamTiming.productionRemainder = accumulated % fieldsNumerator;
             if (elapsedProduction == 0u)
             {
                 return;
@@ -152,11 +170,11 @@ namespace ps2_stubs
                 return now;
             }
 
-            const uint64_t requiredUnits = static_cast<uint64_t>(sectorsNeeded) * kNtScFieldsPerSecondNumerator;
+            const uint64_t requiredUnits = static_cast<uint64_t>(sectorsNeeded) * fieldsPerSecondNumerator(runtime);
             const uint64_t remainingUnits = requiredUnits > g_cdStreamTiming.productionRemainder
                                                 ? requiredUnits - g_cdStreamTiming.productionRemainder
                                                 : 0u;
-            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * kNtScFieldsPerSecondDenominator;
+            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * fieldsPerSecondDenominator(runtime);
             const uint64_t ticks = std::max<uint64_t>(1u, (remainingUnits + unitsPerTick - 1u) / unitsPerTick);
             return now + ticks;
         }

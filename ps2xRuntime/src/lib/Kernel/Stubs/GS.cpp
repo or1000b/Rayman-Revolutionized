@@ -802,6 +802,16 @@ namespace ps2_stubs
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
+            // libgraph's sceGsResetGraph calls SetGsCrt(interlace, omode, ffmode): the video mode lands in SMODE1
+            // (omode 2 = NTSC, 3 = PAL), and the VSync rate follows it (EeScheduler.cpp: PAL 50 Hz, NTSC 60 Hz).
+            if (runtime)
+            {
+                R5900Context crt = *ctx;
+                SET_GPR_U32(&crt, 4, interlace & 0x1u);
+                SET_GPR_U32(&crt, 5, omode & 0xFFu);
+                SET_GPR_U32(&crt, 6, ffmode & 0x1u);
+                ps2_syscalls::GsSetCrt(rdram, &crt, runtime);
+            }
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);

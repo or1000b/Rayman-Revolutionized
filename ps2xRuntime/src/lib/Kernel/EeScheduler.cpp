@@ -154,6 +154,9 @@ namespace
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
+    // PAL: a field every 20 ms (50 Hz), from the video mode the game chose (SetGsCrt writes SMODE1, CMOD 3 = PAL).
+    // NTSC (and before the game sets a mode): ~60 Hz.
+    constexpr auto kVBlankPeriodPal = std::chrono::microseconds(20000);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
@@ -173,8 +176,14 @@ namespace
     }
 
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+    constexpr uint64_t kVBlankPeriodCyclesPal = microsecondsToEeCycles(20000u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+
+    bool palVideoMode(PS2Runtime &runtime)
+    {
+        return ((runtime.memory().gs().smode1 >> 13) & 3ull) == 3ull;
+    }
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -2079,8 +2088,9 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(next.deadlineCycle + kVBlankDurationCycles,
                               next.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(next.deadlineCycle + kVBlankPeriodCycles,
-                              next.hostDeadline + kVBlankPeriod,
+                const bool pal = palVideoMode(m_runtime);
+                scheduleEvent(next.deadlineCycle + (pal ? kVBlankPeriodCyclesPal : kVBlankPeriodCycles),
+                              next.hostDeadline + (pal ? kVBlankPeriodPal : kVBlankPeriod),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(next.event);
@@ -2162,8 +2172,9 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                const bool pal = palVideoMode(m_runtime);
+                scheduleEvent(scheduled.deadlineCycle + (pal ? kVBlankPeriodCyclesPal : kVBlankPeriodCycles),
+                              scheduled.hostDeadline + (pal ? kVBlankPeriodPal : kVBlankPeriod),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

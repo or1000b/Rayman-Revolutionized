@@ -4135,6 +4135,26 @@ void register_ps2_gs_tests()
                                     "sceGsResetGraph should free its temporary GIF packet");
         });
 
+        tc.Run("sceGsResetGraph passes the video mode to SMODE1 like SetGsCrt (PAL / NTSC)", [](TestCase &t)
+        {
+            for (const uint32_t omode : {3u, 2u})
+            {
+                PS2Runtime runtime;
+                t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+                std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+                R5900Context ctx{};
+                setRegU32(ctx, 4, 0u);
+                setRegU32(ctx, 5, 1u);
+                setRegU32(ctx, 6, omode);
+                setRegU32(ctx, 7, 0u);
+                ps2_stubs::sceGsResetGraph(rdram.data(), &ctx, &runtime);
+                t.Equals(static_cast<uint32_t>((runtime.memory().gs().smode1 >> 13) & 3ull), omode,
+                         "SMODE1 CMOD should hold the omode (3 = PAL: the VSync rate follows it)");
+                t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0,
+                         "sceGsResetGraph should succeed in reset mode");
+            }
+        });
+
         tc.Run("sceGsSyncV resumes through the scheduler with deterministic field parity", [](TestCase &t)
         {
             PS2Runtime runtime;

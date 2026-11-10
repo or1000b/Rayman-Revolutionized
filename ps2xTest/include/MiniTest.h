@@ -5,6 +5,7 @@
 #include <map>
 #include <iostream>
 #include <exception>
+#include <cstdlib>
 
 class TestCase;
 using TestRunnerCallback = std::function<void(TestCase&)>;
@@ -120,10 +121,13 @@ public:
         m_beforeEach = fn;
     }
 
+    // MINITEST_FILTER=<text>: run only the tests whose name contains that text.
     static int Run()
     {
         int failedCount = 0;
         int totalTests = 0;
+        const char *filterEnv = std::getenv("MINITEST_FILTER");
+        const std::string filter = filterEnv ? filterEnv : "";
 
         for (auto& c : m_cases)
         {
@@ -144,6 +148,10 @@ public:
             {
                 const std::string& testName = cc.first;
                 const TestRunnerCallback& testFn = cc.second;
+                if (!filter.empty() && testName.find(filter) == std::string::npos)
+                {
+                    continue;
+                }
 
                 totalTests++;
                 testCase.ClearFailures();

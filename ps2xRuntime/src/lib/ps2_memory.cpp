@@ -165,8 +165,18 @@ namespace
         147456000ull,
         9216000ull,
         576000ull,
-        15734ull,
+        15734ull, // HBLANK, NTSC (PAL: kEeTimerHblankPalHz)
     };
+    constexpr uint64_t kEeTimerHblankPalHz = 15625ull;
+
+    // The timer clock; HBLANK counts at the line rate of the video mode the game set (SMODE1 CMOD 3 = PAL).
+    constexpr uint64_t eeTimerClockHz(uint32_t mode, uint64_t smode1)
+    {
+        const uint32_t clks = mode & kEeTimerModeClksMask;
+        if (clks == 3u && ((smode1 >> 13) & 3ull) == 3ull)
+            return kEeTimerHblankPalHz;
+        return kEeTimerClockHz[clks];
+    }
 
     inline bool decodeEeTimerRegister(uint32_t address, size_t &timerIndex, uint32_t &offset)
     {
@@ -426,7 +436,7 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             continue;
         }
 
-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t clockHz = eeTimerClockHz(timer.mode, gs().smode1);
         const uint64_t wholeSeconds = eeCycles / kEeClockHz;
         const uint64_t remainingCycles = eeCycles % kEeClockHz;
         const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
@@ -514,7 +524,7 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
             continue;
         }
 
-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t clockHz = eeTimerClockHz(timer.mode, gs().smode1);
         const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
         const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
