@@ -17,9 +17,12 @@ extern "C"
 #endif
 
 #include <deque>
+#include <numeric>
 #include <memory>
 
 #include "Syscalls/Helpers/State.h"
+
+extern "C" uint32_t ps2xVBlankRateOverrideHz(); // EeScheduler.cpp (PS2X_FRAMERATE)
 
 namespace ps2_stubs
 {
@@ -482,14 +485,25 @@ namespace ps2_stubs
         // Pictures are timed in fields (VSync ticks): 2 fields per picture by default (29.97 fps NTSC, 25 fps PAL).
         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
 
-        // The field clock: PAL 50 Hz, NTSC 60000/1001 Hz (the video mode the game set: SMODE1 CMOD 3 = PAL).
-        // Refreshed by the API calls that have the runtime (sceMpegInit / Create / GetPicture).
-        bool g_mpegPalFields = false;
+        // The field clock (fields per second = numerator / denominator): the VBlank rate. PS2X_FRAMERATE when set, else
+        // the video mode the game set: PAL 50 Hz, NTSC 60000/1001 Hz (SMODE1 CMOD 3 = PAL). Refreshed by the API calls
+        // that have the runtime (sceMpegInit / Create / GetPicture).
+        uint64_t g_mpegFieldsNumerator = 60000u;
+        uint64_t g_mpegFieldsDenominator = 1001u;
 
         void refreshMpegFieldClock(PS2Runtime *runtime)
         {
-            if (runtime != nullptr)
-                g_mpegPalFields = ((runtime->memory().gs().smode1 >> 13) & 3ull) == 3ull;
+            if (const uint32_t hz = ps2xVBlankRateOverrideHz())
+            {
+                g_mpegFieldsNumerator = hz;
+                g_mpegFieldsDenominator = 1u;
+            }
+            else if (runtime != nullptr)
+            {
+                const bool pal = ((runtime->memory().gs().smode1 >> 13) & 3ull) == 3ull;
+                g_mpegFieldsNumerator = pal ? 50u : 60000u;
+                g_mpegFieldsDenominator = pal ? 1u : 1001u;
+            }
         }
         constexpr size_t kMpegTimingScanLimit = 4096u;
         constexpr size_t kMaxDecodedPicturesAhead = 8u;
@@ -611,8 +625,8 @@ namespace ps2_stubs
 
             const uint64_t extensionNumerator = static_cast<uint64_t>(frameRateExtensionN) + 1u;
             const uint64_t extensionDenominator = static_cast<uint64_t>(frameRateExtensionD) + 1u;
-            const uint64_t fieldsNumerator = g_mpegPalFields ? 50u : 60000u;
-            const uint64_t fieldsDenominator = g_mpegPalFields ? 1u : 1001u;
+            const uint64_t fieldsNumerator = g_mpegFieldsNumerator;
+            const uint64_t fieldsDenominator = g_mpegFieldsDenominator;
             const uint64_t denominator = fieldsDenominator * frameRateNumerator * extensionNumerator;
             const uint64_t numerator = (fieldsNumerator * frameRateDenominator * extensionDenominator) << 32u;
             return std::max(kPictureClockOne, (numerator + denominator / 2u) / denominator);
@@ -744,10 +758,12 @@ namespace ps2_stubs
 
         uint64_t mpegPtsDeltaToVSyncQ32(uint64_t delta90k)
         {
-            // 90 kHz MPEG clock -> field clock: NTSC (60000/1001 Hz) fields = pts * 60000 / (90000 * 1001)
-            // = pts * 2 / 3003; PAL (50 Hz) fields = pts * 50 / 90000 = pts / 1800.
-            const uint64_t ptsDivisor = g_mpegPalFields ? 1800u : 3003u;
-            const uint64_t fieldsPerDivisor = g_mpegPalFields ? 1u : 2u;
+            // 90 kHz MPEG clock -> field clock: fields = pts * numerator / (90000 * denominator), reduced: NTSC
+            // (60000/1001 Hz) pts * 2 / 3003, PAL (50 Hz) pts / 1800, 60 Hz pts / 1500.
+            const uint64_t fullDivisor = 90000u * g_mpegFieldsDenominator;
+            const uint64_t common = std::gcd(g_mpegFieldsNumerator, fullDivisor);
+            const uint64_t ptsDivisor = fullDivisor / common;
+            const uint64_t fieldsPerDivisor = g_mpegFieldsNumerator / common;
             const uint64_t whole = delta90k / ptsDivisor;
             const uint64_t remainder = delta90k % ptsDivisor;
             const uint64_t wholeQ32 = whole * fieldsPerDivisor * kPictureClockOne;

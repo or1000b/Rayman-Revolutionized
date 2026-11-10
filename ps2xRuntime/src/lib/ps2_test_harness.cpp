@@ -42,6 +42,7 @@
 extern "C" void ps2xDumpCrashContext(); // ps2_runtime.cpp: last guest function, dispatch history
 extern "C" void ps2xSpu2DebugDump();    // ps2xIOP iop_memory.cpp: SPU2 mixer state
 extern "C" void ps2xRequestGsCapture(); // gs_cpu_backend.cpp: F11 capture (CPU renderer)
+extern "C" uint32_t ps2xVBlankRateOverrideHz(); // EeScheduler.cpp (PS2X_FRAMERATE)
 
 namespace
 {
@@ -85,6 +86,9 @@ namespace
     std::atomic<int64_t> g_lastTickMs{0};
     std::atomic<bool> g_exiting{false};
     uint64_t g_frameBudget = 0;
+    // Game-specific hook at every guest VBlank (main.cpp sets it): script time (see scriptClock), VSync, EE RAM.
+    using GuestVsyncHook = void (*)(uint64_t scriptTime, uint64_t vsync, const uint8_t *rdram);
+    GuestVsyncHook g_guestVsyncHook = nullptr;
     int g_watchdogSec = 15;
     bool g_testMode = false;
 
@@ -94,11 +98,16 @@ namespace
         return value && std::atoi(value) != 0;
     }
 
-    // Window frames normally; guest VSyncs in deterministic mode.
+    // Window frames normally; guest VSyncs in deterministic mode. With PS2X_FRAMERATE=N the VSyncs are scaled to
+    // PAL fields (x 50 / N), so a scenario's ticks mean the same real time (20 ms each) at every frame rate.
     uint64_t scriptClock()
     {
         static const bool deterministic = deterministicEnv();
-        return deterministic ? g_guestVsync.load(std::memory_order_relaxed) : g_tick.load(std::memory_order_relaxed);
+        static const uint32_t rateHz = ps2xVBlankRateOverrideHz();
+        if (!deterministic)
+            return g_tick.load(std::memory_order_relaxed);
+        const uint64_t vsync = g_guestVsync.load(std::memory_order_relaxed);
+        return rateHz != 0u ? vsync * 50u / rateHz : vsync;
     }
 
     int64_t nowMs()
@@ -693,9 +702,16 @@ extern "C" uint64_t ps2xGuestVsync()
 
 // EE thread, at every VBlank start (EeScheduler). Feeds the guest clock used in deterministic mode and
 // logs the state fingerprint used to compare two runs.
+extern "C" void ps2xSetGuestVsyncHook(void (*fn)(uint64_t scriptTime, uint64_t vsync, const uint8_t *rdram))
+{
+    g_guestVsyncHook = fn;
+}
+
 extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uint8_t *rdram, uint32_t ramBytes)
 {
     g_guestVsync.store(vsync, std::memory_order_relaxed);
+    if (g_guestVsyncHook && rdram)
+        g_guestVsyncHook(scriptClock(), vsync, rdram);
 
     const auto vsyncList = [](const char *name)
     {

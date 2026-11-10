@@ -3,6 +3,8 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+extern "C" uint32_t ps2xVBlankRateOverrideHz(); // EeScheduler.cpp (PS2X_FRAMERATE)
+
 namespace ps2_stubs
 {
     namespace
@@ -31,8 +33,8 @@ namespace ps2_stubs
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
 
-        // The field clock the stream timing counts in (VSync ticks): PAL 50 Hz, NTSC 60000/1001 Hz (the video mode
-        // the game set: SMODE1 CMOD 3 = PAL).
+        // The field clock the stream timing counts in (VSync ticks): the VBlank rate. PS2X_FRAMERATE when set, else
+        // the video mode the game set: PAL 50 Hz, NTSC 60000/1001 Hz (SMODE1 CMOD 3 = PAL).
         bool palFields(PS2Runtime *runtime)
         {
             return runtime != nullptr && ((runtime->memory().gs().smode1 >> 13) & 3ull) == 3ull;
@@ -40,11 +42,15 @@ namespace ps2_stubs
 
         uint64_t fieldsPerSecondNumerator(PS2Runtime *runtime)
         {
+            if (const uint32_t hz = ps2xVBlankRateOverrideHz())
+                return hz;
             return palFields(runtime) ? 50u : kNtScFieldsPerSecondNumerator;
         }
 
         uint64_t fieldsPerSecondDenominator(PS2Runtime *runtime)
         {
+            if (ps2xVBlankRateOverrideHz() != 0u)
+                return 1u;
             return palFields(runtime) ? 1u : kNtScFieldsPerSecondDenominator;
         }
 

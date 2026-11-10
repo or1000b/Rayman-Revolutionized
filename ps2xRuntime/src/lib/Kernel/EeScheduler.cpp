@@ -19,6 +19,36 @@ extern "C" void ps2xDumpSchedulerTrace();
 // ps2_runtime.cpp: clears the "unwinding to the scheduler" flag before guest code runs again at the stack root.
 extern "C" void ps2xGuestYieldReset();
 
+// Display flips counted in guest time: DISPFB1 sampled at every VBlank start (the game flips at most once per
+// VBlank). The window's "Game FPS" uses it (sampling once per host frame missed flips above ~half the host rate).
+namespace
+{
+    std::atomic<uint64_t> g_guestDisplayFlips{0};
+    uint64_t g_lastDispfb1 = 0;
+}
+extern "C" uint64_t ps2xGuestDisplayFlips()
+{
+    return g_guestDisplayFlips.load(std::memory_order_relaxed);
+}
+
+// PS2X_FRAMERATE=<N> (25..240; "uncapped" = 240): VBlank at N Hz whatever the video mode. The game side (main.cpp,
+// Rayman) makes its frame cap (1 VBlank per frame) and its clock unit (1/N s) follow, so game time stays real time.
+// Unset or "original": the video mode's rate (PAL 50 Hz, NTSC 60 Hz) and the game untouched.
+extern "C" uint32_t ps2xVBlankRateOverrideHz()
+{
+    static const uint32_t hz = []
+    {
+        const char *env = std::getenv("PS2X_FRAMERATE");
+        if (!env || !*env || std::strcmp(env, "original") == 0)
+            return 0u;
+        if (std::strcmp(env, "uncapped") == 0)
+            return 240u;
+        const long value = std::strtol(env, nullptr, 10);
+        return (value >= 25 && value <= 240) ? static_cast<uint32_t>(value) : 0u;
+    }();
+    return hz;
+}
+
 // ps2_test_harness.cpp. Deterministic mode (PS2X_DETERMINISTIC=1): which event comes next and in what
 // order events run is decided by guest cycles only; the host clock is used only to pace (wait).
 extern "C" bool ps2xDeterministic();
@@ -185,6 +215,22 @@ namespace
         return ((runtime.memory().gs().smode1 >> 13) & 3ull) == 3ull;
     }
 
+    // The time from one VBlank to the next, in EE cycles and host time.
+    struct VBlankPeriod
+    {
+        uint64_t cycles;
+        std::chrono::nanoseconds host;
+    };
+
+    VBlankPeriod vblankPeriod(PS2Runtime &runtime)
+    {
+        if (const uint32_t hz = ps2xVBlankRateOverrideHz())
+            return {EeScheduler::kEeClockHz / hz, std::chrono::nanoseconds(1000000000ull / hz)};
+        if (palVideoMode(runtime))
+            return {kVBlankPeriodCyclesPal, kVBlankPeriodPal};
+        return {kVBlankPeriodCycles, kVBlankPeriod};
+    }
+
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
     {
@@ -278,8 +324,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+    const VBlankPeriod firstPeriod = vblankPeriod(m_runtime);
+    scheduleEvent(m_eeCycle + firstPeriod.cycles,
+                  std::chrono::steady_clock::now() + firstPeriod.host,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -2088,9 +2135,9 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(next.deadlineCycle + kVBlankDurationCycles,
                               next.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                const bool pal = palVideoMode(m_runtime);
-                scheduleEvent(next.deadlineCycle + (pal ? kVBlankPeriodCyclesPal : kVBlankPeriodCycles),
-                              next.hostDeadline + (pal ? kVBlankPeriodPal : kVBlankPeriod),
+                const VBlankPeriod period = vblankPeriod(m_runtime);
+                scheduleEvent(next.deadlineCycle + period.cycles,
+                              next.hostDeadline + period.host,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(next.event);
@@ -2172,9 +2219,9 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                const bool pal = palVideoMode(m_runtime);
-                scheduleEvent(scheduled.deadlineCycle + (pal ? kVBlankPeriodCyclesPal : kVBlankPeriodCycles),
-                              scheduled.hostDeadline + (pal ? kVBlankPeriodPal : kVBlankPeriod),
+                const VBlankPeriod period = vblankPeriod(m_runtime);
+                scheduleEvent(scheduled.deadlineCycle + period.cycles,
+                              scheduled.hostDeadline + period.host,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2190,6 +2237,11 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        if (const uint64_t dispfb1 = m_runtime.memory().gs().dispfb1; dispfb1 != g_lastDispfb1)
+        {
+            g_lastDispfb1 = dispfb1;
+            g_guestDisplayFlips.fetch_add(1u, std::memory_order_relaxed);
+        }
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

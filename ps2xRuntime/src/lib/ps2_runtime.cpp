@@ -36,6 +36,7 @@ extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
 void ps2xDebugDumpSemaphoreHistory(int id); // EeScheduler.cpp (Rayman bring-up)
 extern "C" void ps2xRequestGsCapture();         // gs_cpu_backend.cpp
+extern "C" uint64_t ps2xGuestDisplayFlips();       // EeScheduler.cpp: display flips counted at guest VBlanks
 extern "C" int ps2xGsStatsLine(char *buffer, int size);
 extern "C" int ps2xSpu2ReadSamples(int16_t *out, int frames); // ps2xIOP SPU2 output ring
 extern "C" int ps2xSpu2StatsLine(char *buffer, int size);
@@ -1819,6 +1820,13 @@ extern "C" void ps2xGuestYieldReset()
     t_guestYieldPending = false;
 }
 
+// For HLE wrappers around a guest function: true when the wrapped function handed control to the scheduler instead
+// of returning (its rest runs later from the scheduler, not through the wrapper).
+extern "C" bool ps2xGuestYieldPending()
+{
+    return t_guestYieldPending;
+}
+
 extern "C" void ps2xDumpBranchTrace()
 {
     std::fprintf(stderr, "[branch-trace] last 64 guest branches of this thread, oldest first:\n");
@@ -2989,27 +2997,22 @@ void PS2Runtime::run()
         } });
 
     uint64_t tick = 0;
-    // Game frame counter: the game flips its display buffer (DISPFB1) once per rendered frame.
-    uint64_t fpsLastDispfb = 0;
-    uint32_t fpsFlips = 0;
+    // Game frame counter: the game flips its display buffer (DISPFB1) once per rendered frame; the flips are counted
+    // at guest VBlanks (EeScheduler.cpp), not here once per host frame (that missed flips at high frame rates).
+    uint64_t fpsFlipsAtWindowStart = ps2xGuestDisplayFlips();
     double gameFps = 0.0;
     auto fpsWindowStart = std::chrono::steady_clock::now();
     ps2xTestHarnessStart();
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         {
-            const uint64_t dispfb = m_memory.gs().dispfb1;
-            if (dispfb != fpsLastDispfb)
-            {
-                fpsLastDispfb = dispfb;
-                ++fpsFlips;
-            }
             const auto fpsNow = std::chrono::steady_clock::now();
             const double fpsSeconds = std::chrono::duration<double>(fpsNow - fpsWindowStart).count();
             if (fpsSeconds >= 1.0)
             {
-                gameFps = static_cast<double>(fpsFlips) / fpsSeconds;
-                fpsFlips = 0;
+                const uint64_t flips = ps2xGuestDisplayFlips();
+                gameFps = static_cast<double>(flips - fpsFlipsAtWindowStart) / fpsSeconds;
+                fpsFlipsAtWindowStart = flips;
                 fpsWindowStart = fpsNow;
             }
         }

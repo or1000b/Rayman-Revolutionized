@@ -25,6 +25,9 @@
 extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 extern "C" void ps2xSetGameStatsLine(int (*fn)(const uint8_t *rdram, char *buffer, int size)); // ps2_runtime.cpp
 void ps2xVu1ProfileFlush(); // ps2_vu1_core.cpp
+extern "C" uint32_t ps2xVBlankRateOverrideHz(); // EeScheduler.cpp (PS2X_FRAMERATE)
+extern "C" bool ps2xGuestYieldPending();        // ps2_runtime.cpp
+extern "C" void ps2xSetGuestVsyncHook(void (*fn)(uint64_t scriptTime, uint64_t vsync, const uint8_t *rdram)); // ps2_test_harness.cpp
 
 #if defined(_WIN32)
 // Rayman bring-up: report crashes in out\run.log. Declared by hand so <windows.h> (which clashes
@@ -231,6 +234,131 @@ namespace
 
         setReturnU32(ctx, 0u);
         ctx->pc = getRegU32(ctx, 31);
+    }
+
+    // ------------------------------------------------------------------
+    // PS2X_FRAMERATE=N (EeScheduler.cpp: VBlank at N Hz): Rayman at N frames per second, game time kept real time.
+    // - Frame cap. The main loop (0x1010F8) ends waiting (0x101208-0x10121C) until the VBlank-start counter gp-0x71D8
+    //   (counted by the INTC 2 handler 0x1413C8, reset after every frame) passes max(1, its value at the check): at
+    //   least two VBlanks per frame, 25 FPS in PAL. (The US 60 FPS patch nops that loop's branch, 0x10121C.) The
+    //   handler now counts 2 per VBlank: at least one VBlank per frame, so N FPS.
+    // - Game time comes from EE timer 0 (0x14C1B8). The frame clock (0x14BCD8, struct at [gp-0x7108]) takes the time
+    //   since the last frame, rounds it to whole units (n at +0x24; unit +0xC ms = 1000 * the constant 0.02 at
+    //   0x39286C, read once when the clock is made) and steps n units: +0x20 = trunc(n * unit ms), +0x14 += that (ms),
+    //   +0x2C = n * unit s, +0x30 = +0x14 / 1000 s. With 20 ms units a 16.7 ms frame would count 20 ms (the game 20%
+    //   fast), so the unit becomes 1/N s; and trunc(16.667) = 16 would make the ms timers 4% slow, so the ms step is
+    //   made exact (16, 17, 17, ...).
+    // - Demo playback (gp-0x6898 set: n comes from the recording, in 20 ms units): all original.
+    constexpr uint32_t kRaymanVBlankHandlerAddr = 0x001413C8u;
+    constexpr uint32_t kRaymanFrameClockAddr = 0x0014BCD8u;
+    constexpr uint32_t kRaymanClockUnitAddr = 0x0039286Cu;
+    constexpr uint32_t kRaymanFrameWaitBranchAddr = 0x0010121Cu;
+    PS2Runtime::RecompiledFunction g_raymanVBlankHandler = nullptr;
+    PS2Runtime::RecompiledFunction g_raymanFrameClock = nullptr;
+    uint32_t g_raymanFrameRate = 0u;
+    float g_raymanOriginalUnit = 0.02f;
+    int64_t g_raymanClockLastFrame = -1; // frame counter (+0x28) of the last update corrected
+    uint64_t g_raymanClockRemainder = 0; // ms * N not yet counted
+
+    uint32_t raymanRam32(const uint8_t *rdram, uint32_t address)
+    {
+        uint32_t value = 0u;
+        std::memcpy(&value, rdram + (address & 0x01FFFFFCu), sizeof(value));
+        return value;
+    }
+
+    void raymanRamWrite32(uint8_t *rdram, uint32_t address, uint32_t value)
+    {
+        std::memcpy(rdram + (address & 0x01FFFFFCu), &value, sizeof(value));
+    }
+
+    void raymanRamWriteFloat(uint8_t *rdram, uint32_t address, float value)
+    {
+        std::memcpy(rdram + (address & 0x01FFFFFCu), &value, sizeof(value));
+    }
+
+    bool raymanDemoPlayback(const uint8_t *rdram, uint32_t gp)
+    {
+        return rdram[(gp - 0x6898u) & 0x01FFFFFFu] != 0u;
+    }
+
+    void raymanVBlankCounterHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t gp = getRegU32(ctx, 28);
+        g_raymanVBlankHandler(rdram, ctx, runtime); // counter++, ei, return 0
+        if (!raymanDemoPlayback(rdram, gp))
+            raymanRamWrite32(rdram, gp - 0x71D8u, raymanRam32(rdram, gp - 0x71D8u) + 1u);
+    }
+
+    // The update just made (frame counter one past the last one corrected): the exact ms step instead of trunc(n * unit).
+    void raymanClockExactStep(uint8_t *rdram, uint32_t clock)
+    {
+        const uint32_t frame = raymanRam32(rdram, clock + 0x28u);
+        if (g_raymanClockLastFrame >= 0 && frame == static_cast<uint32_t>(g_raymanClockLastFrame) + 1u)
+        {
+            const uint32_t n = raymanRam32(rdram, clock + 0x24u);
+            const uint32_t gameStep = raymanRam32(rdram, clock + 0x20u);
+            g_raymanClockRemainder += static_cast<uint64_t>(n) * 1000u;
+            const uint32_t exactStep = static_cast<uint32_t>(g_raymanClockRemainder / g_raymanFrameRate);
+            g_raymanClockRemainder %= g_raymanFrameRate;
+            const uint32_t ms = raymanRam32(rdram, clock + 0x14u) - gameStep + exactStep;
+            raymanRamWrite32(rdram, clock + 0x20u, exactStep);
+            raymanRamWrite32(rdram, clock + 0x14u, ms);
+            raymanRamWriteFloat(rdram, clock + 0x30u,
+                                static_cast<float>(ms) / static_cast<float>(raymanRam32(rdram, clock + 0x10u)));
+        }
+        g_raymanClockLastFrame = frame;
+    }
+
+    void raymanFrameClockHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t clock = getRegU32(ctx, 4);
+        const bool demo = raymanDemoPlayback(rdram, getRegU32(ctx, 28));
+        if (clock != 0u)
+        {
+            if (demo)
+                g_raymanClockLastFrame = -1;
+            else
+                raymanClockExactStep(rdram, clock); // an update a scheduler yield left without its correction
+            // The unit, as the clock's maker (0x14BBA8) sets it: +0x8 seconds, +0xC = +0x10 (1000) * that in ms.
+            const float unit = demo ? g_raymanOriginalUnit : 1.0f / static_cast<float>(g_raymanFrameRate);
+            raymanRamWriteFloat(rdram, clock + 0x08u, unit);
+            raymanRamWriteFloat(rdram, clock + 0x0Cu, static_cast<float>(raymanRam32(rdram, clock + 0x10u)) * unit);
+        }
+        g_raymanFrameClock(rdram, ctx, runtime);
+        if (clock != 0u && !demo && !ps2xGuestYieldPending())
+            raymanClockExactStep(rdram, clock);
+    }
+
+    void installRaymanFramerate(PS2Runtime &runtime, uint8_t *rdram)
+    {
+        g_raymanFrameRate = ps2xVBlankRateOverrideHz();
+        if (g_raymanFrameRate == 0u)
+            return;
+        const bool codeMatches = raymanRam32(rdram, kRaymanVBlankHandlerAddr) == 0x8F828E28u &&      // lw v0,-0x71d8(gp)
+                                 raymanRam32(rdram, kRaymanVBlankHandlerAddr + 4u) == 0x24420001u && // addiu v0,v0,1
+                                 raymanRam32(rdram, kRaymanVBlankHandlerAddr + 8u) == 0xAF828E28u && // sw v0,-0x71d8(gp)
+                                 raymanRam32(rdram, kRaymanFrameWaitBranchAddr) == 0x1040FFFAu &&    // beqz v0,0x101208
+                                 raymanRam32(rdram, kRaymanFrameClockAddr) == 0x27BDFFA0u &&         // addiu sp,sp,-0x60
+                                 runtime.hasFunction(kRaymanVBlankHandlerAddr) && runtime.hasFunction(kRaymanFrameClockAddr);
+        if (!codeMatches)
+        {
+            std::cerr << "[hle] Rayman: PS2X_FRAMERATE=" << g_raymanFrameRate
+                      << ": frame cap / clock code not found, only the VBlank rate changes (game time may run fast)" << std::endl;
+            return;
+        }
+        std::memcpy(&g_raymanOriginalUnit, rdram + kRaymanClockUnitAddr, sizeof(g_raymanOriginalUnit));
+        raymanRamWriteFloat(rdram, kRaymanClockUnitAddr, 1.0f / static_cast<float>(g_raymanFrameRate));
+        g_raymanVBlankHandler = runtime.lookupFunction(kRaymanVBlankHandlerAddr);
+        g_raymanFrameClock = runtime.lookupFunction(kRaymanFrameClockAddr);
+        if (g_raymanVBlankHandler && g_raymanFrameClock &&
+            runtime.registerFunction(kRaymanVBlankHandlerAddr, &raymanVBlankCounterHle) &&
+            runtime.registerFunction(kRaymanFrameClockAddr, &raymanFrameClockHle))
+            std::cerr << "[hle] Rayman: " << g_raymanFrameRate << " FPS (VBlank " << g_raymanFrameRate
+                      << " Hz, frame cap 1 VBlank, clock unit 1/" << g_raymanFrameRate << " s, exact ms step; was "
+                      << g_raymanOriginalUnit << " s)" << std::endl;
+        else
+            std::cerr << "[hle] Rayman: failed to install the frame rate change" << std::endl;
     }
 
     // 0x1DF7F0 evaluates one AI behaviour tree (a0 = actor context, a1 = first node, a2 = result
@@ -989,11 +1117,60 @@ namespace
         lastTrend = trend;
     }
 
+    // PS2X_RAYMAN_TRACK="from,to[,step]": a [rayman-track] line every step script units (default 5) between from and
+    // to: Rayman's position, state and air, and the game clock. Script time is 20 ms per unit at every PS2X_FRAMERATE
+    // (deterministic runs, see the harness), so two frame rates can be compared at the same real time.
+    void raymanTrackHook(uint64_t scriptTime, uint64_t vsync, const uint8_t *rdram)
+    {
+        struct Config
+        {
+            bool on = false;
+            uint64_t from = 0, to = 0, step = 5;
+        };
+        static const Config cfg = []
+        {
+            Config c;
+            if (const char *env = std::getenv("PS2X_RAYMAN_TRACK"))
+            {
+                unsigned long long a = 0, b = 0, step = 5;
+                if (std::sscanf(env, "%llu,%llu,%llu", &a, &b, &step) >= 2 && b >= a && step > 0)
+                    c = Config{true, a, b, step};
+            }
+            return c;
+        }();
+        static uint64_t next = 0;
+        if (!cfg.on || scriptTime < cfg.from || scriptTime > cfg.to)
+            return;
+        if (next < cfg.from)
+            next = cfg.from;
+        if (scriptTime < next)
+            return;
+        while (next <= scriptTime)
+            next += cfg.step;
+        const RaymanState s = readRaymanState(rdram);
+        const uint32_t clock = raymanRam32(rdram, 0x0039A3F0u - 0x7108u); // [gp-0x7108]: the frame clock
+        uint32_t gameMs = 0u, frames = 0u, n = 0u;
+        float gameSeconds = 0.0f;
+        if (clock >= 0x00100000u && clock < 0x02000000u)
+        {
+            gameMs = raymanRam32(rdram, clock + 0x14u);
+            n = raymanRam32(rdram, clock + 0x24u);
+            frames = raymanRam32(rdram, clock + 0x28u);
+            std::memcpy(&gameSeconds, rdram + clock + 0x30u, sizeof(gameSeconds));
+        }
+        std::fprintf(stderr, "[rayman-track] t=%llu ms=%llu vsync=%llu state=%s behaviour=%d pos=%.3f,%.3f,%.3f air=%.2f "
+                             "game_ms=%u game_s=%.3f frames=%u n=%u\n",
+                     static_cast<unsigned long long>(scriptTime), static_cast<unsigned long long>(scriptTime * 20u),
+                     static_cast<unsigned long long>(vsync), s.state, s.behaviour, s.x, s.y, s.z, s.air, gameMs,
+                     gameSeconds, frames, n);
+    }
+
     void installGameHle(PS2Runtime &runtime, const std::string &gameId)
     {
         if (gameId != "SLES-50044")
             return;
         ps2xSetGameStatsLine(&raymanGameStatsLine);
+        ps2xSetGuestVsyncHook(&raymanTrackHook);
 
         uint8_t *rdram = runtime.memory().getRDRAM();
         if (!rdram)
@@ -1012,6 +1189,8 @@ namespace
             std::cerr << "[hle] Rayman: real-time wait helper installed at 0x14BEC8" << std::endl;
         else
             std::cerr << "[hle] Rayman: failed to install wait helper" << std::endl;
+
+        installRaymanFramerate(runtime, rdram);
 
         uint32_t evalEntryWord = 0u;
         std::memcpy(&evalEntryWord, rdram + kRaymanEvalTreeAddr, sizeof(evalEntryWord));
