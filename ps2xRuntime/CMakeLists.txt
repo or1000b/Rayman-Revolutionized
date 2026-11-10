@@ -462,6 +462,9 @@ if(MSVC)
         src/lib/vu/vu1aot.cpp
         ${VU1AOT_SRC_FILES}
         PROPERTIES COMPILE_OPTIONS "/fp:precise")
+    # The generated programs are a few huge functions: code-generate them at compile time (/GL-: in parallel, and the
+    # link does not redo them). /Z7: line numbers for the sampling profiler (PS2X_NATIVE_PROF), same code.
+    set_source_files_properties(${VU1AOT_SRC_FILES} PROPERTIES COMPILE_OPTIONS "/fp:precise;/GL-;/Z7")
 endif()
 
 # GPU GS renderer: paraLLEl-GS (Vulkan compute, LGPL-3.0-or-later, https://github.com/Arntzen-Software/parallel-gs)

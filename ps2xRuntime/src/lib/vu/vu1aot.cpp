@@ -7,13 +7,19 @@ namespace vu1aot
 {
     namespace
     {
+        // Compile-time constants: the calls to std::numeric_limits are not always inlined into the big functions.
+        constexpr float kFloatMax = std::numeric_limits<float>::max();
+        constexpr float kFloatMin = std::numeric_limits<float>::min();
+        constexpr int32_t kInt32Max = std::numeric_limits<int32_t>::max();
+        constexpr int32_t kInt32Min = std::numeric_limits<int32_t>::min();
+
         int32_t vuFloatToInt(float value, float scale) // ps2_vu1_upper.cpp
         {
             const double scaled = static_cast<double>(value) * static_cast<double>(scale);
-            if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
-                return std::numeric_limits<int32_t>::max();
-            if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
-                return std::numeric_limits<int32_t>::min();
+            if (scaled >= static_cast<double>(kInt32Max))
+                return kInt32Max;
+            if (scaled <= static_cast<double>(kInt32Min))
+                return kInt32Min;
             return static_cast<int32_t>(scaled);
         }
 
@@ -49,7 +55,7 @@ namespace vu1aot
             polynomial = 1.0f + value * polynomial;
             polynomial *= polynomial;
             polynomial *= polynomial;
-            return polynomial != 0.0f ? 1.0f / polynomial : std::numeric_limits<float>::max();
+            return polynomial != 0.0f ? 1.0f / polynomial : kFloatMax;
         }
     }
 
@@ -81,8 +87,8 @@ namespace vu1aot
     {
         const bool negative = std::signbit(exactResult);
         const long double magnitude = std::fabs(exactResult);
-        const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
-        const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
+        constexpr long double maximum = static_cast<long double>(kFloatMax);
+        constexpr long double minimum = static_cast<long double>(kFloatMin);
         uint8_t flags = negative ? 0x2u : 0u;
         uint32_t bits = negative ? 0x80000000u : 0u;
         if (magnitude == 0.0L)
@@ -120,8 +126,8 @@ namespace vu1aot
         uint32_t productSticky = 0u;
         if (productSum)
         {
-            const float maximum = std::numeric_limits<float>::max();
-            const float minimum = std::numeric_limits<float>::min();
+            constexpr float maximum = kFloatMax;
+            constexpr float minimum = kFloatMin;
             for (uint32_t component = 0; component < 4u; ++component)
             {
                 if ((dest & laneBit(component)) == 0u)
@@ -702,7 +708,7 @@ namespace vu1aot
             if (den == 0.0f)
             {
                 statusDi = num == 0.0f ? 0x10u : 0x20u;
-                result = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+                result = std::signbit(num) != std::signbit(den) ? -kFloatMax : kFloatMax;
             }
             else
                 result = num / den;
@@ -731,7 +737,7 @@ namespace vu1aot
         else
         {
             statusDi = num == 0.0f ? 0x10u : 0x20u;
-            result = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+            result = std::signbit(num) ? -kFloatMax : kFloatMax;
         }
         result = normalizeResult(result, ignoredFlags);
         value = normalizeResult(result, ignoredFlags);

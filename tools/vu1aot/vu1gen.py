@@ -2,6 +2,7 @@
 """VU1 microprogram -> C++ ahead-of-time translator (docs/vu1_aot.md).
 
 usage: python tools/vu1aot/vu1gen.py [--prof out/vu1prof] [--keys KEY,KEY...] [--out ps2xRuntime/src/lib/vu/aot]
+                                     [--with-flags]
 
 For each program key (tools/vu1aot/vu1reach.py) the image with the most VU1 cycles is used: its code
 (code_<hash>.bin), the interpreter's own decode table for it (decode_<hash>.txt: pipelines, latencies, register reads
@@ -14,6 +15,10 @@ one block per (pair, timing state) with a fixed stall, and only the values move 
 cycle the interpreter makes them (flags in issue order, then Q, then P). What the generator cannot see ahead (an
 XGKICK while the previous packet is still transferring, a JR target the profile never saw, the cycle budget) makes
 the native run give up ("bail"): the dispatcher undoes it and the interpreter runs the whole program.
+
+By default the programs are flag-free: no MAC / status flags (the FMAC family on SSE, ops::fmacNf), valid only
+when no instruction of the code image reads them (the interpreter's macStatusUnread; Rayman's VU1 code never does).
+The dispatcher runs them only then (Program::flagsFree). --with-flags generates code for both cases instead.
 """
 import argparse
 import collections
@@ -94,8 +99,11 @@ def upper_kind(instr):
     return None
 
 
-def upper_template(instr):
-    """The template call (ops::fmacSse / itof / absT) for an upper instruction, or None (generic upper())."""
+def upper_template(instr, nf):
+    """The template call (ops::fmacNf / fmacSse / itof / ftoi / absT / clipT) for an upper instruction, or None
+    (generic upper()). nf: flag-free program."""
+    fmac = ('ops::fmacNf<ops::Op::%s, %s, 0x%x, %d, %d, %d, %d, %s, 0x%08xu>(c)' if nf else
+            'ops::fmacSse<ops::Op::%s, %s, 0x%x, %d, %d, %d, %d, %s, 0x%08xu>(c, fr)')
     op = instr & 0x3f
     dest = instr >> 21 & 0xf
     ft = instr >> 16 & 0x1f
@@ -115,12 +123,16 @@ def upper_template(instr):
                 return None
             kind, y = table[op]
             bc = 0
-        return 'ops::fmacSse<ops::Op::%s, %s, 0x%x, %d, %d, %d, %d, false, 0x%08xu>(c, fr)' % (kind, y, dest, fs, ft, fd, bc, instr)
+        return fmac % (kind, y, dest, fs, ft, fd, bc, 'false', instr)
     sp = (instr & 3) | ((instr >> 4) & 0x7c)
     if 0x10 <= sp <= 0x13:  # ITOF0 / 4 / 12 / 15
         return 'ops::itof<%d, 0x%x, %d, %d>(c)' % (sp & 3, dest, fs, ft)
+    if 0x14 <= sp <= 0x17:  # FTOI0 / 4 / 12 / 15
+        return 'ops::ftoi<%d, 0x%x, %d, %d>(c)' % (sp & 3, dest, fs, ft)
     if sp == 0x1d:  # ABS
         return 'ops::absT<0x%x, %d, %d>(c)' % (dest, fs, ft)
+    if sp == 0x1f:  # CLIP
+        return 'ops::clipT<%d, %d>(c, clipV)' % (fs, ft)
     if sp <= 0x0f or 0x18 <= sp <= 0x1b:
         kind = {0: 'Add', 1: 'Sub', 2: 'MAdd', 3: 'MSub', 6: 'Mul'}[sp >> 2]
         y, bc = 'YBc', sp & 3
@@ -133,7 +145,7 @@ def upper_template(instr):
             return None
         kind, y = table[sp]
         bc = 0
-    return 'ops::fmacSse<ops::Op::%s, %s, 0x%x, %d, %d, %d, %d, true, 0x%08xu>(c, fr)' % (kind, y, dest, fs, ft, fd, bc, instr)
+    return fmac % (kind, y, dest, fs, ft, fd, bc, 'true', instr)
 
 
 def lower_class(p):
@@ -163,6 +175,48 @@ def lower_class(p):
         if sp in (0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x78, 0x79, 0x7a, 0x7c, 0x7d, 0x7e):
             return 'efu'
     return 'plain'
+
+
+def may_write_reg0(p, lc, uk):
+    """Whether the pair may write VF0 or VI0 (then the pair ends by restoring them). Conservative: an upper
+    instruction whose destination field is 0, or a plain lower instruction with any register field 0."""
+    up = p.upper
+    if uk in ('fmac', 'plain'):
+        if up & 0x3f < 0x3c:
+            if (up >> 6) & 0x1f == 0:  # fd
+                return True
+        else:
+            sp = (up & 3) | ((up >> 4) & 0x7c)
+            if (0x10 <= sp <= 0x17 or sp == 0x1d) and (up >> 16) & 0x1f == 0:  # ITOF / FTOI / ABS: ft
+                return True
+    if lc == 'plain':
+        lo = p.lower
+        op = lo >> 25 & 0x7f
+        ft, fs, fd = lo >> 16 & 0x1f, lo >> 11 & 0x1f, lo >> 6 & 0x1f
+        if op in (0x01, 0x05):  # SQ, ISW: no register written
+            return False
+        if op in (0x00, 0x04, 0x08, 0x09, 0x14, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1c):  # LQ ILW IADDIU ISUBIU FS* FM* FCGET
+            return ft == 0
+        if op in (0x10, 0x12, 0x13):  # FCEQ FCAND FCOR: VI1
+            return False
+        if op == 0x40:
+            f = lo & 0x3f
+            if f in (0x30, 0x31, 0x34, 0x35):  # IADD ISUB IAND IOR: id
+                return fd == 0
+            if f == 0x32:  # IADDI: it
+                return ft == 0
+            if f >= 0x3c:
+                sp = (lo & 3) | ((lo >> 4) & 0x7c)
+                if sp in (0x30, 0x31, 0x3c, 0x3d, 0x3e, 0x40, 0x41, 0x64, 0x68, 0x69):  # MOVE MR32 MTIR MFIR ILWR RNEXT
+                    return ft == 0                                                    # RGET MFP XTOP XITOP: ft / it
+                if sp in (0x34, 0x36):  # LQI LQD: ft and the base is
+                    return ft == 0 or fs == 0
+                if sp in (0x35, 0x37):  # SQI SQD: the base it
+                    return ft == 0
+                if sp in (0x3b, 0x3f, 0x42, 0x43, 0x7b):  # WAITQ ISWR RINIT RXOR WAITP
+                    return False
+        return True  # anything else: assume it may
+    return False
 
 
 def is_branch(p):
@@ -264,8 +318,9 @@ def free_slot(used, n):
 
 
 class Gen:
-    def __init__(self, key, pairs, entries, jr):
+    def __init__(self, key, pairs, entries, jr, nf):
         self.key = key
+        self.nf = nf        # flag-free: FMAC instructions queue no flag entries
         self.pairs = pairs  # pc -> Pair
         self.entries = sorted(entries)
         self.jr = jr        # site pc -> set of targets
@@ -296,6 +351,9 @@ class Gen:
                 _, slot, kind, ws, wc = c
                 if kind == 'f':
                     self.emit(ind + 'if (c.flags[%d].on) commitFlag(c, c.flags[%d]);' % (slot, slot))
+                elif kind == 'c':  # CLIP / FCSET: only the clip flag (when a same-cycle FCSET has not taken over)
+                    if wc:
+                        self.emit(ind + 's.clip = c.flags[%d].clip;' % slot)
                 else:
                     self.emit(ind + 'commitFlag(c, c.flags[%d]);' % slot)
             elif c[0] == 'q':
@@ -386,7 +444,7 @@ class Gen:
         used = {f[1] for f in st.flags}
         new_flags = []
         upper_slot = None
-        if uk in ('fmac', 'clip'):
+        if uk == 'clip' or (uk == 'fmac' and not self.nf):
             upper_slot = free_slot(used, 8)
             if upper_slot is None:
                 self.bail(ind, 'BailFlagOverflow', pc)
@@ -396,16 +454,16 @@ class Gen:
         if shadow:
             self.emit(ind + '{ float shOld[4], shNew[4]; std::memcpy(shOld, s.vf[%d], 16);' % shadow)
         if uk in ('fmac', 'clip', 'plain'):
-            tmpl = upper_template(p.upper)
+            tmpl = upper_template(p.upper, self.nf)
             if tmpl:
                 self.emit(ind + '%s;' % tmpl)
             else:
                 self.emit(ind + 'upper(c, 0x%08xu, fr, clipQ, clipV);' % p.upper)
-            if uk == 'fmac':
+            if uk == 'fmac' and not self.nf:
                 self.emit(ind + 'c.flags[%d] = {fr.mac, fr.status, fr.extraSticky, 0, true, WSTATUS_%s, false, false, fr.queued};' % (upper_slot, name))
                 new_flags.append([4, upper_slot, 'f', True, False])
             elif uk == 'clip':
-                self.emit(ind + 'c.flags[%d] = {0, 0, 0, clipV, false, false, false, WCLIP_%s, true};' % (upper_slot, name))
+                self.emit(ind + 'c.flags[%d].clip = clipV;' % upper_slot)
                 new_flags.append([4, upper_slot, 'c', False, True])
         if shadow:
             self.emit(ind + 'std::memcpy(shNew, s.vf[%d], 16); std::memcpy(s.vf[%d], shOld, 16);' % (shadow, shadow))
@@ -450,7 +508,7 @@ class Gen:
             used.add(slot)
             for f in new_flags:
                 f[4] = False  # queueFcset: same-cycle entries stop writing clip
-            self.emit(ind + 'c.workingClip = 0x%xu; c.flags[%d] = {0, 0, 0, 0x%xu, false, false, false, true, true};' % (imm24, slot, imm24))
+            self.emit(ind + 'c.workingClip = 0x%xu; c.flags[%d].clip = 0x%xu;' % (imm24, slot, imm24))
             new_flags.append([4, slot, 'c', False, True])
         elif lc == 'b':
             op = lo >> 25 & 0x7f
@@ -484,7 +542,8 @@ class Gen:
         # VI registers hold 16 bits (the queued write lands as int16_t).
         if written_vi:
             self.emit(ind + 's.vi[%d] = static_cast<int16_t>(s.vi[%d]);' % (written_vi, written_vi))
-        self.emit(ind + 's.vf[0][0] = 0.0f; s.vf[0][1] = 0.0f; s.vf[0][2] = 0.0f; s.vf[0][3] = 1.0f; s.vi[0] = 0;')
+        if may_write_reg0(p, lc, uk):
+            self.emit(ind + 's.vf[0][0] = 0.0f; s.vf[0][1] = 0.0f; s.vf[0][2] = 0.0f; s.vf[0][3] = 1.0f; s.vi[0] = 0;')
         if next_backup:
             self.emit(ind + 'bk = bkOld%s;' % name)
 
@@ -521,8 +580,6 @@ class Gen:
         for f in new_flags:
             if f[2] == 'f':
                 self.out_consts.append('constexpr bool WSTATUS_%s = %s;' % (name, 'true' if f[3] else 'false'))
-            elif f[2] == 'c' and uk == 'clip' and f[1] == upper_slot:
-                self.out_consts.append('constexpr bool WCLIP_%s = %s;' % (name, 'true' if f[4] else 'false'))
         if lc == 'imm':
             self.out_consts.append('constexpr uint32_t kImm%s = 0x%08xu;' % (name, p.lower))
 
@@ -578,7 +635,10 @@ class Gen:
         sim = st.copy()
         for _ in range(rem_live):
             self.emit_commits(tick(sim), ind)
-        self.emit(ind + '{ const uint32_t fl = c.flagsLive ? %du : %du;' % (rem_live, rem_dead))
+        if self.nf:
+            self.emit(ind + '{ const uint32_t fl = %du;' % rem_dead)
+        else:
+            self.emit(ind + '{ const uint32_t fl = c.flagsLive ? %du : %du;' % (rem_live, rem_dead))
         self.emit(ind + '  if (!advance(c, fl)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % next_pc)
         self.emit(ind + '  uint32_t extra = 0; while (c.kick.active) { if (!advance(c, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; } ++extra; }' % next_pc)
         self.emit(ind + '  const uint32_t total = fl + extra;')
@@ -629,6 +689,7 @@ def main():
     ap.add_argument('--prof', default=os.path.join('out', 'vu1prof'))
     ap.add_argument('--keys', default='')
     ap.add_argument('--out', default=os.path.join('ps2xRuntime', 'src', 'lib', 'vu', 'aot'))
+    ap.add_argument('--with-flags', action='store_true', help='also compute MAC / status flags (images that read them)')
     args = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import vu1reach
@@ -663,7 +724,7 @@ def main():
             ent |= set(entries[hh])
             for site, ts in jr[hh].items():
                 jrt[site] |= ts
-        g = Gen(key, pairs, ent, jrt)
+        g = Gen(key, pairs, ent, jrt, not args.with_flags)
         starts = g.generate()
         fn = 'prog_%s' % key
         lines = ['// Generated by tools/vu1aot/vu1gen.py from out/vu1prof/code_%s.bin. Do not edit.' % h,
@@ -695,7 +756,8 @@ def main():
     if table:
         tl.append('const Program kPrograms[] = {')
         for key, fn, pcs, code, ent in table:
-            tl.append('    {"%s", kPcs_%s, kWords_%s, %d, kEntries_%s, %d, %s},' % (key, key, key, len(pcs), key, len(ent), fn))
+            tl.append('    {"%s", kPcs_%s, kWords_%s, %d, kEntries_%s, %d, %s, %s},' % (key, key, key, len(pcs), key, len(ent), fn,
+                                                                            'false' if args.with_flags else 'true'))
         tl += ['};', 'const uint32_t kProgramCount = %d;' % len(table)]
     else:
         tl += ['const Program kPrograms[1] = {};', 'const uint32_t kProgramCount = 0;']

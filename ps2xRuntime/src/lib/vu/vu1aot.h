@@ -108,74 +108,77 @@ namespace vu1aot
         c.kick.credit = 1u; // XGKICK's issue cycle counts toward PATH1 (startXgkick)
     }
 
-    // One VU cycle of PATH1 (progressXgkick). Returns false on a packet the interpreter rejects.
-    inline bool kickCycle(Ctx &c)
+    // One qword of PATH1 (progressXgkick: one per 2 VU cycles of credit). Returns false on a packet the interpreter
+    // rejects.
+    inline bool kickQword(Ctx &c)
     {
         Kick &k = c.kick;
-        ++k.credit;
-        while (k.active && k.credit >= 2u)
+        if (k.copied > 0x10000u - 16u)
+            return false;
+        const uint32_t qwordOffset = k.copied;
+        const uint32_t firstSource = (k.source + k.copied) % c.dataSize;
+        if (firstSource + 16u <= c.dataSize)
+            std::memcpy(c.kickBuf + k.copied, c.data + firstSource, 16u);
+        else
+            for (uint32_t i = 0; i < 16u; ++i)
+                c.kickBuf[k.copied + i] = c.data[(k.source + k.copied + i) % c.dataSize];
+        k.copied += 16u;
+        if (k.tagEnd == 0u)
         {
-            k.credit -= 2u;
-            if (k.copied > 0x10000u - 16u)
-                return false;
-            const uint32_t qwordOffset = k.copied;
-            const uint32_t firstSource = (k.source + k.copied) % c.dataSize;
-            if (firstSource + 16u <= c.dataSize)
-                std::memcpy(c.kickBuf + k.copied, c.data + firstSource, 16u);
+            uint64_t tagLo = 0;
+            std::memcpy(&tagLo, c.kickBuf + qwordOffset, sizeof(tagLo));
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            uint64_t tagBytes = 16u;
+            if (format == 0u)
+                tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
+            else if (format == 1u)
+                tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
             else
-                for (uint32_t i = 0; i < 16u; ++i)
-                    c.kickBuf[k.copied + i] = c.data[(k.source + k.copied + i) % c.dataSize];
-            k.copied += 16u;
-            if (k.tagEnd == 0u)
+                tagBytes += static_cast<uint64_t>(nloop) * 16u;
+            if (tagBytes > 0x10000u - qwordOffset)
+                return false;
+            k.tagEnd = qwordOffset + static_cast<uint32_t>(tagBytes);
+            k.tagEop = ((tagLo >> 15) & 1u) != 0u;
+            if (k.tagEop)
+                k.total = k.tagEnd;
+        }
+        if (k.copied >= k.tagEnd)
+        {
+            if (k.tagEop)
             {
-                uint64_t tagLo = 0;
-                std::memcpy(&tagLo, c.kickBuf + qwordOffset, sizeof(tagLo));
-                const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
-                const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
-                uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
-                if (nreg == 0u)
-                    nreg = 16u;
-                uint64_t tagBytes = 16u;
-                if (format == 0u)
-                    tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
-                else if (format == 1u)
-                    tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-                else
-                    tagBytes += static_cast<uint64_t>(nloop) * 16u;
-                if (tagBytes > 0x10000u - qwordOffset)
-                    return false;
-                k.tagEnd = qwordOffset + static_cast<uint32_t>(tagBytes);
-                k.tagEop = ((tagLo >> 15) & 1u) != 0u;
-                if (k.tagEop)
-                    k.total = k.tagEnd;
+                c.packets.insert(c.packets.end(), c.kickBuf, c.kickBuf + k.total);
+                c.packetSizes.push_back(k.total);
+                k.active = false;
             }
-            if (k.copied >= k.tagEnd)
+            else
             {
-                if (k.tagEop)
-                {
-                    c.packets.insert(c.packets.end(), c.kickBuf, c.kickBuf + k.total);
-                    c.packetSizes.push_back(k.total);
-                    k.active = false;
-                }
-                else
-                {
-                    k.tagEnd = 0u;
-                    k.tagEop = false;
-                }
+                k.tagEnd = 0u;
+                k.tagEop = false;
             }
         }
         return true;
     }
 
-    // n VU cycles pass (stall cycles or the cycle a pair takes).
+    // n VU cycles pass (stall cycles or the cycle a pair takes). progressXgkick runs every cycle: +1 credit, then a
+    // qword per 2 credits while the packet lasts. Nothing between those cycles looks at the transfer, so the n
+    // credits go in at once (same qwords, same credit left; after the packet ends the credit no longer matters:
+    // kickStart resets it). A rejected packet bails, and the interpreter redoes the run.
     VU1AOT_INLINE bool advance(Ctx &c, uint32_t n)
     {
         c.cycles += n;
         if (!c.kick.active)
             return true;
-        for (uint32_t i = 0; i < n; ++i)
-            if (!kickCycle(c))
+        c.kick.credit += n;
+        while (c.kick.active && c.kick.credit >= 2u)
+        {
+            c.kick.credit -= 2u;
+            if (!kickQword(c))
                 return false;
+        }
         return true;
     }
 
@@ -310,6 +313,7 @@ namespace vu1aot
         const uint32_t *entries;      // entry PCs the native code covers
         uint32_t entryCount;
         ProgramFn run;
+        bool flagsFree;               // generated without MAC / status flags: runs only when no instruction reads them
     };
 
     extern const Program kPrograms[];

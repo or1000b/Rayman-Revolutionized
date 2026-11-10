@@ -65,8 +65,8 @@ namespace vu1aot
             uint32_t productSticky = 0u;
             if constexpr (productSum)
             {
-                const float maximum = std::numeric_limits<float>::max();
-                const float minimum = std::numeric_limits<float>::min();
+                constexpr float maximum = std::numeric_limits<float>::max();
+                constexpr float minimum = std::numeric_limits<float>::min();
                 for (uint32_t k = 0; k < 4u; ++k)
                 {
                     if ((DEST & laneBit(k)) == 0u)
@@ -314,15 +314,24 @@ namespace vu1aot
                 lowerPlain(c, I); // the rest: the generic copy
         }
 
-        // ---------------------------------------------------------------- SSE fast path (flags not live)
+        // ---------------------------------------------------------------- SSE path (flags not live)
         //
-        // The same arithmetic on 4 lanes at once: SSE computes each lane exactly like the scalar instruction (same
-        // rounding mode, round toward zero; operands clamped like vuNormalizeOperand; multiply and add rounded
-        // separately). The interpreter keeps a lane's float result when its exponent is in 1..253 (and, for MADD /
-        // MSUB, no product overflowed and the result is not much smaller than ACC: exponent + 20 >= ACC exponent);
-        // then the MAC / status flags are only signs, and nothing reads them when flags are not live (Rayman's VU1
-        // code never reads them). Any other lane: the exact scalar template does the whole instruction (registers are
-        // untouched until the store). OPMSUB / OPMULA always take the interpreter's exact path, so they stay scalar.
+        // The FMAC family on 4 lanes at once, bit-exact with the interpreter when no instruction of the image reads the
+        // MAC / status flags (the interpreter's macStatusUnread: it computes no flags, and neither does this). SSE
+        // rounds each lane like the scalar instruction (the native run sets round toward zero, as the interpreter's run
+        // does; operands clamped like vuNormalizeOperand; multiply and add rounded separately). What the interpreter
+        // then writes (fmacFinish: the float result, except where normalizeFmacExactResult replaces it):
+        //  - ADD / SUB / MUL: the float result, but a zero or a result below FLT_MIN (exponent 0) keeps only its sign.
+        //    In round toward zero an exact result below FLT_MIN is what the float result holds (the sum of two floats
+        //    there is exact, a product rounds toward zero keeping its sign), and an overflow gives +-FLT_MAX, which the
+        //    interpreter writes too.
+        //  - MADD / MSUB: the float result where the interpreter's fast test holds (exponent 2..253, no product above
+        //    FLT_MAX, exponent + 20 >= ACC exponent); elsewhere the exact (double) result decides: zero or below
+        //    FLT_MIN -> its sign, above FLT_MAX -> +-FLT_MAX, else the float result. A product that may overflow takes
+        //    the scalar template (rare).
+        //  - MAX / MINI: _mm_max_ps / _mm_min_ps are (a > b) ? a : b and (a < b) ? a : b, the interpreter's
+        //    expressions (no NaN after clamping).
+        //  - OPMSUB / OPMULA always take the interpreter's exact path: the scalar template.
 
         VU1AOT_INLINE __m128i nz4i(__m128i b)
         {
@@ -336,8 +345,17 @@ namespace vu1aot
 
         VU1AOT_INLINE __m128i exp4(__m128 v) { return _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(v), 23), _mm_set1_epi32(0xFF)); }
 
-        // DEST (0x8 = x) -> SSE lane bits (bit 0 = x), for movemask / blends.
+        VU1AOT_INLINE __m128 signBit4() { return _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))); }
+
+        // DEST (0x8 = x) -> SSE lane bits (bit 0 = x), for movemask / blends. Use it in constant expressions only.
         constexpr int laneMask(uint8_t dest) { return ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8); }
+
+        // Lane bits (bit 0 = x) -> a lane mask (all ones in the lanes set).
+        VU1AOT_INLINE __m128 bitsMask(int bits)
+        {
+            const __m128i sel = _mm_setr_epi32(1, 2, 4, 8);
+            return _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(bits), sel), sel));
+        }
 
         template <uint8_t DEST>
         VU1AOT_INLINE void store4(float *dst, __m128 r)
@@ -349,81 +367,114 @@ namespace vu1aot
                 _mm_storeu_ps(dst, _mm_blend_ps(_mm_loadu_ps(dst), r, m));
         }
 
-        template <Op OP, YSource Y, uint8_t DEST, uint8_t FS, uint8_t FT, uint8_t FD, uint8_t BC, bool TOACC, uint32_t INSTR>
-        VU1AOT_INLINE void fmacSse(Ctx &c, FlagResult &flags)
+        // The second operand of every lane, clamped (yOperand for 4 lanes; not YCross).
+        template <YSource Y, uint8_t FT, uint8_t BC>
+        VU1AOT_INLINE __m128 yOperand4(const Ctx &c)
         {
-            if constexpr (OP == Op::OpMsub || OP == Op::OpMula)
+            if constexpr (Y == YBc)
             {
-                fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
+                const __m128 t = nz4(c.s.vf[FT]);
+                return _mm_shuffle_ps(t, t, _MM_SHUFFLE(BC, BC, BC, BC));
+            }
+            else if constexpr (Y == YQ)
+                return _mm_set1_ps(nz(c.s.q));
+            else if constexpr (Y == YI)
+                return _mm_set1_ps(nz(c.s.i));
+            else
+                return nz4(c.s.vf[FT]);
+        }
+
+        // An FMAC-family instruction with flags not live (the caller knows: c.flagsLive is false).
+        template <Op OP, YSource Y, uint8_t DEST, uint8_t FS, uint8_t FT, uint8_t FD, uint8_t BC, bool TOACC, uint32_t INSTR>
+        VU1AOT_INLINE void fmacNf(Ctx &c)
+        {
+            if constexpr (OP == Op::OpMsub || OP == Op::OpMula || Y == YCross)
+            {
+                FlagResult unused;
+                fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, unused);
             }
             else
             {
-                if (c.flagsLive)
-                {
-                    fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
-                    return;
-                }
-                flags = {};
+                constexpr int M = laneMask(DEST);
                 const __m128 vs = nz4(c.s.vf[FS]);
-                __m128 y;
-                if constexpr (Y == YBc)
-                {
-                    const __m128 t = nz4(c.s.vf[FT]);
-                    y = _mm_shuffle_ps(t, t, _MM_SHUFFLE(BC, BC, BC, BC));
-                }
-                else if constexpr (Y == YQ)
-                    y = _mm_set1_ps(nz(c.s.q));
-                else if constexpr (Y == YI)
-                    y = _mm_set1_ps(nz(c.s.i));
-                else
-                    y = nz4(c.s.vf[FT]);
+                const __m128 y = yOperand4<Y, FT, BC>(c);
                 float *dst = TOACC ? c.s.acc : c.s.vf[FD];
                 if constexpr (OP == Op::Max)
                     store4<DEST>(dst, _mm_max_ps(vs, y)); // (vs > y) ? vs : y
                 else if constexpr (OP == Op::Min)
                     store4<DEST>(dst, _mm_min_ps(vs, y)); // (vs < y) ? vs : y
-                else
+                else if constexpr (OP == Op::Add || OP == Op::Sub || OP == Op::Mul)
                 {
                     __m128 r;
-                    __m128i ok;
-                    if constexpr (OP == Op::Add || OP == Op::Sub || OP == Op::Mul)
-                    {
-                        if constexpr (OP == Op::Add)
-                            r = _mm_add_ps(vs, y);
-                        else if constexpr (OP == Op::Sub)
-                            r = _mm_sub_ps(vs, y);
-                        else
-                            r = _mm_mul_ps(vs, y);
-                        const __m128i e = exp4(r);
-                        ok = _mm_and_si128(_mm_cmpgt_epi32(e, _mm_setzero_si128()), _mm_cmplt_epi32(e, _mm_set1_epi32(254)));
-                    }
+                    if constexpr (OP == Op::Add)
+                        r = _mm_add_ps(vs, y);
+                    else if constexpr (OP == Op::Sub)
+                        r = _mm_sub_ps(vs, y);
                     else
+                        r = _mm_mul_ps(vs, y);
+                    const __m128 tiny = _mm_castsi128_ps(_mm_cmpeq_epi32(exp4(r), _mm_setzero_si128()));
+                    store4<DEST>(dst, _mm_blendv_ps(r, _mm_and_ps(r, signBit4()), tiny));
+                }
+                else
+                {
+                    const __m128 acc = nz4(c.s.acc);
+                    const __m128 product = _mm_mul_ps(vs, y);
+                    __m128 r;
+                    if constexpr (OP == Op::MAdd)
+                        r = _mm_add_ps(acc, product);
+                    else
+                        r = _mm_sub_ps(acc, product);
+                    // No product can overflow when the exponents sum to at most 379 (|vs * y| < 2^127).
+                    const __m128i esum = _mm_add_epi32(exp4(vs), exp4(y));
+                    if ((_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(esum, _mm_set1_epi32(379)))) & M) != 0)
                     {
-                        const __m128 acc = nz4(c.s.acc);
+                        FlagResult unused;
+                        fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, unused);
+                        return;
+                    }
+                    const __m128i er = exp4(r);
+                    __m128i fast = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_set1_epi32(1)), _mm_cmplt_epi32(er, _mm_set1_epi32(254)));
+                    fast = _mm_and_si128(fast, _mm_cmpgt_epi32(_mm_add_epi32(er, _mm_set1_epi32(21)), exp4(acc)));
+                    const int slow = ~_mm_movemask_ps(_mm_castsi128_ps(fast)) & M;
+                    if (slow != 0)
+                    {
+                        // normalizeFmacExactResult: the double result (the product of two floats is exact in double).
+                        constexpr double maximum = static_cast<double>(std::numeric_limits<float>::max());
+                        constexpr double minimum = static_cast<double>(std::numeric_limits<float>::min());
+                        const __m256d p = _mm256_mul_pd(_mm256_cvtps_pd(vs), _mm256_cvtps_pd(y));
+                        const __m256d a = _mm256_cvtps_pd(acc);
+                        __m256d d;
                         if constexpr (OP == Op::MAdd)
-                            r = _mm_add_ps(acc, _mm_mul_ps(vs, y));
+                            d = _mm256_add_pd(a, p);
                         else
-                            r = _mm_sub_ps(acc, _mm_mul_ps(vs, y));
-                        // No product can overflow when the exponents sum to at most 379 (|vs * y| < 2^127).
-                        const __m128i esum = _mm_add_epi32(exp4(vs), exp4(y));
-                        if ((_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(esum, _mm_set1_epi32(379)))) & laneMask(DEST)) != 0)
-                        {
-                            fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
-                            return;
-                        }
-                        const __m128i er = exp4(r);
-                        ok = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_set1_epi32(1)), _mm_cmplt_epi32(er, _mm_set1_epi32(254)));
-                        ok = _mm_and_si128(ok, _mm_cmpgt_epi32(_mm_add_epi32(er, _mm_set1_epi32(21)), exp4(acc)));
+                            d = _mm256_sub_pd(a, p);
+                        const __m256d magnitude = _mm256_andnot_pd(_mm256_set1_pd(-0.0), d);
+                        const int below = _mm256_movemask_pd(_mm256_cmp_pd(magnitude, _mm256_set1_pd(minimum), _CMP_LT_OQ));
+                        const int above = _mm256_movemask_pd(_mm256_cmp_pd(magnitude, _mm256_set1_pd(maximum), _CMP_GT_OQ));
+                        const __m128 sign = _mm_and_ps(bitsMask(_mm256_movemask_pd(d)), signBit4());
+                        r = _mm_blendv_ps(r, sign, bitsMask(slow & below));
+                        r = _mm_blendv_ps(r, _mm_or_ps(sign, _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF))), bitsMask(slow & above));
                     }
-                    if ((_mm_movemask_ps(_mm_castsi128_ps(ok)) & laneMask(DEST)) == laneMask(DEST))
-                        store4<DEST>(dst, r);
-                    else
-                        fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
+                    store4<DEST>(dst, r);
                 }
             }
         }
 
-        // ITOF0 / 4 / 12 / 15 (special 0x10..0x13): static_cast<float>(int) [/ 16 / 4096 / 32768] into FT.
+        // The same with the flag result of the generic path (programs generated for both: flags live or not).
+        template <Op OP, YSource Y, uint8_t DEST, uint8_t FS, uint8_t FT, uint8_t FD, uint8_t BC, bool TOACC, uint32_t INSTR>
+        VU1AOT_INLINE void fmacSse(Ctx &c, FlagResult &flags)
+        {
+            if (c.flagsLive)
+            {
+                fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
+                return;
+            }
+            flags = {};
+            fmacNf<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c);
+        }
+
+        // ITOF0 / 4 / 12 / 15 (special 0x10..0x13): static_cast<float>(int) [/ 16 / 4096 / 32768] into FT (the division
+        // by a power of two is exact).
         template <uint8_t SC, uint8_t DEST, uint8_t FS, uint8_t FT>
         VU1AOT_INLINE void itof(Ctx &c)
         {
@@ -437,11 +488,46 @@ namespace vu1aot
             store4<DEST>(c.s.vf[FT], r);
         }
 
+        // FTOI0 / 4 / 12 / 15 (special 0x14..0x17): vuFloatToInt of the clamped operand into FT: the double product
+        // with the scale, >= INT32_MAX -> INT32_MAX, <= INT32_MIN -> INT32_MIN, else truncated. The truncating
+        // conversion gives 0x80000000 (INT32_MIN) for everything at or below INT32_MIN.
+        template <uint8_t SC, uint8_t DEST, uint8_t FS, uint8_t FT>
+        VU1AOT_INLINE void ftoi(Ctx &c)
+        {
+            __m256d d = _mm256_cvtps_pd(nz4(c.s.vf[FS]));
+            if constexpr (SC == 1)
+                d = _mm256_mul_pd(d, _mm256_set1_pd(16.0));
+            else if constexpr (SC == 2)
+                d = _mm256_mul_pd(d, _mm256_set1_pd(4096.0));
+            else if constexpr (SC == 3)
+                d = _mm256_mul_pd(d, _mm256_set1_pd(32768.0));
+            d = _mm256_min_pd(d, _mm256_set1_pd(2147483647.0));
+            store4<DEST>(c.s.vf[FT], _mm_castsi128_ps(_mm256_cvttpd_epi32(d)));
+        }
+
         // ABS (special 0x1D): fabs of the clamped operand into FT.
         template <uint8_t DEST, uint8_t FS, uint8_t FT>
         VU1AOT_INLINE void absT(Ctx &c)
         {
             store4<DEST>(c.s.vf[FT], _mm_and_ps(nz4(c.s.vf[FS]), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))));
+        }
+
+        // CLIP (special 0x1F): x, y, z (raw bits, as signed integers) against +|w| and -|w|, six bits shifted into the
+        // working clip (queueClip); the flag entry carries the new value.
+        template <uint8_t FS, uint8_t FT>
+        VU1AOT_INLINE void clipT(Ctx &c, uint32_t &clip)
+        {
+            uint32_t wBits = 0u;
+            std::memcpy(&wBits, &c.s.vf[FT][3], sizeof(wBits));
+            const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(c.s.vf[FS]));
+            const __m128i l = _mm_set1_epi32(limit);
+            const int pos = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(v, l))) & 7;
+            const int neg = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(_mm_xor_si128(v, _mm_castps_si128(signBit4())), l))) & 7;
+            static constexpr uint8_t spread[8] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15}; // x, y, z -> bits 0, 2, 4
+            const uint32_t f = static_cast<uint32_t>(spread[pos]) | (static_cast<uint32_t>(spread[neg]) << 1);
+            c.workingClip = ((c.workingClip << 6) | f) & 0xFFFFFFu;
+            clip = c.workingClip;
         }
     }
 }

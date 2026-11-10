@@ -380,7 +380,7 @@ namespace
         CloseHandle(thread);
 
         HANDLE process = GetCurrentProcess();
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
         SymInitialize(process, nullptr, TRUE);
         alignas(SYMBOL_INFO) char symBuf[sizeof(SYMBOL_INFO) + 512];
         std::unordered_map<DWORD64, std::string> names;
@@ -411,17 +411,45 @@ namespace
                 }
             }
         }
+        // Exclusive samples by source line (file:line of the sampled instruction; inlined code reports the line of the
+        // inlined function), to see what is hot inside one big function.
+        std::unordered_map<std::string, uint32_t> lines;
+        {
+            std::unordered_map<DWORD64, std::string> lineNames;
+            for (const auto &s : samples)
+            {
+                auto it = lineNames.find(s[0]);
+                if (it == lineNames.end())
+                {
+                    IMAGEHLP_LINE64 line = {};
+                    line.SizeOfStruct = sizeof(line);
+                    DWORD lineDisp = 0;
+                    std::string where = "?";
+                    if (SymGetLineFromAddr64(process, s[0], &lineDisp, &line) && line.FileName)
+                    {
+                        const char *file = line.FileName;
+                        for (const char *p = line.FileName; *p; ++p)
+                            if (*p == '\\' || *p == '/')
+                                file = p + 1;
+                        where = std::string(file) + ":" + std::to_string(line.LineNumber);
+                    }
+                    it = lineNames.emplace(s[0], where + "  " + nameOf(s[0])).first;
+                }
+                ++lines[it->second];
+            }
+        }
         SymCleanup(process);
-        auto print = [&](const char *title, const std::unordered_map<std::string, uint32_t> &table) {
+        auto print = [&](const char *title, const std::unordered_map<std::string, uint32_t> &table, size_t maxRows) {
             std::vector<std::pair<std::string, uint32_t>> rows(table.begin(), table.end());
             std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
             std::fprintf(stderr, "[nprof] %s (%zu samples):\n", title, samples.size());
-            for (size_t i = 0; i < rows.size() && i < 45; ++i)
+            for (size_t i = 0; i < rows.size() && i < maxRows; ++i)
                 std::fprintf(stderr, "[nprof]   %5.1f%%  %s\n", 100.0 * rows[i].second / std::max<size_t>(1, samples.size()),
                              rows[i].first.c_str());
         };
-        print("exclusive", exclusive);
-        print("inclusive", inclusive);
+        print("exclusive", exclusive, 45);
+        print("inclusive", inclusive, 45);
+        print("exclusive by line", lines, 120);
         std::fflush(stderr);
     }
 #else

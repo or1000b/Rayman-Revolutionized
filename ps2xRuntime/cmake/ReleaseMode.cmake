@@ -1,5 +1,12 @@
 include(CheckIPOSupported)
 
+# Incremental link-time code generation: a relink code-generates again only the object files that changed (a full
+# /LTCG redoes the whole game, about 20 minutes). CMake's IPO property adds /LTCG to the link; replace it.
+if(MSVC)
+    set(CMAKE_C_LINK_OPTIONS_IPO "/INCREMENTAL:NO" "/LTCG:INCREMENTAL")
+    set(CMAKE_CXX_LINK_OPTIONS_IPO "/INCREMENTAL:NO" "/LTCG:INCREMENTAL")
+endif()
+
 check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 
 function(EnableFastReleaseMode TargetName)
@@ -26,7 +33,7 @@ function(EnableFastReleaseMode TargetName)
         if(TARGET ${TargetName})
             target_link_options(${TargetName} PRIVATE
                 $<$<CONFIG:Release>:
-                    /LTCG # link-time code generation
+                    /LTCG:INCREMENTAL # link-time code generation (only for changed object files)
                     /OPT:REF # remove unreferenced
                     /OPT:ICF # fold identical COMDATs
                 >

@@ -103,7 +103,7 @@ code per image: from the profiled entries, following branches and the profiled J
   after its VSync); `vu1_hash` only compares lines before the frame budget.
 - All 10 programs generate (node counts ~1.15x pairs; only JR switch defaults can bail).
 - Next: diff + switch on the other 9 programs; then speed (SSE for the FMAC fast path, registers in locals, fewer
-  helper calls).
+  helper calls). Done: see the sections below.
 
 ## Floating point: /fp:precise for all VU code (2026-11-10)
 
@@ -126,3 +126,36 @@ code per image: from the profiled entries, following branches and the profiled J
 - Diff mode, all 5 scenarios: 2.88 million runs compared, 0 differences (5 budget bails, 4 runs not idle at entry).
 - Native, same build, interpreter-only references (`PS2X_VU1AOT=0`) vs native: every picture and VU1 hash
   identical; intro 403 -> 279 s, swim 206 -> 162 s, shoot 155 -> 130 s; first level 12.2 -> 19.3 game FPS.
+
+## Speed: SSE, flag-free programs (2026-11-10)
+
+- `[nprof]` on the first level after all 10 programs went native: the generated functions ~50% of the game thread,
+  plus helpers the compiler did not inline into those huge functions (`std::numeric_limits<float>::max` 4%,
+  `ops::laneMask` 1.2%, `kickCycle` 1.1%, the generic `upper()` 1.6%).
+- Flag-free programs (the default; `vu1gen.py --with-flags` for the old code): when no instruction of the code image
+  reads MAC / status flags, the interpreter computes none (`macStatusUnread`), so the generated code queues no FMAC
+  flag entries at all (`Program::flagsFree`; the dispatcher runs such a program only when the image's flags are not
+  live, else the interpreter). In Rayman's VU1 code flags are never read.
+- `ops::fmacNf` (vu1aot_ops.h) does the FMAC family on 4 lanes with SSE, bit-exact by construction:
+  - ADD / SUB / MUL: the float result, a result with exponent 0 keeps only its sign. In round toward zero (the
+    interpreter's mode, also set around native runs) that is exactly what normalizeFmacExactResult gives: a sum of
+    two floats below FLT_MIN is exact, a product below it keeps its sign, an overflow already gives +-FLT_MAX.
+  - MADD / MSUB: the interpreter's fast test on 4 lanes; lanes outside it take the exact (double) result on AVX
+    (zero / below FLT_MIN -> sign, above FLT_MAX -> +-FLT_MAX, else the float result). A product that may overflow
+    (exponents sum > 379) and OPMSUB / OPMULA use the scalar template.
+  - MAX / MINI: `_mm_max_ps` / `_mm_min_ps` are the interpreter's `(a > b) ? a : b` / `(a < b) ? a : b`.
+  - Templates also for ITOF, FTOI (double product, clamp, truncate), ABS and CLIP: no generic `upper()` call left.
+- Generated code: CLIP / FCSET entries commit straight to the clip register (`s.clip = ...`), VF0 / VI0 are restored
+  only after a pair that may write them (none in Rayman's programs), `advance()` adds the cycles to the XGKICK credit
+  at once instead of one call per cycle.
+- Diff mode, all 5 scenarios: 2.92 million runs compared, 0 differences (the suite now even passes in diff mode).
+  Native: every picture and VU1 hash identical; first level 20.1 -> 30.1 game FPS (the cap), intro 271 -> 217 s,
+  swim 160 -> 149 s, shoot 129 s.
+
+## Build time (2026-11-10)
+
+- The runtime is linked with link-time code generation: every link code-generated the whole game again (~20 min).
+  Now `/LTCG:INCREMENTAL` (`ps2xRuntime/cmake/ReleaseMode.cmake`, also replacing CMake's IPO `/LTCG`): a relink
+  redoes only the object files that changed.
+- The generated programs are compiled with `/GL-` (code generated at compile time, in parallel, not again at the link)
+  and `/Z7` (line numbers for the `[nprof] exclusive by line` table of `PS2X_NATIVE_PROF`; the code is the same).

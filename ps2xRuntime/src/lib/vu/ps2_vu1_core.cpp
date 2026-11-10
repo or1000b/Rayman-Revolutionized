@@ -410,7 +410,7 @@ namespace
     {
         bool flagsLive = true;
         program = vu1AotSelect(code, codeSize, memory, flagsLive);
-        if (!program)
+        if (!program || (program->flagsFree && flagsLive)) // flag-free code: only when no instruction reads the flags
         {
             ++g_vu1AotStats.notCovered;
             return false;
