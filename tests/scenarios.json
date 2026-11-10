@@ -90,8 +90,10 @@
         { "type": "log_absent", "pattern": "water=32767", "label": "the water plane stays detected (CLAUDE.md issue 13: VCALLMSR started VU0 at a garbage address, every ray test missed)" },
         { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=surface .*depth=[1-9]", "label": "Rayman does not sink through the water plane while swimming on the surface" },
         { "type": "shot", "tick": 8200, "min_variance": 100, "golden": "swim_diving.bmp", "max_diff": 20, "label": "Rayman diving, air bar shown" },
-        { "type": "shot", "tick": 8850, "min_variance": 100, "golden": "swim_back_on_beach.bmp", "max_diff": 20, "label": "Rayman back on the beach after jumping out" }
-      ]
+        { "type": "shot", "tick": 8850, "min_variance": 100, "golden": "swim_back_on_beach.bmp", "max_diff": 20, "label": "Rayman back on the beach after jumping out" },
+        { "type": "track", "metric": "air_rate", "min": -4.1, "max": -3.9, "label": "air falls 4 per real second while diving" }
+      ],
+      "env": { "PS2X_RAYMAN_TRACK": "7300,8900,5" }
     },
     {
       "name": "shoot_minisaurus",
@@ -109,6 +111,82 @@
         { "type": "shot", "tick": 7432, "min_variance": 100, "golden": "shoot_ball_flying.bmp", "region": [333, 144, 36, 36], "max_diff": 3, "label": "the energy ball flying away" },
         { "type": "shot", "tick": 7652, "min_variance": 100, "golden": "shoot_third_throw.bmp", "max_diff": 20, "label": "third throw (whole picture)" }
       ]
+    },
+    {
+      "name": "rayman_physics",
+      "description": "Load the user's save (Minisaurus Plain beach), skip Murfy's dialogue, then a standing jump, a jump with the helicopter, and 20 s of the stick held: walking on the beach, then swimming on the surface. [rayman-track] every 20 ms for the frame rate comparison (PS2X_FRAMERATE).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7350:cross:4,7500:cross:3,7525:cross:75,7650:ldown:1000",
+      "frames": 8800,
+      "env": { "PS2X_RAYMAN_TRACK": "7300,8800,1" },
+      "_note": "Ticks are 20 ms of real time at every PS2X_FRAMERATE (the harness scales guest VSyncs). Rayman stands at the same spot at 7300 in every mode.",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "track", "metric": "game_ms_per_s", "from": 7300, "to": 8800, "min": 999, "max": 1001, "label": "game time runs at real time (game clock ms per real second)" },
+        { "type": "track", "metric": "jump_airtime", "from": 7340, "to": 7480, "min": 0.86, "max": 0.96, "label": "standing jump: time in the air (original 0.92 s)" },
+        { "type": "track", "metric": "jump_height", "from": 7340, "to": 7480, "min": 2.93, "max": 3.31, "label": "standing jump: height (original 3.12, +-6%)" },
+        { "type": "track", "metric": "z_speed", "from": 7550, "to": 7590, "min": -3.32, "max": -3.0, "label": "helicopter: fall speed while the jump button is held (original -3.16 u/s, +-5%)" },
+        { "type": "track", "metric": "top_speed", "state": "ground", "from": 7650, "min": 9.0, "max": 9.75, "label": "walking speed with the stick held (original 9.38 u/s, +-4%)" },
+        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" }
+      ]
+    },
+    {
+      "name": "rayman_physics_50",
+      "description": "rayman_physics at PS2X_FRAMERATE=50: game time, jumps, walking and swimming must match the original rate.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7350:cross:4,7500:cross:3,7525:cross:75,7650:ldown:1000",
+      "frames": 8800,
+      "env": { "PS2X_RAYMAN_TRACK": "7300,8800,1", "PS2X_FRAMERATE": "50" },
+      "_note": "Ticks are 20 ms of real time at every PS2X_FRAMERATE (the harness scales guest VSyncs). Rayman stands at the same spot at 7300 in every mode.",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "track", "metric": "game_ms_per_s", "from": 7300, "to": 8800, "min": 999, "max": 1001, "label": "game time runs at real time (game clock ms per real second)" },
+        { "type": "track", "metric": "jump_airtime", "from": 7340, "to": 7480, "min": 0.86, "max": 0.96, "label": "standing jump: time in the air (original 0.92 s)" },
+        { "type": "track", "metric": "jump_height", "from": 7340, "to": 7480, "min": 2.93, "max": 3.31, "label": "standing jump: height (original 3.12, +-6%)" },
+        { "type": "track", "metric": "z_speed", "from": 7550, "to": 7590, "min": -3.32, "max": -3.0, "label": "helicopter: fall speed while the jump button is held (original -3.16 u/s, +-5%)", "known_fail": "falls 11% faster at 50 FPS (-3.50): the engine integrates once per frame (variable time step), measured 2026-11-10" },
+        { "type": "track", "metric": "top_speed", "state": "ground", "from": 7650, "min": 9.0, "max": 9.75, "label": "walking speed with the stick held (original 9.38 u/s, +-4%)" },
+        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" }
+      ]
+    },
+    {
+      "name": "rayman_physics_60",
+      "description": "rayman_physics at PS2X_FRAMERATE=60: game time, jumps, walking and swimming must match the original rate.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7350:cross:4,7500:cross:3,7525:cross:75,7650:ldown:1000",
+      "frames": 8800,
+      "env": { "PS2X_RAYMAN_TRACK": "7300,8800,1", "PS2X_FRAMERATE": "60" },
+      "_note": "Ticks are 20 ms of real time at every PS2X_FRAMERATE (the harness scales guest VSyncs). Rayman stands at the same spot at 7300 in every mode.",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "track", "metric": "game_ms_per_s", "from": 7300, "to": 8800, "min": 999, "max": 1001, "label": "game time runs at real time (game clock ms per real second)" },
+        { "type": "track", "metric": "jump_airtime", "from": 7340, "to": 7480, "min": 0.86, "max": 0.96, "label": "standing jump: time in the air (original 0.92 s)" },
+        { "type": "track", "metric": "jump_height", "from": 7340, "to": 7480, "min": 2.93, "max": 3.31, "label": "standing jump: height (original 3.12, +-6%)" },
+        { "type": "track", "metric": "z_speed", "from": 7550, "to": 7590, "min": -3.32, "max": -3.0, "label": "helicopter: fall speed while the jump button is held (original -3.16 u/s, +-5%)", "known_fail": "falls 13% faster at 60 FPS (-3.58): the engine integrates once per frame (variable time step), measured 2026-11-10" },
+        { "type": "track", "metric": "top_speed", "state": "ground", "from": 7650, "min": 9.0, "max": 9.75, "label": "walking speed with the stick held (original 9.38 u/s, +-4%)" },
+        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" }
+      ]
+    },
+    {
+      "name": "swim_tutorial_60fps",
+      "description": "swim_tutorial at PS2X_FRAMERATE=60: the same sequence of states, air falling 4 per second while diving, game time at real time.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7400:ldown:250,7900:l2:100,8000:lup:150,8110:l2:60,8260:cross:80,8400:ldown:340,8660:cross:8,8700:cross:8",
+      "frames": 8900,
+      "_note": "Fixture = the user's save of 2026-11-09 15:42 (local only, tests\fixtures). After Murfy's dialogue the camera faces away from the pool: stick down 7400 walks into the water (8048, surface; L2 pressed on land at 7900 is part of the route), L2 8110 dives (air falls 4/s from 100), X 8260 rises (surface ~8372, air back to 100 ~10 VSyncs later), stick down swims back and X jumps out onto the beach (~8730). Routes depend on small physics differences: re-check after VU / collision changes. [rayman-state] lines: main.cpp readRaymanState (CLAUDE.md issue 13).",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "log_sequence", "patterns": ["\\[rayman-state\\] .*state=surface from=(ground|air)", "\\[rayman-state\\] .*state=diving from=surface air=100\\.00", "\\[rayman-state\\] .*state=diving .*trend=falling", "\\[rayman-state\\] .*state=surface from=diving", "\\[rayman-state\\] .*state=surface .*air=100\\.00 trend=steady", "\\[rayman-state\\] .*state=air from=surface", "\\[rayman-state\\] .*state=ground from=air"], "label": "states in order: enters the water, dives with full air, air falls, surfaces, air back to 100, jumps out, lands" },
+        { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=(surface|ground|air) from=(surface|ground|air|-) .*trend=falling", "label": "air falls only while diving" },
+        { "type": "log_absent", "pattern": "water=32767", "label": "the water plane stays detected (CLAUDE.md issue 13: VCALLMSR started VU0 at a garbage address, every ray test missed)" },
+        { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=surface .*depth=[1-9]", "label": "Rayman does not sink through the water plane while swimming on the surface" },
+        { "type": "track", "metric": "game_ms_per_s", "from": 7300, "to": 8900, "min": 999, "max": 1001, "label": "game time runs at real time (game clock ms per real second)" },
+        { "type": "track", "metric": "air_rate", "min": -4.1, "max": -3.9, "label": "air falls 4 per real second while diving (original rate: 4)" }
+      ],
+      "env": { "PS2X_RAYMAN_TRACK": "7300,8900,5", "PS2X_FRAMERATE": "60" }
     }
   ]
 }

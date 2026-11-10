@@ -215,6 +215,15 @@ if ($buildOk) {
             }
         }
         $threadStats = @($threadStats)
+        # [rayman-track] lines (PS2X_RAYMAN_TRACK): t in 20 ms units of real time at every PS2X_FRAMERATE.
+        $track = @{}
+        foreach ($l in $lines) {
+            if ($l -match '\[rayman-track\] t=(\d+) .*?state=(\S+) .*?pos=([-\d.]+),([-\d.]+),([-\d.]+) air=([-\d.]+) game_ms=(\d+)') {
+                $track[[int]$Matches[1]] = [pscustomobject]@{ State = $Matches[2]; X = [double]$Matches[3]; Y = [double]$Matches[4]
+                    Z = [double]$Matches[5]; Air = [double]$Matches[6]; Ms = [double]$Matches[7] }
+            }
+        }
+        $trackTimes = @($track.Keys | Sort-Object)
         $shotFiles = @(Get-ChildItem $dir -Filter 'test_shot_*.bmp' | ForEach-Object {
                 [pscustomobject]@{ Tick = [int]($_.BaseName -replace 'test_shot_', ''); Path = $_.FullName } } | Sort-Object Tick)
 
@@ -225,6 +234,74 @@ if ($buildOk) {
                     $detail = "exit code $exitCode"
                     if ($hang) { $detail += "; " + $hang.Line + " (stacks in the log)" }
                     Write-CheckResult $sc.name $check ([string]$exitCode -eq [string]$check.expect) $detail
+                }
+                'track' {
+                    # A measurement from the [rayman-track] lines, between min and max. metric:
+                    #   game_ms_per_s  game clock ms per real second between from and to
+                    #   top_speed      horizontal speed (units/s) over 1 s windows that stay in `state` from `from` on:
+                    #                  the average of the best 10% (free movement; paths differ between frame rates)
+                    #   air_rate       air change per second over the first second of diving
+                    #   jump_airtime   seconds from the first air sample in [from, to) to the next non-air one
+                    #   jump_height    peak height of that jump above the takeoff
+                    #   z_speed        vertical speed (units/s, negative = falling): linear fit of the height over [from, to]
+                    if ($trackTimes.Count -eq 0) { Write-CheckResult $sc.name $check $false 'no [rayman-track] lines (PS2X_RAYMAN_TRACK)'; break }
+                    $value = $null
+                    switch ($check.metric) {
+                        'game_ms_per_s' {
+                            if ($track.ContainsKey([int]$check.from) -and $track.ContainsKey([int]$check.to)) {
+                                $value = ($track[[int]$check.to].Ms - $track[[int]$check.from].Ms) / (([int]$check.to - [int]$check.from) * 0.02)
+                            }
+                        }
+                        'top_speed' {
+                            $speeds = @(foreach ($t in $trackTimes) {
+                                    if ($t -lt [int]$check.from -or -not $track.ContainsKey($t + 50)) { continue }
+                                    $inState = $true
+                                    for ($k = $t; $k -le $t + 50; $k++) { if ($track.ContainsKey($k) -and $track[$k].State -ne $check.state) { $inState = $false; break } }
+                                    if ($inState) {
+                                        $a = $track[$t]; $b = $track[$t + 50]
+                                        [math]::Sqrt(($b.X - $a.X) * ($b.X - $a.X) + ($b.Y - $a.Y) * ($b.Y - $a.Y))
+                                    } }) | Sort-Object
+                            if ($speeds.Count -gt 0) {
+                                $top = @($speeds | Select-Object -Last ([math]::Max(1, [int]($speeds.Count / 10))))
+                                $value = ($top | Measure-Object -Average).Average
+                            }
+                        }
+                        'air_rate' {
+                            foreach ($t in $trackTimes) {
+                                if ($track[$t].State -ne 'diving' -or -not $track.ContainsKey($t + 50)) { continue }
+                                $all = $true
+                                for ($k = $t; $k -le $t + 50; $k++) { if ($track.ContainsKey($k) -and $track[$k].State -ne 'diving') { $all = $false; break } }
+                                if ($all) { $value = $track[$t + 50].Air - $track[$t].Air; break }
+                            }
+                        }
+                        { $_ -in 'jump_airtime', 'jump_height' } {
+                            $window = @($trackTimes | Where-Object { $_ -ge [int]$check.from -and $_ -lt [int]$check.to })
+                            $take = $window | Where-Object { $track[$_].State -eq 'air' } | Select-Object -First 1
+                            if ($null -ne $take) {
+                                $land = $window | Where-Object { $_ -gt $take -and $track[$_].State -ne 'air' } | Select-Object -First 1
+                                if ($check.metric -eq 'jump_airtime') { if ($null -ne $land) { $value = ($land - $take) * 0.02 } }
+                                else {
+                                    $z0 = if ($track.ContainsKey($take - 1)) { $track[$take - 1].Z } else { $track[$take].Z }
+                                    $end = if ($null -ne $land) { $land } else { [int]$check.to }
+                                    $value = (@($window | Where-Object { $_ -ge $take -and $_ -lt $end } | ForEach-Object { $track[$_].Z }) |
+                                        Measure-Object -Maximum).Maximum - $z0
+                                }
+                            }
+                        }
+                        'z_speed' {
+                            $pts = @($trackTimes | Where-Object { $_ -ge [int]$check.from -and $_ -le [int]$check.to })
+                            if ($pts.Count -ge 2) {
+                                $mt = ($pts | Measure-Object -Average).Average
+                                $mz = ($pts | ForEach-Object { $track[$_].Z } | Measure-Object -Average).Average
+                                $num = 0.0; $den = 0.0
+                                foreach ($t in $pts) { $num += ($t - $mt) * ($track[$t].Z - $mz); $den += ($t - $mt) * ($t - $mt) }
+                                if ($den -gt 0) { $value = $num / $den / 0.02 }
+                            }
+                        }
+                        default { Add-Result $sc.name $check.type 'FAIL' "unknown track metric '$($check.metric)'" }
+                    }
+                    if ($null -eq $value) { Write-CheckResult $sc.name $check $false "no value for $($check.metric) (phase not found)" }
+                    else { Write-CheckResult $sc.name $check (($value -ge $check.min) -and ($value -le $check.max)) ("{0} {1:N3} (allowed {2} .. {3})" -f $check.metric, $value, $check.min, $check.max) }
                 }
                 'log_absent' {
                     $hit = $lines | Select-String -Pattern $check.pattern | Select-Object -First 1

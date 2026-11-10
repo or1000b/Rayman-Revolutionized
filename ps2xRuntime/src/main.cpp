@@ -256,6 +256,7 @@ namespace
     PS2Runtime::RecompiledFunction g_raymanVBlankHandler = nullptr;
     PS2Runtime::RecompiledFunction g_raymanFrameClock = nullptr;
     uint32_t g_raymanFrameRate = 0u;
+    uint32_t g_raymanUnitHz = 0u; // clock unit = 1 / this (the frame rate; PS2X_RAYMAN_CLOCK_UNIT_HZ for experiments)
     float g_raymanOriginalUnit = 0.02f;
     int64_t g_raymanClockLastFrame = -1; // frame counter (+0x28) of the last update corrected
     uint64_t g_raymanClockRemainder = 0; // ms * N not yet counted
@@ -299,8 +300,8 @@ namespace
             const uint32_t n = raymanRam32(rdram, clock + 0x24u);
             const uint32_t gameStep = raymanRam32(rdram, clock + 0x20u);
             g_raymanClockRemainder += static_cast<uint64_t>(n) * 1000u;
-            const uint32_t exactStep = static_cast<uint32_t>(g_raymanClockRemainder / g_raymanFrameRate);
-            g_raymanClockRemainder %= g_raymanFrameRate;
+            const uint32_t exactStep = static_cast<uint32_t>(g_raymanClockRemainder / g_raymanUnitHz);
+            g_raymanClockRemainder %= g_raymanUnitHz;
             const uint32_t ms = raymanRam32(rdram, clock + 0x14u) - gameStep + exactStep;
             raymanRamWrite32(rdram, clock + 0x20u, exactStep);
             raymanRamWrite32(rdram, clock + 0x14u, ms);
@@ -321,7 +322,7 @@ namespace
             else
                 raymanClockExactStep(rdram, clock); // an update a scheduler yield left without its correction
             // The unit, as the clock's maker (0x14BBA8) sets it: +0x8 seconds, +0xC = +0x10 (1000) * that in ms.
-            const float unit = demo ? g_raymanOriginalUnit : 1.0f / static_cast<float>(g_raymanFrameRate);
+            const float unit = demo ? g_raymanOriginalUnit : 1.0f / static_cast<float>(g_raymanUnitHz);
             raymanRamWriteFloat(rdram, clock + 0x08u, unit);
             raymanRamWriteFloat(rdram, clock + 0x0Cu, static_cast<float>(raymanRam32(rdram, clock + 0x10u)) * unit);
         }
@@ -335,6 +336,10 @@ namespace
         g_raymanFrameRate = ps2xVBlankRateOverrideHz();
         if (g_raymanFrameRate == 0u)
             return;
+        g_raymanUnitHz = g_raymanFrameRate;
+        if (const char *unitHz = std::getenv("PS2X_RAYMAN_CLOCK_UNIT_HZ")) // experiments: separate unit and frame rate
+            if (const long hz = std::strtol(unitHz, nullptr, 10); hz >= 10 && hz <= 1000)
+                g_raymanUnitHz = static_cast<uint32_t>(hz);
         const bool codeMatches = raymanRam32(rdram, kRaymanVBlankHandlerAddr) == 0x8F828E28u &&      // lw v0,-0x71d8(gp)
                                  raymanRam32(rdram, kRaymanVBlankHandlerAddr + 4u) == 0x24420001u && // addiu v0,v0,1
                                  raymanRam32(rdram, kRaymanVBlankHandlerAddr + 8u) == 0xAF828E28u && // sw v0,-0x71d8(gp)
@@ -348,14 +353,14 @@ namespace
             return;
         }
         std::memcpy(&g_raymanOriginalUnit, rdram + kRaymanClockUnitAddr, sizeof(g_raymanOriginalUnit));
-        raymanRamWriteFloat(rdram, kRaymanClockUnitAddr, 1.0f / static_cast<float>(g_raymanFrameRate));
+        raymanRamWriteFloat(rdram, kRaymanClockUnitAddr, 1.0f / static_cast<float>(g_raymanUnitHz));
         g_raymanVBlankHandler = runtime.lookupFunction(kRaymanVBlankHandlerAddr);
         g_raymanFrameClock = runtime.lookupFunction(kRaymanFrameClockAddr);
         if (g_raymanVBlankHandler && g_raymanFrameClock &&
             runtime.registerFunction(kRaymanVBlankHandlerAddr, &raymanVBlankCounterHle) &&
             runtime.registerFunction(kRaymanFrameClockAddr, &raymanFrameClockHle))
             std::cerr << "[hle] Rayman: " << g_raymanFrameRate << " FPS (VBlank " << g_raymanFrameRate
-                      << " Hz, frame cap 1 VBlank, clock unit 1/" << g_raymanFrameRate << " s, exact ms step; was "
+                      << " Hz, frame cap 1 VBlank, clock unit 1/" << g_raymanUnitHz << " s, exact ms step; was "
                       << g_raymanOriginalUnit << " s)" << std::endl;
         else
             std::cerr << "[hle] Rayman: failed to install the frame rate change" << std::endl;
