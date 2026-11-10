@@ -95,7 +95,7 @@ def upper_kind(instr):
 
 
 def upper_template(instr):
-    """ops::fmac template arguments for an FMAC-family upper instruction, or None (generic upper())."""
+    """The template call (ops::fmacSse / itof / absT) for an upper instruction, or None (generic upper())."""
     op = instr & 0x3f
     dest = instr >> 21 & 0xf
     ft = instr >> 16 & 0x1f
@@ -115,8 +115,12 @@ def upper_template(instr):
                 return None
             kind, y = table[op]
             bc = 0
-        return 'ops::fmac<ops::Op::%s, %s, 0x%x, %d, %d, %d, %d, false, 0x%08xu>' % (kind, y, dest, fs, ft, fd, bc, instr)
+        return 'ops::fmacSse<ops::Op::%s, %s, 0x%x, %d, %d, %d, %d, false, 0x%08xu>(c, fr)' % (kind, y, dest, fs, ft, fd, bc, instr)
     sp = (instr & 3) | ((instr >> 4) & 0x7c)
+    if 0x10 <= sp <= 0x13:  # ITOF0 / 4 / 12 / 15
+        return 'ops::itof<%d, 0x%x, %d, %d>(c)' % (sp & 3, dest, fs, ft)
+    if sp == 0x1d:  # ABS
+        return 'ops::absT<0x%x, %d, %d>(c)' % (dest, fs, ft)
     if sp <= 0x0f or 0x18 <= sp <= 0x1b:
         kind = {0: 'Add', 1: 'Sub', 2: 'MAdd', 3: 'MSub', 6: 'Mul'}[sp >> 2]
         y, bc = 'YBc', sp & 3
@@ -129,7 +133,7 @@ def upper_template(instr):
             return None
         kind, y = table[sp]
         bc = 0
-    return 'ops::fmac<ops::Op::%s, %s, 0x%x, %d, %d, %d, %d, true, 0x%08xu>' % (kind, y, dest, fs, ft, fd, bc, instr)
+    return 'ops::fmacSse<ops::Op::%s, %s, 0x%x, %d, %d, %d, %d, true, 0x%08xu>(c, fr)' % (kind, y, dest, fs, ft, fd, bc, instr)
 
 
 def lower_class(p):
@@ -394,7 +398,7 @@ class Gen:
         if uk in ('fmac', 'clip', 'plain'):
             tmpl = upper_template(p.upper)
             if tmpl:
-                self.emit(ind + '%s(c, fr);' % tmpl)
+                self.emit(ind + '%s;' % tmpl)
             else:
                 self.emit(ind + 'upper(c, 0x%08xu, fr, clipQ, clipV);' % p.upper)
             if uk == 'fmac':

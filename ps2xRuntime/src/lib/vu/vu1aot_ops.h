@@ -7,6 +7,8 @@
 
 #include "vu1aot.h"
 
+#include <immintrin.h>
+
 namespace vu1aot
 {
     namespace ops
@@ -310,6 +312,136 @@ namespace vu1aot
             }
             else
                 lowerPlain(c, I); // the rest: the generic copy
+        }
+
+        // ---------------------------------------------------------------- SSE fast path (flags not live)
+        //
+        // The same arithmetic on 4 lanes at once: SSE computes each lane exactly like the scalar instruction (same
+        // rounding mode, round toward zero; operands clamped like vuNormalizeOperand; multiply and add rounded
+        // separately). The interpreter keeps a lane's float result when its exponent is in 1..253 (and, for MADD /
+        // MSUB, no product overflowed and the result is not much smaller than ACC: exponent + 20 >= ACC exponent);
+        // then the MAC / status flags are only signs, and nothing reads them when flags are not live (Rayman's VU1
+        // code never reads them). Any other lane: the exact scalar template does the whole instruction (registers are
+        // untouched until the store). OPMSUB / OPMULA always take the interpreter's exact path, so they stay scalar.
+
+        VU1AOT_INLINE __m128i nz4i(__m128i b)
+        {
+            const __m128i e = _mm_and_si128(b, _mm_set1_epi32(0x7F800000));
+            const __m128i sign = _mm_and_si128(b, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+            b = _mm_blendv_epi8(b, sign, _mm_cmpeq_epi32(e, _mm_setzero_si128()));
+            return _mm_blendv_epi8(b, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7F800000)));
+        }
+
+        VU1AOT_INLINE __m128 nz4(const float *v) { return _mm_castsi128_ps(nz4i(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v)))); }
+
+        VU1AOT_INLINE __m128i exp4(__m128 v) { return _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(v), 23), _mm_set1_epi32(0xFF)); }
+
+        // DEST (0x8 = x) -> SSE lane bits (bit 0 = x), for movemask / blends.
+        constexpr int laneMask(uint8_t dest) { return ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8); }
+
+        template <uint8_t DEST>
+        VU1AOT_INLINE void store4(float *dst, __m128 r)
+        {
+            constexpr int m = laneMask(DEST);
+            if constexpr (m == 0xF)
+                _mm_storeu_ps(dst, r);
+            else if constexpr (m != 0)
+                _mm_storeu_ps(dst, _mm_blend_ps(_mm_loadu_ps(dst), r, m));
+        }
+
+        template <Op OP, YSource Y, uint8_t DEST, uint8_t FS, uint8_t FT, uint8_t FD, uint8_t BC, bool TOACC, uint32_t INSTR>
+        VU1AOT_INLINE void fmacSse(Ctx &c, FlagResult &flags)
+        {
+            if constexpr (OP == Op::OpMsub || OP == Op::OpMula)
+            {
+                fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
+            }
+            else
+            {
+                if (c.flagsLive)
+                {
+                    fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
+                    return;
+                }
+                flags = {};
+                const __m128 vs = nz4(c.s.vf[FS]);
+                __m128 y;
+                if constexpr (Y == YBc)
+                {
+                    const __m128 t = nz4(c.s.vf[FT]);
+                    y = _mm_shuffle_ps(t, t, _MM_SHUFFLE(BC, BC, BC, BC));
+                }
+                else if constexpr (Y == YQ)
+                    y = _mm_set1_ps(nz(c.s.q));
+                else if constexpr (Y == YI)
+                    y = _mm_set1_ps(nz(c.s.i));
+                else
+                    y = nz4(c.s.vf[FT]);
+                float *dst = TOACC ? c.s.acc : c.s.vf[FD];
+                if constexpr (OP == Op::Max)
+                    store4<DEST>(dst, _mm_max_ps(vs, y)); // (vs > y) ? vs : y
+                else if constexpr (OP == Op::Min)
+                    store4<DEST>(dst, _mm_min_ps(vs, y)); // (vs < y) ? vs : y
+                else
+                {
+                    __m128 r;
+                    __m128i ok;
+                    if constexpr (OP == Op::Add || OP == Op::Sub || OP == Op::Mul)
+                    {
+                        if constexpr (OP == Op::Add)
+                            r = _mm_add_ps(vs, y);
+                        else if constexpr (OP == Op::Sub)
+                            r = _mm_sub_ps(vs, y);
+                        else
+                            r = _mm_mul_ps(vs, y);
+                        const __m128i e = exp4(r);
+                        ok = _mm_and_si128(_mm_cmpgt_epi32(e, _mm_setzero_si128()), _mm_cmplt_epi32(e, _mm_set1_epi32(254)));
+                    }
+                    else
+                    {
+                        const __m128 acc = nz4(c.s.acc);
+                        if constexpr (OP == Op::MAdd)
+                            r = _mm_add_ps(acc, _mm_mul_ps(vs, y));
+                        else
+                            r = _mm_sub_ps(acc, _mm_mul_ps(vs, y));
+                        // No product can overflow when the exponents sum to at most 379 (|vs * y| < 2^127).
+                        const __m128i esum = _mm_add_epi32(exp4(vs), exp4(y));
+                        if ((_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(esum, _mm_set1_epi32(379)))) & laneMask(DEST)) != 0)
+                        {
+                            fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
+                            return;
+                        }
+                        const __m128i er = exp4(r);
+                        ok = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_set1_epi32(1)), _mm_cmplt_epi32(er, _mm_set1_epi32(254)));
+                        ok = _mm_and_si128(ok, _mm_cmpgt_epi32(_mm_add_epi32(er, _mm_set1_epi32(21)), exp4(acc)));
+                    }
+                    if ((_mm_movemask_ps(_mm_castsi128_ps(ok)) & laneMask(DEST)) == laneMask(DEST))
+                        store4<DEST>(dst, r);
+                    else
+                        fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
+                }
+            }
+        }
+
+        // ITOF0 / 4 / 12 / 15 (special 0x10..0x13): static_cast<float>(int) [/ 16 / 4096 / 32768] into FT.
+        template <uint8_t SC, uint8_t DEST, uint8_t FS, uint8_t FT>
+        VU1AOT_INLINE void itof(Ctx &c)
+        {
+            __m128 r = _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(c.s.vf[FS])));
+            if constexpr (SC == 1)
+                r = _mm_div_ps(r, _mm_set1_ps(16.0f));
+            else if constexpr (SC == 2)
+                r = _mm_div_ps(r, _mm_set1_ps(4096.0f));
+            else if constexpr (SC == 3)
+                r = _mm_div_ps(r, _mm_set1_ps(32768.0f));
+            store4<DEST>(c.s.vf[FT], r);
+        }
+
+        // ABS (special 0x1D): fabs of the clamped operand into FT.
+        template <uint8_t DEST, uint8_t FS, uint8_t FT>
+        VU1AOT_INLINE void absT(Ctx &c)
+        {
+            store4<DEST>(c.s.vf[FT], _mm_and_ps(nz4(c.s.vf[FS]), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))));
         }
     }
 }
