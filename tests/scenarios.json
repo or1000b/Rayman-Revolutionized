@@ -187,6 +187,22 @@
         { "type": "track", "metric": "air_rate", "min": -4.1, "max": -3.9, "label": "air falls 4 per real second while diving (original rate: 4)" }
       ],
       "env": { "PS2X_RAYMAN_TRACK": "7300,8900,5", "PS2X_FRAMERATE": "60" }
+    },
+    {
+      "name": "pacing_realtime",
+      "description": "Normal play (not deterministic) at PS2X_FRAMERATE=120, more than this PC draws: game time must keep wall-clock time (real-time pacing skips the missed time like a console dropping frames) instead of running in slow motion.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "deterministic": false,
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5",
+      "frames": 9000,
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_RAYMAN_TRACK": "6000,9000,30" },
+      "_note": "Not deterministic: ticks are window frames (~60 per second) and the run differs every time; the checks only look at game time against wall-clock time. PS2X_REALTIME_PACING=0 shows the old behaviour (game time falls behind).",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "log_present", "pattern": "\\[pace\\] VBlank", "label": "the host fell behind and real-time pacing skipped time (else the test had no load)" },
+        { "type": "track", "metric": "game_ms_per_host_s", "from": 6000, "to": 8970, "min": 970, "max": 1030, "label": "game time keeps wall-clock time while the host cannot keep up (game ms per wall-clock second)" }
+      ]
     }
   ]
 }

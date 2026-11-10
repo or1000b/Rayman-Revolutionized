@@ -1152,6 +1152,9 @@ namespace
             return;
         while (next <= scriptTime)
             next += cfg.step;
+        // Wall-clock ms since the first line: against game_ms it shows whether game time keeps real time (normal play).
+        static const auto hostStart = std::chrono::steady_clock::now();
+        const int64_t hostMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hostStart).count();
         const RaymanState s = readRaymanState(rdram);
         const uint32_t clock = raymanRam32(rdram, 0x0039A3F0u - 0x7108u); // [gp-0x7108]: the frame clock
         uint32_t gameMs = 0u, frames = 0u, n = 0u;
@@ -1164,10 +1167,10 @@ namespace
             std::memcpy(&gameSeconds, rdram + clock + 0x30u, sizeof(gameSeconds));
         }
         std::fprintf(stderr, "[rayman-track] t=%llu ms=%llu vsync=%llu state=%s behaviour=%d pos=%.3f,%.3f,%.3f air=%.2f "
-                             "game_ms=%u game_s=%.3f frames=%u n=%u\n",
+                             "game_ms=%u game_s=%.3f frames=%u n=%u host_ms=%lld\n",
                      static_cast<unsigned long long>(scriptTime), static_cast<unsigned long long>(scriptTime * 20u),
                      static_cast<unsigned long long>(vsync), s.state, s.behaviour, s.x, s.y, s.z, s.air, gameMs,
-                     gameSeconds, frames, n);
+                     gameSeconds, frames, n, static_cast<long long>(hostMs));
     }
 
     void installGameHle(PS2Runtime &runtime, const std::string &gameId)

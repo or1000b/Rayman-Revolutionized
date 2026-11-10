@@ -85,8 +85,29 @@ Goal (user): more frames per second without changing the game's speed: game time
 - 120 / uncapped: the host draws 60-110 FPS (guest time lags real time); at 240 Hz Rayman got stuck in the air for
   18 s (collision / ground detection with 4 ms steps); at 120 the ground state flickers once and walking is 6% slower.
 
+## Real-time pacing (2026-11-10)
+
+- Before: when the host could not finish a frame within its VBlank budget, guest time (EE cycles, which the game's
+  clock reads through timer 0) simply fell behind wall-clock time: slow motion against the music, and once the load
+  dropped the late VBlank deadlines let the guest run unthrottled until it caught up (a fast-forward).
+- Now (EeScheduler.cpp, normal play only; deterministic runs unchanged; `PS2X_REALTIME_PACING=0` = old behaviour): a
+  VBlank processed more than one period after its host time skips the missed time in whole VBlank periods: EE cycles
+  and EE timers jump to real time (at most 250 ms of game time per skip; a longer stall is dropped like a pause) and
+  the next VBlank stays on the host grid. The game sees one longer frame and steps its clock by more units, like a
+  console dropping frames. The IOP already keeps real time (wallClockDeficit), so sound is not touched. `[pace]` lines.
+- Measured (scenario `pacing_realtime`: not deterministic, PS2X_FRAMERATE=120 while the host draws 61-81 FPS): game
+  time 1000.0 ms per wall-clock second (n alternates 1 / 2); with `PS2X_REALTIME_PACING=0` 603.7 ms (40% slow motion).
+
+## VU0 native (2026-11-10)
+
+- With Rayman's collision microcode translated (docs/vu1_aot.md "VU0"): at 60 FPS the collision function 0x20C660
+  went from 18-24% to 7-11% of the game thread, idle on land 3-6% -> 13-25%; at 50 FPS idle 22-28% (steady 50). The
+  heaviest scenes at 60 (water, the beach after the swim) still drop to 36-56 FPS, now bound by VU1 (~25%) and GS
+  (~25%); with real-time pacing those drops no longer slow the game down.
+
 ## Tests
 
 `rayman_physics` (original), `rayman_physics_50`, `rayman_physics_60`, `swim_tutorial_60fps` (scenarios.json, check
 type `track` in run_tests.ps1: game_ms_per_s, top_speed, air_rate, jump_airtime, jump_height, z_speed). The helicopter
-check is KNOWN-FAIL at 50 / 60 (integration step), PASS at the original rate.
+check is KNOWN-FAIL at 50 / 60 (integration step), PASS at the original rate. `pacing_realtime` (not deterministic):
+game time per wall-clock second while the host is overloaded (metric game_ms_per_host_s, host_ms in [rayman-track]).

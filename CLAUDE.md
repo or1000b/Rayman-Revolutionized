@@ -64,6 +64,7 @@
   - EE->IOP RPC is synchronous (`IopRpcBridge::handleRpc`).
   - IOP->EE RPC is implemented in `services/iop_rpc.cpp` (sifcmd 15/16/18) and `Kernel/Syscalls/RPC.cpp` (`SifRegisterRpc` reads cfunc/cbuf/qd from `$8-$10`; queue-walk fallback).
   - Real-time pacing: a wall-clock floor in `runEeCycles`.
+  - EE real-time pacing (EeScheduler.cpp, normal play only, 2026-11-10): a VBlank more than one period late skips the missed EE time (cycles + EE timers, at most 250 ms per skip), so an overloaded host drops frames like a console instead of running the game in slow motion and then fast-forwarding. `[pace]` lines; `PS2X_REALTIME_PACING=0` turns it off; deterministic runs never skip (docs/framerate.md).
   - Stacks are filled with "self-pointer garbage" (`fillStackGarbage`). UBISOUND reads an uninitialised stack flag during voice init and only works with garbage there.
 - **UBISOUND protocol**:
   - EE->IOP: sid `0x65653269` ("ee2i"), `function = (module<<16)|cmd`. Request is `[outSize][inSize][data]`, reply is `[result][data]`. Init is `0x00010000`.

@@ -222,6 +222,19 @@ namespace
         std::chrono::nanoseconds host;
     };
 
+    // Real-time pacing (normal play; PS2X_REALTIME_PACING=0 turns it off; deterministic runs never use it).
+    bool realTimePacing()
+    {
+        static const bool on = []
+        {
+            const char *env = std::getenv("PS2X_REALTIME_PACING");
+            return !ps2xDeterministic() && !(env && std::strcmp(env, "0") == 0);
+        }();
+        return on;
+    }
+    uint64_t g_paceSkips = 0;          // VBlanks that came late and skipped time
+    uint64_t g_paceSkippedPeriods = 0; // VBlank periods skipped in all
+
     VBlankPeriod vblankPeriod(PS2Runtime &runtime)
     {
         if (const uint32_t hz = ps2xVBlankRateOverrideHz())
@@ -2220,8 +2233,39 @@ void EeScheduler::processDueDeadlines()
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 const VBlankPeriod period = vblankPeriod(m_runtime);
-                scheduleEvent(scheduled.deadlineCycle + period.cycles,
-                              scheduled.hostDeadline + period.host,
+                // Real-time pacing: a VBlank processed more than one period after its host time means the host could
+                // not keep up (a heavy frame). Instead of running behind real time (slow motion against the music,
+                // then a fast catch-up once the load drops), skip the missed time like a console that drops frames:
+                // EE time (cycles and EE timers, which the game's clock reads) jumps to real time in whole VBlank
+                // periods and the next VBlank stays on the grid. The game sees one longer frame and steps its clock
+                // by that much. The IOP keeps real time on its own (iop_emulator.cpp wallClockDeficit).
+                uint64_t skipCycles = 0u;
+                std::chrono::nanoseconds skipHost{0};
+                if (realTimePacing())
+                {
+                    const auto late = std::chrono::steady_clock::now() - scheduled.hostDeadline;
+                    if (late > period.host)
+                    {
+                        // At most 250 ms of game time per skip; a longer stall (window dragged, debugger, disk) is
+                        // dropped like a pause instead of one huge game step. The host grid moves by the whole lag.
+                        const uint64_t periods = static_cast<uint64_t>(late / period.host);
+                        const uint64_t maxPeriods = std::max<uint64_t>(1u, static_cast<uint64_t>(std::chrono::milliseconds(250) / period.host));
+                        skipCycles = std::min(periods, maxPeriods) * period.cycles;
+                        skipHost = period.host * static_cast<int64_t>(periods);
+                        m_eeCycle += skipCycles;
+                        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(skipCycles);
+                        ++g_paceSkips;
+                        g_paceSkippedPeriods += periods;
+                        if (g_paceSkips <= 10u || (g_paceSkips % 200u) == 0u)
+                            std::fprintf(stderr, "[pace] VBlank %llu late by %.1f ms: skipped %llu period(s) (%llu skips, %llu periods so far)\n",
+                                         static_cast<unsigned long long>(m_vsyncTick + 1u),
+                                         std::chrono::duration<double, std::milli>(late).count(),
+                                         static_cast<unsigned long long>(periods), static_cast<unsigned long long>(g_paceSkips),
+                                         static_cast<unsigned long long>(g_paceSkippedPeriods));
+                    }
+                }
+                scheduleEvent(scheduled.deadlineCycle + skipCycles + period.cycles,
+                              scheduled.hostDeadline + skipHost + period.host,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

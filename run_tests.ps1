@@ -218,9 +218,10 @@ if ($buildOk) {
         # [rayman-track] lines (PS2X_RAYMAN_TRACK): t in 20 ms units of real time at every PS2X_FRAMERATE.
         $track = @{}
         foreach ($l in $lines) {
-            if ($l -match '\[rayman-track\] t=(\d+) .*?state=(\S+) .*?pos=([-\d.]+),([-\d.]+),([-\d.]+) air=([-\d.]+) game_ms=(\d+)') {
+            if ($l -match '\[rayman-track\] t=(\d+) .*?state=(\S+) .*?pos=([-\d.]+),([-\d.]+),([-\d.]+) air=([-\d.]+) game_ms=(\d+)(?:.*?host_ms=(\d+))?') {
                 $track[[int]$Matches[1]] = [pscustomobject]@{ State = $Matches[2]; X = [double]$Matches[3]; Y = [double]$Matches[4]
-                    Z = [double]$Matches[5]; Air = [double]$Matches[6]; Ms = [double]$Matches[7] }
+                    Z = [double]$Matches[5]; Air = [double]$Matches[6]; Ms = [double]$Matches[7]
+                    HostMs = $(if ($Matches[8]) { [double]$Matches[8] } else { $null }) }
             }
         }
         $trackTimes = @($track.Keys | Sort-Object)
@@ -238,6 +239,8 @@ if ($buildOk) {
                 'track' {
                     # A measurement from the [rayman-track] lines, between min and max. metric:
                     #   game_ms_per_s  game clock ms per real second between from and to
+                    #   game_ms_per_host_s  game clock ms per wall-clock second (host_ms) between from and to: real-time
+                    #                  pacing in normal (non-deterministic) play
                     #   top_speed      horizontal speed (units/s) over 1 s windows that stay in `state` from `from` on:
                     #                  the average of the best 10% (free movement; paths differ between frame rates)
                     #   air_rate       air change per second over the first second of diving
@@ -250,6 +253,12 @@ if ($buildOk) {
                         'game_ms_per_s' {
                             if ($track.ContainsKey([int]$check.from) -and $track.ContainsKey([int]$check.to)) {
                                 $value = ($track[[int]$check.to].Ms - $track[[int]$check.from].Ms) / (([int]$check.to - [int]$check.from) * 0.02)
+                            }
+                        }
+                        'game_ms_per_host_s' {
+                            if ($track.ContainsKey([int]$check.from) -and $track.ContainsKey([int]$check.to) -and $null -ne $track[[int]$check.to].HostMs) {
+                                $hostSpan = $track[[int]$check.to].HostMs - $track[[int]$check.from].HostMs
+                                if ($hostSpan -gt 0) { $value = ($track[[int]$check.to].Ms - $track[[int]$check.from].Ms) / $hostSpan * 1000 }
                             }
                         }
                         'top_speed' {
