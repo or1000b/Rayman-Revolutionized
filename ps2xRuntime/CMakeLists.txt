@@ -451,6 +451,18 @@ endif()
 target_sources(ps2_runtime PRIVATE
     ${VU1AOT_SRC_FILES}
 )
+# VU arithmetic must round like the hardware (separate multiply and add, no reordering) and the same way in the
+# interpreter and the translated programs: /fp:fast (ReleaseMode.cmake) let the compiler fuse a + b * c into one FMA
+# depending on how the code was shaped (docs/vu1_aot.md). MSVC takes the last /fp option.
+if(MSVC)
+    set_source_files_properties(
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        src/lib/vu/vu1aot.cpp
+        ${VU1AOT_SRC_FILES}
+        PROPERTIES COMPILE_OPTIONS "/fp:precise")
+endif()
 
 # GPU GS renderer: paraLLEl-GS (Vulkan compute, LGPL-3.0-or-later, https://github.com/Arntzen-Software/parallel-gs)
 # with the parts of Granite it needs (volk + Vulkan headers only). Built into a small bridge library so neither its

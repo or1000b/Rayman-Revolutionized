@@ -78,10 +78,10 @@
       "description": "Load the user's save (Minisaurus Plain beach), skip Murfy's dialogue, walk into the swim tutorial's water, dive, swim, surface and jump out onto the beach.",
       "renderer": "gpu",
       "memcard": "fixtures\\mc_swim\\mc0",
-      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7400:ldown:250,7900:l2:100,8000:lup:150,8200:cross:80,8320:ldown:580,8580:cross:8,8620:cross:8,8660:cross:8,8700:cross:8,8740:cross:8,8780:cross:8",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7400:ldown:250,7900:l2:100,8000:lup:150,8110:l2:60,8260:cross:80,8400:ldown:340,8660:cross:8,8700:cross:8",
       "frames": 8900,
-      "shots": [7950, 8250, 8850],
-      "_note": "Fixture = the user's save of 2026-11-09 15:42 (local only, tests\\fixtures). After Murfy's dialogue the camera faces away from the pool: stick down 7400 walks into the water (~7640, surface), L2 7900 dives (air falls 4/s from 100), stick up swims under water, X 8200 rises (surface ~8268, air back to 100 within ~12 VSyncs), stick down swims back and X jumps (behaviour 35) until Rayman lands on the beach (~8812). [rayman-state] lines: main.cpp readRaymanState (CLAUDE.md issue 13).",
+      "shots": [8200, 8500, 8850],
+      "_note": "Fixture = the user's save of 2026-11-09 15:42 (local only, tests\fixtures). After Murfy's dialogue the camera faces away from the pool: stick down 7400 walks into the water (8048, surface; L2 pressed on land at 7900 is part of the route), L2 8110 dives (air falls 4/s from 100), X 8260 rises (surface ~8372, air back to 100 ~10 VSyncs later), stick down swims back and X jumps out onto the beach (~8730). Routes depend on small physics differences: re-check after VU / collision changes. [rayman-state] lines: main.cpp readRaymanState (CLAUDE.md issue 13).",
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
         { "type": "vu1_hash", "golden": "swim_tutorial.vu1hash", "label": "VU1 sent the GS the same bytes as the reference (hash every 600 VSyncs)" },
@@ -89,7 +89,7 @@
         { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=(surface|ground|air) from=(surface|ground|air|-) .*trend=falling", "label": "air falls only while diving" },
         { "type": "log_absent", "pattern": "water=32767", "label": "the water plane stays detected (CLAUDE.md issue 13: VCALLMSR started VU0 at a garbage address, every ray test missed)" },
         { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=surface .*depth=[1-9]", "label": "Rayman does not sink through the water plane while swimming on the surface" },
-        { "type": "shot", "tick": 7950, "min_variance": 100, "golden": "swim_diving.bmp", "max_diff": 20, "label": "Rayman diving, air bar shown" },
+        { "type": "shot", "tick": 8200, "min_variance": 100, "golden": "swim_diving.bmp", "max_diff": 20, "label": "Rayman diving, air bar shown" },
         { "type": "shot", "tick": 8850, "min_variance": 100, "golden": "swim_back_on_beach.bmp", "max_diff": 20, "label": "Rayman back on the beach after jumping out" }
       ]
     },

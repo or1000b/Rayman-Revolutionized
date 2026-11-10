@@ -104,3 +104,25 @@ code per image: from the profiled entries, following branches and the profiled J
 - All 10 programs generate (node counts ~1.15x pairs; only JR switch defaults can bail).
 - Next: diff + switch on the other 9 programs; then speed (SSE for the FMAC fast path, registers in locals, fewer
   helper calls).
+
+## Floating point: /fp:precise for all VU code (2026-11-10)
+
+- The runtime is built with `/fp:fast /arch:AVX2` (`ps2xRuntime/cmake/ReleaseMode.cmake`). Under it the compiler may
+  fuse `acc + vs * y` into one FMA and reorder float math, and whether it does depends on the shape of the code: the
+  first native helpers (a line-by-line copy of execUpper) happened to match the interpreter, the instruction
+  templates (`vu1aot_ops.h`) did not (1-3 ULP in ~70% of runs).
+- The PS2's VU rounds the multiply and the add separately (PCSX2: mulps then addps). So all VU sources
+  (ps2_vu1_core / upper / lower, vu1aot.cpp, the generated programs) are compiled with `/fp:precise`
+  (`ps2xRuntime/CMakeLists.txt`): no fusion, no reordering, the same result whatever the shape. This changed the
+  interpreter's own results slightly (the VU1 hash references were renewed; pictures compared first).
+- Rule for VU code: keep it in those files (or add new files to that list); do not rely on /fp:fast code matching.
+
+## All 10 programs native (2026-11-10)
+
+- Instruction templates (`vu1aot_ops.h`): the generated code calls `ops::fmac<...>` / `ops::lower<word>` with the
+  instruction decoded at compile time (the generic `upper()` remains for ITOF / FTOI / ABS / CLIP).
+- A bailed run could leave an XGKICK transfer in the static context; the next run delivered that stale packet
+  (3 mismatches in the intro): the context's transfer is now cleared when a run starts, like resetScheduler.
+- Diff mode, all 5 scenarios: 2.88 million runs compared, 0 differences (5 budget bails, 4 runs not idle at entry).
+- Native, same build, interpreter-only references (`PS2X_VU1AOT=0`) vs native: every picture and VU1 hash
+  identical; intro 403 -> 279 s, swim 206 -> 162 s, shoot 155 -> 130 s; first level 12.2 -> 19.3 game FPS.

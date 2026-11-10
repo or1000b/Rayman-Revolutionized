@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 #include <ps2_log.h>
@@ -446,6 +447,8 @@ namespace
         c.flagsLive = flagsLive;
         c.workingClip = a.workingClip;
         c.kickBuf = t_vu1AotKickBuf.data();
+        c.kick = {}; // a bailed run can leave a transfer in flight; the interpreter starts with none (resetScheduler)
+        c.branchBackupValid = false;
         c.packets.clear();
         c.packetSizes.clear();
         c.undo.clear();
@@ -493,7 +496,7 @@ namespace
                        uint32_t dataSize, const Vu1AotCapture &capture, const vu1aot::Program *program, uint32_t entryPc)
     {
         ++g_vu1AotStats.compared;
-        char what[256] = {};
+        char what[1024] = {};
         auto differ = [&](const char *fmt, auto... args)
         {
             if (what[0] == 0)
@@ -559,7 +562,16 @@ namespace
                 break;
             }
         if (c.packetSizes != capture.sizes)
-            differ("packets: native %zu interpreter %zu", c.packetSizes.size(), capture.sizes.size());
+        {
+            std::string sizes;
+            for (const auto *list : {&c.packetSizes, &capture.sizes})
+            {
+                sizes += list == &c.packetSizes ? " native:" : " interpreter:";
+                for (size_t k = 0; k < list->size() && k < 24u; ++k)
+                    sizes += " " + std::to_string((*list)[k]);
+            }
+            differ("packets: native %zu interpreter %zu%s", c.packetSizes.size(), capture.sizes.size(), sizes.c_str());
+        }
         else if (c.packets != capture.packets)
             differ("packet bytes");
         if (what[0] != 0)
