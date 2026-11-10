@@ -36,5 +36,8 @@ android/.gradle/
 # Memory card fixtures (user saves, hold game icons): local only
 /tests/fixtures/
 
+# VU1 programs translated from the game's microcode (tools/vu1aot/vu1gen.py): derived code, local only
+ps2xRuntime/src/lib/vu/aot/
+
 # Python bytecode (tools/*.py imported by scratch scripts)
 __pycache__/

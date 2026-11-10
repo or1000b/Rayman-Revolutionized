@@ -52,9 +52,9 @@ XGKICK packets (bytes and order) and the cycle count. Two reasons:
 
 1. References (done 2026-11-10): `vu1_hash` check, golden pictures for 5 scenarios, `shoot_minisaurus`.
 2. Survey (done 2026-11-10, results below): which code images, entries, JR targets, cycle shares.
-3. Diff harness + shared kick submission.
+3. Diff harness + shared kick submission (done 2026-11-10).
 4. Generator, program by program (the biggest cycle share first), each one validated with the diff mode and
-   `run_tests` before it is switched on.
+   `run_tests` before it is switched on. First program done 2026-11-10 (see Status).
 
 ## Survey results (2026-11-10, all 5 run_tests scenarios, 18.8 billion VU1 cycles)
 
@@ -80,3 +80,27 @@ code per image: from the profiled entries, following branches and the profiled J
   | ec561d05c7cc | 540 | ~0% | 2 | |
 
 - Other levels may use JR targets or programs the 5 scenarios never reached: they run on the interpreter until profiled.
+
+## Status and how to use it (2026-11-10)
+
+- Runtime: `ps2xRuntime/src/lib/vu/vu1aot.h` / `vu1aot.cpp` (value helpers: copies of the interpreter's cases, plus
+  XGKICK transfer, undo log, commits), dispatch in `ps2_vu1_core.cpp` (`vu1AotDispatch`, called by `execute` /
+  `resume` for VU1). A native run works on a copy of the registers with an undo log for VU data memory and buffered
+  packets; on a bail it is undone and the interpreter runs the whole program. The rounding mode is the interpreter's
+  (round toward zero) during native runs: without it every float differed by 1-3 ULP.
+- `PS2X_VU1AOT`: unset / `1` native, `0` interpreter only, `diff` native on a copy + interpreter for real, compared
+  (`[vu1aot-diff]` first difference, `[vu1aot]` counters every 600 VSyncs).
+- Generator: `python tools/vu1aot/vu1gen.py [--keys K,...]` reads `out/vu1prof` (run the game with
+  `PS2X_VU1_PROFILE=1` first) and writes `ps2xRuntime/src/lib/vu/aot/` (prog_<key>.cpp + aot_programs.cpp). That
+  folder is local (derived from the game's microcode, like `src/runner`); without it the build uses
+  `vu1aot_none.cpp` (empty table, interpreter only).
+- XGKICK while the previous packet transfers is the normal case (program 6af8eb: every run): the generated code
+  counts the wait and continues in a block made for that wait length (up to the longest pending latency).
+- Program 6af8ebd05633 (33% of VU1 cycles): 428 nodes; diff mode on `shoot_minisaurus`: 103574 runs compared,
+  0 differences, 0 bails. Native in run_tests: all pictures and VU1 hashes identical; intro 394 -> 349 s, swim
+  197 -> 184 s, shoot 153 -> 148 s.
+- The `[vu1-hash]` line at a scenario's last VSync races with the end of the run (printed at the first XGKICK at or
+  after its VSync); `vu1_hash` only compares lines before the frame budget.
+- All 10 programs generate (node counts ~1.15x pairs; only JR switch defaults can bail).
+- Next: diff + switch on the other 9 programs; then speed (SSE for the FMAC fast path, registers in locals, fewer
+  helper calls).

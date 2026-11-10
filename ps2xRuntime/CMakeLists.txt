@@ -394,6 +394,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
+    src/lib/vu/vu1aot.cpp
     src/lib/games_database.cpp
 )
 
@@ -436,6 +437,19 @@ file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
 
 target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
+)
+
+# VU1 programs translated ahead of time (tools/vu1aot/vu1gen.py writes src/lib/vu/aot/, local like src/runner;
+# docs/vu1_aot.md).
+file(GLOB VU1AOT_SRC_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu/aot/*.cpp"
+)
+if(NOT VU1AOT_SRC_FILES)
+    # Not generated (the folder is local): the empty program table, every VU1 run on the interpreter.
+    set(VU1AOT_SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu/vu1aot_none.cpp")
+endif()
+target_sources(ps2_runtime PRIVATE
+    ${VU1AOT_SRC_FILES}
 )
 
 # GPU GS renderer: paraLLEl-GS (Vulkan compute, LGPL-3.0-or-later, https://github.com/Arntzen-Software/parallel-gs)

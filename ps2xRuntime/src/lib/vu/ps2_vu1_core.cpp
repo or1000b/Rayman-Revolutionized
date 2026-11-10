@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
+#include "vu1aot.h"
 
 #include <algorithm>
 #include <bit>
@@ -237,6 +238,413 @@ namespace
     };
     Vu1Profile g_vu1Profile;
     bool g_vu1ProfileResume = false; // set by resume() for the next run()
+
+    // One finished PATH1 packet from VU1 (interpreter or native code): the kick hash, then the GIF.
+    // PS2X_VU1_KICK_HASH=1: a running FNV-1a hash of every XGKICK packet, printed every 600 guest VSyncs
+    // (`[vu1-hash]`). Two builds that print the same hashes sent the GS the same bytes: an equivalence check for
+    // VU1 changes (run_tests check type vu1_hash).
+    void vu1DeliverPath1Packet(PS2Memory *memory, GS *gs, const uint8_t *packet, uint32_t bytes)
+    {
+        static const bool kickHash = []
+        {
+            const char *env = std::getenv("PS2X_VU1_KICK_HASH");
+            return env && *env && *env != '0';
+        }();
+        if (kickHash)
+        {
+            static uint64_t hash = 1469598103934665603ull, kicks = 0, nextReport = 600;
+            for (uint32_t i = 0; i < bytes; ++i)
+                hash = (hash ^ packet[i]) * 1099511628211ull;
+            ++kicks;
+            const uint64_t vsync = ps2xGuestVsync();
+            if (vsync >= nextReport)
+            {
+                std::fprintf(stderr, "[vu1-hash] vsync %llu kicks %llu hash %016llx\n", static_cast<unsigned long long>(vsync),
+                             static_cast<unsigned long long>(kicks), static_cast<unsigned long long>(hash));
+                nextReport = (vsync / 600u + 1u) * 600u;
+            }
+        }
+        if (memory)
+            memory->submitGifPacket(GifPathId::Path1, packet, bytes);
+        else if (gs)
+            gs->processGIFPacket(packet, bytes);
+    }
+
+    // PS2X_VU1AOT=diff: the interpreter's packets of the run being compared.
+    struct Vu1AotCapture
+    {
+        std::vector<uint8_t> packets;
+        std::vector<uint32_t> sizes;
+    };
+    Vu1AotCapture *g_vu1AotCapture = nullptr;
+
+    // ---------------------------------------------------------------- VU1 ahead-of-time translation (docs/vu1_aot.md)
+
+    // PS2X_VU1AOT: unset or 1 = native code where a program covers the run, 0 = interpreter only, diff = native code
+    // on a copy and the interpreter for real, everything compared (the interpreter's result is kept).
+    enum class Vu1AotMode
+    {
+        Off,
+        Native,
+        Diff
+    };
+    Vu1AotMode vu1AotMode()
+    {
+        static const Vu1AotMode mode = []
+        {
+            const char *env = std::getenv("PS2X_VU1AOT");
+            if (env && std::strcmp(env, "0") == 0)
+                return Vu1AotMode::Off;
+            if (env && std::strcmp(env, "diff") == 0)
+                return Vu1AotMode::Diff;
+            return Vu1AotMode::Native;
+        }();
+        return mode;
+    }
+
+    struct Vu1AotStats
+    {
+        uint64_t native = 0, compared = 0, mismatches = 0, notCovered = 0, notIdle = 0;
+        uint64_t bails[8]{};
+        uint64_t nextReport = 600;
+        uint32_t reported = 0;
+    };
+    Vu1AotStats g_vu1AotStats;
+
+    void vu1AotReport()
+    {
+        const uint64_t vsync = ps2xGuestVsync();
+        if (vsync < g_vu1AotStats.nextReport)
+            return;
+        g_vu1AotStats.nextReport = (vsync / 600u + 1u) * 600u;
+        const Vu1AotStats &s = g_vu1AotStats;
+        std::fprintf(stderr,
+                     "[vu1aot] vsync %llu native %llu compared %llu mismatches %llu not_covered %llu not_idle %llu bails budget %llu "
+                     "kick_busy %llu jr %llu kick_error %llu unsupported %llu flags %llu runaway %llu\n",
+                     static_cast<unsigned long long>(vsync), static_cast<unsigned long long>(s.native),
+                     static_cast<unsigned long long>(s.compared), static_cast<unsigned long long>(s.mismatches),
+                     static_cast<unsigned long long>(s.notCovered), static_cast<unsigned long long>(s.notIdle),
+                     static_cast<unsigned long long>(s.bails[1]), static_cast<unsigned long long>(s.bails[2]),
+                     static_cast<unsigned long long>(s.bails[3]), static_cast<unsigned long long>(s.bails[4]),
+                     static_cast<unsigned long long>(s.bails[5]), static_cast<unsigned long long>(s.bails[6]),
+                     static_cast<unsigned long long>(s.bails[7]));
+    }
+
+    // The program whose reachable pairs equal the micro memory (checked once per code generation), and whether the
+    // loaded code reads MAC / status flags (the interpreter's rebuildDecodedCodeCache rule).
+    struct Vu1AotSelection
+    {
+        uint64_t generation = ~0ull;
+        const vu1aot::Program *program = nullptr;
+        bool flagsLive = true;
+    };
+    Vu1AotSelection g_vu1AotSelection;
+
+    const vu1aot::Program *vu1AotSelect(const uint8_t *code, uint32_t codeSize, const PS2Memory *memory, bool &flagsLive)
+    {
+        const uint64_t generation = memory ? memory->getVU1CodeGeneration() : ~1ull;
+        if (generation != g_vu1AotSelection.generation || !memory)
+        {
+            g_vu1AotSelection.generation = generation;
+            g_vu1AotSelection.program = nullptr;
+            bool readsMacStatus = false;
+            for (uint32_t pc = 0; pc + 8u <= codeSize; pc += 8u)
+            {
+                uint32_t lower = 0, upper = 0;
+                std::memcpy(&lower, code + pc, 4u);
+                std::memcpy(&upper, code + pc + 4u, 4u);
+                if ((upper & 0x80000000u) != 0u)
+                    continue;
+                const uint32_t op = lower >> 25;
+                if (op == 0x14u || op == 0x16u || op == 0x17u || op == 0x18u || op == 0x1Au || op == 0x1Bu)
+                    readsMacStatus = true;
+            }
+            g_vu1AotSelection.flagsLive = readsMacStatus;
+            for (uint32_t p = 0; p < vu1aot::kProgramCount; ++p)
+            {
+                const vu1aot::Program &prog = vu1aot::kPrograms[p];
+                bool same = true;
+                for (uint32_t k = 0; k < prog.pairCount && same; ++k)
+                {
+                    uint64_t words = 0;
+                    if (prog.pcs[k] + 8u > codeSize)
+                    {
+                        same = false;
+                        break;
+                    }
+                    std::memcpy(&words, code + prog.pcs[k], 8u);
+                    same = words == prog.words[k];
+                }
+                if (same && (!g_vu1AotSelection.program || prog.pairCount > g_vu1AotSelection.program->pairCount))
+                    g_vu1AotSelection.program = &prog;
+            }
+        }
+        flagsLive = g_vu1AotSelection.flagsLive;
+        return g_vu1AotSelection.program;
+    }
+
+    // References to the interpreter's private timing state, built inside execute() / resume().
+    struct Vu1AotAccess
+    {
+        VU1State &state;
+        uint64_t &cycle;
+        std::array<std::array<uint64_t, 4>, 32> &vfReady;
+        std::array<uint64_t, 16> &viReady;
+        std::array<uint64_t, 4> &accReady;
+        uint64_t efuResourceReady;
+        uint32_t &workingClip;
+        bool &branchBackupValid;
+        uint8_t &branchBackupReg;
+        int32_t &branchBackupValue;
+        bool pipelinesBusy;
+    };
+
+    thread_local std::vector<uint8_t> t_vu1AotKickBuf;
+    thread_local std::vector<uint8_t> t_vu1AotDataCopy;
+
+    // The run as the native code starts it: registers copied, timing idle (else not covered). Returns false when the
+    // run is not covered (nothing changed).
+    bool vu1AotPrepare(vu1aot::Ctx &c, const Vu1AotAccess &a, const vu1aot::Program *&program, const uint8_t *code,
+                       uint32_t codeSize, uint8_t *data, uint32_t dataSize, PS2Memory *memory, uint32_t maxCycles)
+    {
+        bool flagsLive = true;
+        program = vu1AotSelect(code, codeSize, memory, flagsLive);
+        if (!program)
+        {
+            ++g_vu1AotStats.notCovered;
+            return false;
+        }
+        bool covered = false;
+        for (uint32_t e = 0; e < program->entryCount && !covered; ++e)
+            covered = program->entries[e] == a.state.pc;
+        if (!covered)
+        {
+            ++g_vu1AotStats.notCovered;
+            return false;
+        }
+        // The generated entries assume an idle pipeline (everything ready, nothing queued, no branch hazard).
+        bool idle = !a.pipelinesBusy && !a.branchBackupValid && a.efuResourceReady <= a.cycle;
+        for (uint32_t r = 0; r < 32u && idle; ++r)
+            for (uint32_t l = 0; l < 4u; ++l)
+                idle = idle && a.vfReady[r][l] <= a.cycle;
+        for (uint32_t r = 0; r < 16u && idle; ++r)
+            idle = a.viReady[r] <= a.cycle;
+        for (uint32_t l = 0; l < 4u && idle; ++l)
+            idle = a.accReady[l] <= a.cycle;
+        if (!idle)
+        {
+            ++g_vu1AotStats.notIdle;
+            return false;
+        }
+        if (t_vu1AotKickBuf.size() < 0x10000u)
+            t_vu1AotKickBuf.resize(0x10000u);
+        c.s = a.state;
+        c.data = data;
+        c.dataSize = dataSize;
+        c.cycles = 0;
+        c.budget = maxCycles;
+        c.flagsLive = flagsLive;
+        c.workingClip = a.workingClip;
+        c.kickBuf = t_vu1AotKickBuf.data();
+        c.packets.clear();
+        c.packetSizes.clear();
+        c.undo.clear();
+        return true;
+    }
+
+    // A finished native run becomes the interpreter's: registers, timing (cycle count, VF lanes still in flight,
+    // the branch hazard), packets.
+    void vu1AotCommit(vu1aot::Ctx &c, Vu1AotAccess &a, PS2Memory *memory, GS *gs)
+    {
+        a.state = c.s;
+        a.workingClip = c.workingClip;
+        a.cycle += c.cycles;
+        a.state.cycles = a.cycle;
+        for (uint32_t r = 0; r < 32u; ++r)
+            for (uint32_t l = 0; l < 4u; ++l)
+                if (c.vfResidue[r][l] != 0u)
+                    a.vfReady[r][l] = a.cycle + c.vfResidue[r][l];
+        a.branchBackupValid = c.branchBackupValid;
+        a.branchBackupReg = c.branchBackupReg;
+        a.branchBackupValue = c.branchBackupValue;
+        uint32_t offset = 0;
+        for (uint32_t size : c.packetSizes)
+        {
+            if (g_vu1AotCapture)
+            {
+                g_vu1AotCapture->packets.insert(g_vu1AotCapture->packets.end(), c.packets.data() + offset, c.packets.data() + offset + size);
+                g_vu1AotCapture->sizes.push_back(size);
+            }
+            vu1DeliverPath1Packet(memory, gs, c.packets.data() + offset, size);
+            offset += size;
+        }
+    }
+
+    void vu1AotUndo(vu1aot::Ctx &c)
+    {
+        for (auto it = c.undo.rbegin(); it != c.undo.rend(); ++it)
+            std::memcpy(c.data + it->address, it->old, 16u);
+        c.undo.clear();
+    }
+
+    // PS2X_VU1AOT=diff: report what differs between the native run (c, its data in t_vu1AotDataCopy) and the
+    // interpreter's (a, data, capture).
+    void vu1AotCompare(const vu1aot::Ctx &c, bool nativeOk, const Vu1AotAccess &a, uint64_t interpCycles, const uint8_t *data,
+                       uint32_t dataSize, const Vu1AotCapture &capture, const vu1aot::Program *program, uint32_t entryPc)
+    {
+        ++g_vu1AotStats.compared;
+        char what[256] = {};
+        auto differ = [&](const char *fmt, auto... args)
+        {
+            if (what[0] == 0)
+                std::snprintf(what, sizeof(what), fmt, args...);
+        };
+        if (!nativeOk)
+            return; // bails are counted, not compared (the interpreter ran the run)
+        if (c.cycles != interpCycles)
+            differ("cycles native %llu interpreter %llu", static_cast<unsigned long long>(c.cycles),
+                   static_cast<unsigned long long>(interpCycles));
+        for (uint32_t r = 0; r < 32u; ++r)
+            if (std::memcmp(c.s.vf[r], a.state.vf[r], 16u) != 0)
+            {
+                uint32_t n[4], i[4];
+                std::memcpy(n, c.s.vf[r], 16u);
+                std::memcpy(i, a.state.vf[r], 16u);
+                differ("vf%u native %08x %08x %08x %08x interpreter %08x %08x %08x %08x", r, n[0], n[1], n[2], n[3], i[0], i[1], i[2], i[3]);
+            }
+        for (uint32_t r = 0; r < 16u; ++r)
+            if (c.s.vi[r] != a.state.vi[r])
+                differ("vi%u native %d interpreter %d", r, c.s.vi[r], a.state.vi[r]);
+        if (std::memcmp(c.s.acc, a.state.acc, 16u) != 0)
+            differ("acc");
+        if (std::memcmp(&c.s.q, &a.state.q, 4u) != 0)
+            differ("q");
+        if (std::memcmp(&c.s.p, &a.state.p, 4u) != 0)
+            differ("p");
+        if (std::memcmp(&c.s.i, &a.state.i, 4u) != 0)
+            differ("i");
+        if (c.s.r != a.state.r)
+            differ("r");
+        if (c.s.pc != a.state.pc)
+            differ("pc native %04x interpreter %04x", c.s.pc, a.state.pc);
+        if (c.s.mac != a.state.mac)
+            differ("mac native %04x interpreter %04x", c.s.mac, a.state.mac);
+        if (c.s.status != a.state.status)
+            differ("status native %03x interpreter %03x", c.s.status, a.state.status);
+        if (c.s.clip != a.state.clip)
+            differ("clip native %06x interpreter %06x", c.s.clip, a.state.clip);
+        if (c.workingClip != a.workingClip)
+            differ("working clip");
+        if (c.s.ebit != a.state.ebit || c.s.haltAfterDelaySlot != a.state.haltAfterDelaySlot || c.s.branchPending != a.state.branchPending ||
+            c.s.branchTarget != a.state.branchTarget || c.s.branchDelay != a.state.branchDelay || c.s.stoppedByD != a.state.stoppedByD ||
+            c.s.stoppedByT != a.state.stoppedByT)
+            differ("control state: native ebit %d halt %d branch %d target %04x delay %u D %d T %d, interpreter %d %d %d %04x %u %d %d",
+                   c.s.ebit, c.s.haltAfterDelaySlot, c.s.branchPending, c.s.branchTarget, c.s.branchDelay, c.s.stoppedByD,
+                   c.s.stoppedByT, a.state.ebit, a.state.haltAfterDelaySlot, a.state.branchPending, a.state.branchTarget,
+                   a.state.branchDelay, a.state.stoppedByD, a.state.stoppedByT);
+        if (c.branchBackupValid != a.branchBackupValid || (c.branchBackupValid && (c.branchBackupReg != a.branchBackupReg ||
+                                                                                   c.branchBackupValue != a.branchBackupValue)))
+            differ("branch hazard backup");
+        for (uint32_t r = 0; r < 32u; ++r)
+            for (uint32_t l = 0; l < 4u; ++l)
+            {
+                const uint64_t interp = a.vfReady[r][l] > a.cycle ? a.vfReady[r][l] - a.cycle : 0u;
+                if (interp != c.vfResidue[r][l])
+                    differ("vf%u lane %u residue native %u interpreter %llu", r, l, c.vfResidue[r][l], static_cast<unsigned long long>(interp));
+            }
+        for (uint32_t q = 0; q < dataSize; q += 16u)
+            if (std::memcmp(t_vu1AotDataCopy.data() + q, data + q, 16u) != 0)
+            {
+                differ("data qword 0x%x", q / 16u);
+                break;
+            }
+        if (c.packetSizes != capture.sizes)
+            differ("packets: native %zu interpreter %zu", c.packetSizes.size(), capture.sizes.size());
+        else if (c.packets != capture.packets)
+            differ("packet bytes");
+        if (what[0] != 0)
+        {
+            ++g_vu1AotStats.mismatches;
+            if (g_vu1AotStats.reported++ < 40u)
+                std::fprintf(stderr, "[vu1aot-diff] vsync %llu program %s entry %04x: %s\n",
+                             static_cast<unsigned long long>(ps2xGuestVsync()), program->key, entryPc, what);
+        }
+    }
+
+    // execute() / resume(): native code when it covers the run, else (or in diff mode, also) the interpreter.
+    template <typename RunInterpreter>
+    void vu1AotDispatch(Vu1AotAccess a, const uint8_t *code, uint32_t codeSize, uint8_t *data, uint32_t dataSize,
+                        PS2Memory *memory, GS *gs, uint32_t maxCycles, RunInterpreter &&runInterpreter)
+    {
+        const Vu1AotMode mode = vu1AotMode();
+        if (mode == Vu1AotMode::Off)
+        {
+            runInterpreter();
+            return;
+        }
+        static vu1aot::Ctx c;
+        const vu1aot::Program *program = nullptr;
+        if (!vu1AotPrepare(c, a, program, code, codeSize, data, dataSize, memory, maxCycles))
+        {
+            runInterpreter();
+            vu1AotReport();
+            return;
+        }
+        const uint32_t entryPc = a.state.pc;
+        // The interpreter's run() computes with round toward zero; so does the native code.
+        struct RoundTowardZero
+        {
+            int previous = std::fegetround();
+            bool set = std::fesetround(FE_TOWARDZERO) == 0;
+            ~RoundTowardZero()
+            {
+                if (set && previous != -1)
+                    std::fesetround(previous);
+            }
+        };
+        if (mode == Vu1AotMode::Native)
+        {
+            c.logUndo = true;
+            c.bail = vu1aot::BailNone;
+            bool ok;
+            {
+                RoundTowardZero rz;
+                ok = program->run(c, entryPc) && c.bail == vu1aot::BailNone;
+            }
+            if (ok)
+            {
+                ++g_vu1AotStats.native;
+                vu1AotCommit(c, a, memory, gs);
+            }
+            else
+            {
+                ++g_vu1AotStats.bails[c.bail >= 1 && c.bail <= 7 ? c.bail : 5];
+                vu1AotUndo(c);
+                runInterpreter();
+            }
+            vu1AotReport();
+            return;
+        }
+        // Diff: native code on a copy of the data memory, then the interpreter for real, then compare.
+        t_vu1AotDataCopy.assign(data, data + dataSize);
+        c.data = t_vu1AotDataCopy.data();
+        c.logUndo = false;
+        c.bail = vu1aot::BailNone;
+        bool nativeOk;
+        {
+            RoundTowardZero rz;
+            nativeOk = program->run(c, entryPc) && c.bail == vu1aot::BailNone;
+        }
+        if (!nativeOk)
+            ++g_vu1AotStats.bails[c.bail >= 1 && c.bail <= 7 ? c.bail : 5];
+        Vu1AotCapture capture;
+        g_vu1AotCapture = &capture;
+        const uint64_t startCycle = a.cycle;
+        runInterpreter();
+        g_vu1AotCapture = nullptr;
+        vu1AotCompare(c, nativeOk, a, a.cycle - startCycle, data, dataSize, capture, program, entryPc);
+        vu1AotReport();
+    }
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
@@ -1773,33 +2181,13 @@ void VU1Interpreter::finishXgkick()
         }
     }
 
-    // PS2X_VU1_KICK_HASH=1: a running FNV-1a hash of every XGKICK packet, printed every 600 guest VSyncs
-    // (`[vu1-hash]`). Two builds that print the same hashes sent the GS the same bytes: an equivalence check for
-    // VU1 interpreter changes.
-    static const bool kickHash = []
+    if (g_vu1AotCapture)
     {
-        const char *env = std::getenv("PS2X_VU1_KICK_HASH");
-        return env && *env && *env != '0';
-    }();
-    if (kickHash)
-    {
-        static uint64_t hash = 1469598103934665603ull, kicks = 0, nextReport = 600;
-        for (uint32_t i = 0; i < m_xgkick.totalBytes; ++i)
-            hash = (hash ^ m_xgkick.packet[i]) * 1099511628211ull;
-        ++kicks;
-        const uint64_t vsync = ps2xGuestVsync();
-        if (vsync >= nextReport)
-        {
-            std::fprintf(stderr, "[vu1-hash] vsync %llu kicks %llu hash %016llx\n", static_cast<unsigned long long>(vsync),
-                         static_cast<unsigned long long>(kicks), static_cast<unsigned long long>(hash));
-            nextReport = (vsync / 600u + 1u) * 600u;
-        }
+        g_vu1AotCapture->packets.insert(g_vu1AotCapture->packets.end(), m_xgkick.packet.data(),
+                                        m_xgkick.packet.data() + m_xgkick.totalBytes);
+        g_vu1AotCapture->sizes.push_back(m_xgkick.totalBytes);
     }
-
-    if (m_activeMemory)
-        m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
-    else if (m_activeGs)
-        m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
+    vu1DeliverPath1Packet(m_activeMemory, m_activeGs, m_xgkick.packet.data(), m_xgkick.totalBytes);
     m_xgkick.active = false;
 }
 
@@ -2563,6 +2951,14 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
             }
         }
     }
+    if (m_unit == Unit::VU1)
+    {
+        vu1AotDispatch(Vu1AotAccess{m_state, m_cycle, m_vfReady, m_viReady, m_accReady, m_efuResourceReady, m_workingClip,
+                                    m_viBranchBackupValid, m_viBranchBackupReg, m_viBranchBackupValue, pipelinesPending()},
+                       vuCode, codeSize, vuData, dataSize, memory, &gs, maxCycles,
+                       [&] { run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles); });
+        return;
+    }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -2576,7 +2972,13 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
     g_vu1ProfileResume = true;
-    run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    if (m_unit == Unit::VU1)
+        vu1AotDispatch(Vu1AotAccess{m_state, m_cycle, m_vfReady, m_viReady, m_accReady, m_efuResourceReady, m_workingClip,
+                                    m_viBranchBackupValid, m_viBranchBackupReg, m_viBranchBackupValue, pipelinesPending()},
+                       vuCode, codeSize, vuData, dataSize, memory, &gs, maxCycles,
+                       [&] { run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles); });
+    else
+        run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
     g_vu1ProfileResume = false;
 }
 

@@ -254,7 +254,11 @@ if ($buildOk) {
                 'vu1_hash' {
                     # Every [vu1-hash] line must equal the reference (tests\golden\<golden>): VU1 sent the GS the same
                     # bytes. The reference is written by -UpdateGolden, or from this run when it does not exist yet.
-                    $got = @($lines | ForEach-Object { if ($_ -match '\[vu1-hash\] vsync \d+ kicks \d+ hash [0-9a-f]+') { $Matches[0] } })
+                    # A line is printed at the first XGKICK at or after its VSync, so the one at the frame budget's
+                    # last VSync races with the end of the run: only lines before the budget count.
+                    $budget = [int]$sc.frames
+                    $got = @($lines | ForEach-Object {
+                            if ($_ -match '\[vu1-hash\] vsync (\d+) kicks \d+ hash [0-9a-f]+' -and [int]$Matches[1] -lt $budget) { $Matches[0] } })
                     if ($got.Count -eq 0) { Write-CheckResult $sc.name $check $false 'no [vu1-hash] lines (PS2X_VU1_KICK_HASH)'; break }
                     $golden = Join-Path $GoldenDir $check.golden
                     if ($UpdateGolden -or -not (Test-Path $golden)) {
@@ -264,7 +268,7 @@ if ($buildOk) {
                         Write-CheckResult $sc.name $check $true "$($got.Count) hashes; $what"
                         break
                     }
-                    $ref = @(Get-Content $golden)
+                    $ref = @(Get-Content $golden | Where-Object { $_ -match 'vsync (\d+)' -and [int]$Matches[1] -lt $budget })
                     $n = [math]::Min($ref.Count, $got.Count)
                     $split = -1
                     for ($i = 0; $i -lt $n; $i++) { if ($ref[$i] -ne $got[$i]) { $split = $i; break } }
