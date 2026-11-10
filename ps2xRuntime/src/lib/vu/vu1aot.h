@@ -316,6 +316,8 @@ namespace vu1aot
         bool flagsFree;               // generated without MAC / status flags: runs only when no instruction reads them
     };
 
-    extern const Program kPrograms[];
+    extern const Program kPrograms[];   // VU1 (aot/aot_programs.cpp, or vu1aot_none.cpp)
     extern const uint32_t kProgramCount;
+    extern const Program kPrograms0[];  // VU0 (aot/aot_programs0.cpp, or vu0aot_none.cpp)
+    extern const uint32_t kProgramCount0;
 }

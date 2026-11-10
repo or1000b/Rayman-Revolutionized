@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """VU1 microprogram -> C++ ahead-of-time translator (docs/vu1_aot.md).
 
-usage: python tools/vu1aot/vu1gen.py [--prof out/vu1prof] [--keys KEY,KEY...] [--out ps2xRuntime/src/lib/vu/aot]
-                                     [--with-flags]
+usage: python tools/vu1aot/vu1gen.py [--unit 1|0] [--prof out/vu1prof] [--keys KEY,KEY...]
+                                     [--out ps2xRuntime/src/lib/vu/aot] [--with-flags]
+
+--unit 0 translates VU0 microprograms (profile out/vu0prof from PS2X_VU0_PROFILE=1; 4 KiB code: addresses masked
+with 0xFFF; files prog0_<key>.cpp and aot_programs0.cpp with vu1aot::kPrograms0). VU0 has no XGKICK / EFU / MFP /
+WAITP: the interpreter decodes them as reserved, so a program using one bails there.
 
 For each program key (tools/vu1aot/vu1reach.py) the image with the most VU1 cycles is used: its code
 (code_<hash>.bin), the interpreter's own decode table for it (decode_<hash>.txt: pipelines, latencies, register reads
@@ -29,6 +33,7 @@ import sys
 
 PIPE_NONE, PIPE_FMAC, PIPE_LSU, PIPE_FDIV, PIPE_EFU, PIPE_IALU, PIPE_BRANCH, PIPE_XGKICK = range(8)
 MAX_NODES = 60000
+CODE_MASK = 0x3fff  # VU1: 16 KiB of micro memory; VU0 (--unit 0): 0xfff
 
 
 def sx11(v):
@@ -382,9 +387,14 @@ class Gen:
         if uk is None:
             self.bail(ind, 'BailUnsupported', pc)
             return
-        if ctl[0] and is_branch(p):
-            self.bail(ind, 'BailUnsupported', pc)  # branch in a branch delay slot / E-bit slot
+        if ctl[0] == 'e' and is_branch(p):
+            self.bail(ind, 'BailUnsupported', pc)  # branch in the E-bit's delay slot
             return
+        nested = ctl[0] in ('b', 'bc', 'jr') and is_branch(p)  # a branch in a taken branch's delay slot
+        if nested and ctl[0] == 'bc':
+            self.emit(ind + 'const bool brFirst%s = br; // the first branch (this pair writes br)' % name)
+        if nested and ctl[0] == 'jr':
+            self.emit(ind + 'const uint32_t jtFirst%s = jt; // the first branch (this pair writes jt)' % name)
         if ctl[0] in ('b', 'bc', 'jr') and p.ebit:
             self.bail(ind, 'BailUnsupported', pc)  # E-bit in a branch delay slot
             return
@@ -513,7 +523,7 @@ class Gen:
             new_flags.append([4, slot, 'c', False, True])
         elif lc == 'b':
             op = lo >> 25 & 0x7f
-            target = (pc + 8 + sx11(lo) * 8) & 0x3fff
+            target = (pc + 8 + sx11(lo) * 8) & CODE_MASK
             if op == 0x21:
                 vit = lo >> 16 & 0xf
                 if vit:
@@ -522,7 +532,7 @@ class Gen:
         elif lc == 'jr':
             op = lo >> 25 & 0x7f
             vis = lo >> 11 & 0xf
-            self.emit(ind + 'jt = (static_cast<uint32_t>(static_cast<uint16_t>(%s)) * 8u) & 0x3FFFu;' % vi_read(vis))
+            self.emit(ind + 'jt = (static_cast<uint32_t>(static_cast<uint16_t>(%s)) * 8u) & 0x%Xu;' % (vi_read(vis), CODE_MASK))
             if op == 0x25:
                 vit = lo >> 16 & 0xf
                 if vit:
@@ -537,7 +547,7 @@ class Gen:
             cond = {0x28: '%s == %s' % (a, b), 0x29: '%s != %s' % (a, b), 0x2c: '%s < 0' % a, 0x2d: '%s > 0' % a,
                     0x2e: '%s <= 0' % a, 0x2f: '%s >= 0' % a}[op]
             self.emit(ind + 'br = %s;' % cond)
-            br_ctl = ('bc', (pc + 8 + sx11(lo) * 8) & 0x3fff, pc + 16)
+            br_ctl = ('bc', (pc + 8 + sx11(lo) * 8) & CODE_MASK, pc + 16)
         if shadow:
             self.emit(ind + 'std::memcpy(s.vf[%d], shNew, 16); }' % shadow)
         # VI registers hold 16 bits (the queued write lands as int16_t).
@@ -592,6 +602,31 @@ class Gen:
         # Where the run goes next.
         if ctl[0] == 'e':
             self.gen_end(ind, pc + 8, st)
+            return
+        if nested:
+            # A branch in the delay slot of a taken branch (the interpreter's inTakenDelaySlot, PCSX2 takedelaybranch;
+            # Rayman's VU0 collision: 0x0718 IBEQ with B 0x0438 in its delay slot): the first branch's target pair
+            # runs as this branch's delay slot, then this branch's target. This branch not taken: the first target
+            # runs normally. The first branch not taken (conditional): this is an ordinary branch.
+            def via(t1):
+                if br_ctl[0] == 'b':
+                    return 'goto %s;' % self.node(t1, st, ('b', br_ctl[1]))
+                if br_ctl[0] == 'jr':
+                    return 'goto %s;' % self.node(t1, st, ('jr', pc))
+                return 'if (br) goto %s; else { s.branchTarget = 0x%xu; goto %s; }' % (
+                    self.node(t1, st, ('b', br_ctl[1])), t1, self.node(t1, st, ('',)))
+            if ctl[0] == 'b':
+                self.emit(ind + via(ctl[1]))
+            elif ctl[0] == 'bc':
+                ordinary = self.node(pc + 8, st, ('b', br_ctl[1]) if br_ctl[0] == 'b' else br_ctl)
+                self.emit(ind + 'if (brFirst%s) { %s } else goto %s;' % (name, via(ctl[1]), ordinary))
+            else:
+                targets = sorted(self.jr.get(ctl[1], ()))
+                self.emit(ind + 'switch (jtFirst%s) {' % name)
+                for t in targets:
+                    self.emit(ind + 'case 0x%x: { %s }' % (t, via(t)))
+                self.emit(ind + 'default: c.bail = BailJrTarget; c.bailPc = 0x%x; return false; }' % pc)
+                self.bails['BailJrTarget(default)'] += 1
             return
         if ctl[0] == 'b':
             self.emit(ind + 's.branchTarget = 0x%xu;' % ctl[1])
@@ -687,11 +722,18 @@ def load_profile(folder):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--prof', default=os.path.join('out', 'vu1prof'))
+    ap.add_argument('--unit', type=int, choices=(0, 1), default=1, help='1 = VU1 (default), 0 = VU0')
+    ap.add_argument('--prof', default=None, help='profile folder (default out/vu1prof, VU0 out/vu0prof)')
     ap.add_argument('--keys', default='')
     ap.add_argument('--out', default=os.path.join('ps2xRuntime', 'src', 'lib', 'vu', 'aot'))
     ap.add_argument('--with-flags', action='store_true', help='also compute MAC / status flags (images that read them)')
     args = ap.parse_args()
+    global CODE_MASK
+    CODE_MASK = 0xfff if args.unit == 0 else 0x3fff
+    if args.prof is None:
+        args.prof = os.path.join('out', 'vu0prof' if args.unit == 0 else 'vu1prof')
+    prefix = 'prog0_' if args.unit == 0 else 'prog_'   # generated file / function names
+    suffix = '0' if args.unit == 0 else ''             # table: kPrograms<suffix>, aot_programs<suffix>.cpp
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import vu1reach
     entries, jr, cycles = load_profile(args.prof)
@@ -753,8 +795,8 @@ def main():
             pairs[pr.pc] = pr
         g = Gen(key, pairs, ent, jrt, not args.with_flags)
         starts = g.generate()
-        fn = 'prog_%s' % key
-        lines = ['// Generated by tools/vu1aot/vu1gen.py from out/vu1prof/code_%s.bin. Do not edit.' % h,
+        fn = prefix + key
+        lines = ['// Generated by tools/vu1aot/vu1gen.py from %s/code_%s.bin (VU%d). Do not edit.' % (args.prof.replace(os.sep, '/'), h, args.unit),
                  '// Program %s: %d pairs, %d nodes, images %d, entries %s.' % (key, len(pcs), len(g.nodes), len(hs), ' '.join('%04x' % e for e in sorted(ent))),
                  '#include "../vu1aot_ops.h"', '', 'namespace vu1aot', '{', 'namespace', '{']
         lines += ['    ' + x for x in g.out_consts]
@@ -770,7 +812,7 @@ def main():
         open(os.path.join(args.out, '%s.cpp' % fn), 'w').write('\n'.join(lines))
         table.append((key, fn, sorted(pcs), code, sorted(ent)))
         print('%s: image %s (+%d), %d pairs, %d nodes, %d lines, bail sites %s' % (key, h, len(hs) - 1, len(pcs), len(g.nodes), len(lines), dict(g.bails)))
-    tl = ['// Generated by tools/vu1aot/vu1gen.py. Do not edit. The table of translated VU1 programs.',
+    tl = ['// Generated by tools/vu1aot/vu1gen.py. Do not edit. The table of translated VU%d programs.' % args.unit,
           '#include "../vu1aot.h"', '', 'namespace vu1aot', '{']
     for key, fn, pcs, code, ent in table:
         tl.append('bool %s(Ctx &c, uint32_t entry);' % fn)
@@ -781,19 +823,19 @@ def main():
         tl.append('const uint32_t kEntries_%s[] = {%s};' % (key, ', '.join('0x%x' % e for e in ent)))
     tl += ['}', '']
     if table:
-        tl.append('const Program kPrograms[] = {')
+        tl.append('const Program kPrograms%s[] = {' % suffix)
         for key, fn, pcs, code, ent in table:
             tl.append('    {"%s", kPcs_%s, kWords_%s, %d, kEntries_%s, %d, %s, %s},' % (key, key, key, len(pcs), key, len(ent), fn,
                                                                             'false' if args.with_flags else 'true'))
-        tl += ['};', 'const uint32_t kProgramCount = %d;' % len(table)]
+        tl += ['};', 'const uint32_t kProgramCount%s = %d;' % (suffix, len(table))]
     else:
-        tl += ['const Program kPrograms[1] = {};', 'const uint32_t kProgramCount = 0;']
+        tl += ['const Program kPrograms%s[1] = {};' % suffix, 'const uint32_t kProgramCount%s = 0;' % suffix]
     tl += ['}', '']
-    open(os.path.join(args.out, 'aot_programs.cpp'), 'w').write('\n'.join(tl))
+    open(os.path.join(args.out, 'aot_programs%s.cpp' % suffix), 'w').write('\n'.join(tl))
     # Programs of an earlier run that are not in the table any more (merged, renamed): the build compiles every
     # .cpp of the folder, so remove them (only after generating all programs, not a --keys subset).
-    current = {'prog_%s.cpp' % key for key, fn, pcs, code, ent in table}
-    for path in ([] if args.keys else glob.glob(os.path.join(args.out, 'prog_*.cpp'))):
+    current = {'%s%s.cpp' % (prefix, key) for key, fn, pcs, code, ent in table}
+    for path in ([] if args.keys else glob.glob(os.path.join(args.out, prefix + '*.cpp'))):
         if os.path.basename(path) not in current:
             os.remove(path)
             print('removed %s (not in the table)' % os.path.basename(path))

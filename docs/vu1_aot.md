@@ -179,3 +179,22 @@ code per image: from the profiled entries, following branches and the profiled J
   session (`[vu1aot] self-check: ... switched off`, counter `disabled`). This covers entries the tests never reach.
 - PAL timing (CLAUDE.md issue 15) changed the VSync rate, so the references were renewed; the suite was profiled again
   under PAL. Diff mode, all 5 scenarios: 2.90 million runs, 0 differences, 0 not covered, 0 JR bails.
+
+## VU0 (2026-11-10)
+
+- At 60 FPS (docs/framerate.md) Rayman's collision on the VU0 interpreter took ~23% of the game thread in water
+  (`executeVU0Microprogram` inclusive). The same translation now covers VU0.
+- Profiling: `PS2X_VU0_PROFILE=1` (out/vu0prof; `run_rayman_profile.bat` sets it too). In all 9 scenarios only two code
+  images: program e09ad6f75847 (510 pairs, 95.7% of VU0 cycles: the collision library, entries 0x0 / 0xF30 / 0xFD0)
+  and 63f357489401 (145 pairs). 7.7 million runs, none over the 4096-cycle budget. Both read flags (FSAND / FMAND), so
+  they are generated with flags (`vu1gen.py --unit 0 --with-flags`: prog0_<key>.cpp, aot_programs0.cpp,
+  vu1aot::kPrograms0; code addresses masked with 0xFFF; vu0aot_none.cpp when not generated). VU0 has no XGKICK / EFU /
+  MFP / WAITP (the interpreter decodes them as reserved).
+- The generator now supports a branch in a taken branch's delay slot (the interpreter's inTakenDelaySlot, PCSX2
+  takedelaybranch): the first target's pair runs as the second branch's delay slot. The collision code depends on it
+  (0x0718 IBEQ with B 0x0438 in its slot, CLAUDE.md issue 10).
+- Runtime: the dispatcher is per unit (`Vu1AotUnit` g_vu1Aot / g_vu0Aot: mode, selection, counters, self-check);
+  `PS2X_VU0AOT` = unset / 0 / diff like PS2X_VU1AOT; `[vu0aot]` lines.
+- Diff mode, all 9 scenarios: 6.8 million VU0 runs compared, 0 differences, 0 bails, 0 not covered. Native: run_tests
+  all PASS. Collision function 0x20C660 at 60 FPS 18-24% -> 7-11% of the time; idle at 60 FPS on land 3-6% -> 13-25%,
+  at 50 FPS 7-21% -> 22-28%. The heaviest scenes at 60 are now bound by VU1 (~25%) and GS (~25%).

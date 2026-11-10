@@ -448,6 +448,10 @@ if(NOT VU1AOT_SRC_FILES)
     # Not generated (the folder is local): the empty program table, every VU1 run on the interpreter.
     set(VU1AOT_SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu/vu1aot_none.cpp")
 endif()
+# The VU0 table likewise (vu1gen.py --unit 0 writes aot_programs0.cpp).
+if(NOT VU1AOT_SRC_FILES MATCHES "aot_programs0[.]cpp")
+    list(APPEND VU1AOT_SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu/vu0aot_none.cpp")
+endif()
 target_sources(ps2_runtime PRIVATE
     ${VU1AOT_SRC_FILES}
 )
