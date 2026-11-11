@@ -408,13 +408,13 @@ class Gen:
         s = 0 if kicked else stall_for(st, p)
         if not kicked:
             # Budget: the interpreter stops at the loop top (cycle >= budget) or when the stall reaches it.
-            self.emit(ind + 'if (c.cycles + %d >= c.budget) { c.bail = BailBudget; c.bailPc = 0x%x; return false; }' % (s, pc))
+            self.emit(ind + 'if (cyc + %d >= budget) { c.bail = BailBudget; c.bailPc = 0x%x; return false; }' % (s, pc))
         commits = []
         for _ in range(s):
             commits += tick(st)
         self.emit_commits(commits, ind)
         if s:
-            self.emit(ind + 'if (!advance(c, %d)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % (s, pc))
+            self.emit(ind + 'if (!advanceLocal(c, cyc, %d)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % (s, pc))
         if lc == 'xgkick' and not kicked:
             # XGKICK waits until the previous packet has gone (calculatePairReadyCycle: cycle + 1 while PATH1 is
             # busy, re-checked every cycle). The wait is data-dependent: count it, then continue in the block made
@@ -423,8 +423,8 @@ class Gen:
             longest = max(list(st.vf) + list(st.vi) + list(st.acc) + [st.q, st.efures] + list(st.efu) +
                           [f[0] for f in st.flags] + list(st.vipend) + [0])
             self.emit(ind + 'uint32_t ex = 0;')
-            self.emit(ind + 'while (c.kick.active) { if (c.cycles + 1 >= c.budget) { c.bail = BailBudget; c.bailPc = 0x%x; return false; }'
-                      ' if (!advance(c, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; } ++ex; }' % (pc, pc))
+            self.emit(ind + 'while (c.kick.active) { if (cyc + 1 >= budget) { c.bail = BailBudget; c.bailPc = 0x%x; return false; }'
+                      ' if (!advanceLocal(c, cyc, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; } ++ex; }' % (pc, pc))
             self.emit(ind + 'switch (ex) {')
             sim = st.copy()
             landed = []  # commits of the extra cycles so far, in time order (each case jumps away: no fall-through)
@@ -597,7 +597,7 @@ class Gen:
         # advanceOneCycle.
         commits = tick(st)
         self.emit_commits(commits, ind)
-        self.emit(ind + 'if (!advance(c, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % pc)
+        self.emit(ind + 'if (!advanceLocal(c, cyc, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % pc)
 
         # Where the run goes next.
         if ctl[0] == 'e':
@@ -675,8 +675,8 @@ class Gen:
             self.emit(ind + '{ const uint32_t fl = %du;' % rem_dead)
         else:
             self.emit(ind + '{ const uint32_t fl = c.flagsLive ? %du : %du;' % (rem_live, rem_dead))
-        self.emit(ind + '  if (!advance(c, fl)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % next_pc)
-        self.emit(ind + '  uint32_t extra = 0; while (c.kick.active) { if (!advance(c, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; } ++extra; }' % next_pc)
+        self.emit(ind + '  if (!advanceLocal(c, cyc, fl)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % next_pc)
+        self.emit(ind + '  uint32_t extra = 0; while (c.kick.active) { if (!advanceLocal(c, cyc, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; } ++extra; }' % next_pc)
         self.emit(ind + '  const uint32_t total = fl + extra;')
         self.emit(ind + '  std::memset(c.vfResidue, 0, sizeof(c.vfResidue));')
         for i, r in enumerate(st.vf):
@@ -688,7 +688,7 @@ class Gen:
             self.emit(ind + 'c.branchBackupValid = true; c.branchBackupReg = %d; c.branchBackupValue = bk;' % st.backup)
         else:
             self.emit(ind + 'c.branchBackupValid = false; c.branchBackupReg = 0; c.branchBackupValue = 0;')
-        self.emit(ind + 'return true;')
+        self.emit(ind + 'c.cycles = cyc; return true;')
 
     def generate(self):
         self.out_consts = []
@@ -801,12 +801,15 @@ def main():
                  '#include "../vu1aot_ops.h"', '', 'namespace vu1aot', '{', 'namespace', '{']
         lines += ['    ' + x for x in g.out_consts]
         lines += ['}', '', 'bool %s(Ctx &c, uint32_t entry)' % fn, '{',
-                  '    VU1State &s = c.s;', '    FlagResult fr;', '    bool clipQ = false;', '    uint32_t clipV = 0;',
+                  '    VU1State &s = c.s;', '    uint64_t cyc = c.cycles; // cycles of this run, in a register; stored when returning',
+                  '    const uint64_t budget = c.budget;', '    FlagResult fr;', '    bool clipQ = false;', '    uint32_t clipV = 0;',
                   '    int32_t bk = 0;', '    bool br = false;', '    uint32_t jt = 0;',
                   '    (void)clipQ; (void)clipV; (void)bk; (void)br; (void)jt;', '    switch (entry)', '    {']
         for e, n in sorted(starts.items()):
             lines.append('    case 0x%x: goto %s;' % (e, n))
         lines += ['    default: return false;', '    }']
+        # A bail leaves c.cycles as it was: the dispatcher undoes a bailed run and does not read them, and a store in
+        # each of the thousands of bail sites pushed the biggest program past MSVC's size limit for optimizing.
         lines += g.out
         lines += ['}', '}', '']
         open(os.path.join(args.out, '%s.cpp' % fn), 'w').write('\n'.join(lines))

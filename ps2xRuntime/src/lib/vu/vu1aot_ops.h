@@ -11,6 +11,24 @@
 
 namespace vu1aot
 {
+    // advance() with the run's cycle count in a local of the generated function (`cyc`, stored to c.cycles when the
+    // function returns): c.cycles in memory made every pair's `+= n` and the next pair's budget check one
+    // store-to-load chain (~5 host cycles a pair). Only the transfer of a running XGKICK needs the context.
+    VU1AOT_INLINE bool advanceLocal(Ctx &c, uint64_t &cyc, uint32_t n)
+    {
+        cyc += n;
+        if (!c.kick.active)
+            return true;
+        c.kick.credit += n;
+        while (c.kick.active && c.kick.credit >= 2u)
+        {
+            c.kick.credit -= 2u;
+            if (!kickQword(c))
+                return false;
+        }
+        return true;
+    }
+
     namespace ops
     {
         VU1AOT_INLINE float nz(float v) { return vuNormalizeOperand(v); }

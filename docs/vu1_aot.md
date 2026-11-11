@@ -219,3 +219,16 @@ code per image: from the profiled entries, following branches and the profiled J
   where the two part (`PS2X_VU1AOT_REPLAY_TRACE=0`: the diff run only). A hand-made snapshot of this case (entry 0x10E8,
   `branchPending`, target 0x1110) now reports `not_idle 1` (interpreter jumps to 0x1110); the same without a pending
   branch: both stop at the same pcs at every budget.
+
+## Code generation notes (2026-11-11)
+
+- The run's cycle count is a local of the generated function (`cyc`, `advanceLocal` in vu1aot_ops.h; stored to
+  c.cycles on the successful exit only: the dispatcher undoes a bailed run and does not read it). Before, every pair
+  did `c.cycles += n` in memory and the next pair's budget check read it back. Effect small (glade_explore: program
+  4ead7b35a3a6 15.2% -> 14.5% of the game thread, 6af8ebd05633 3.9% -> 3.6%): out-of-order execution hid the chain.
+- **MSVC's size limit**: a function past it is compiled without any optimization, silently (warning C4883 is off by
+  default). The first try also stored c.cycles in every bail site (4677 stores in 4ead7b35a3a6): that program then
+  compiled to 2.5 MB of unoptimized code (everything on a 760 KB stack frame) and took 70% of the game thread instead
+  of 15%. The generated files are now compiled with `/d2OptimizeHugeFunctions` (optimizes them anyway: 0.6 MB, ~3 min
+  for that file) and `/w14883` (the warning in the build log). Profiling new levels can make a program bigger: check
+  the log for C4883 and the profile for a program that suddenly costs much more.
