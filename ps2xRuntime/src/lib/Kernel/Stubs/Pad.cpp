@@ -172,17 +172,17 @@ namespace ps2_stubs
                 return;
             }
 
-            // Keyboard mapping (PS2 -> keys):
-            // D-Pad: arrows, Square/Cross/Circle/Triangle: Z/X/C/V
-            // L1/R1: Q/E, L2/R2: 1/3, Start/Select: Enter/RightShift
-            // L3/R3: LeftCtrl/RightCtrl, Analog left: WASD
+            // Keyboard mapping (PS2 -> keys), the same as PSPadBackend (ps2_pad.cpp), which normally answers:
+            // arrows: D-Pad and left analog stick (Rayman moves with the stick, menus use the D-Pad),
+            // Cross: A or X (jump), Square: Space or Z (shoot), Circle/Triangle: C/V,
+            // L1/R1: Q/E, L2/R2: 1/3, Start/Select: Enter/RightShift, L3/R3: LeftCtrl/RightCtrl
             setButton(state, kPadBtnUp, IsKeyDown(KEY_UP));
             setButton(state, kPadBtnDown, IsKeyDown(KEY_DOWN));
             setButton(state, kPadBtnLeft, IsKeyDown(KEY_LEFT));
             setButton(state, kPadBtnRight, IsKeyDown(KEY_RIGHT));
 
-            setButton(state, kPadBtnSquare, IsKeyDown(KEY_Z));
-            setButton(state, kPadBtnCross, IsKeyDown(KEY_X));
+            setButton(state, kPadBtnSquare, IsKeyDown(KEY_Z) || IsKeyDown(KEY_SPACE));
+            setButton(state, kPadBtnCross, IsKeyDown(KEY_X) || IsKeyDown(KEY_A));
             setButton(state, kPadBtnCircle, IsKeyDown(KEY_C));
             setButton(state, kPadBtnTriangle, IsKeyDown(KEY_V));
 
@@ -203,13 +203,13 @@ namespace ps2_stubs
 
             float ax = 0.0f;
             float ay = 0.0f;
-            if (IsKeyDown(KEY_D))
+            if (IsKeyDown(KEY_RIGHT))
                 ax += 1.0f;
-            if (IsKeyDown(KEY_A))
+            if (IsKeyDown(KEY_LEFT))
                 ax -= 1.0f;
-            if (IsKeyDown(KEY_S))
+            if (IsKeyDown(KEY_DOWN))
                 ay += 1.0f;
-            if (IsKeyDown(KEY_W))
+            if (IsKeyDown(KEY_UP))
                 ay -= 1.0f;
 
             if (ax != 0.0f || ay != 0.0f)

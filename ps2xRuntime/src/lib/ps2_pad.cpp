@@ -89,32 +89,34 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     }
     // Keyboard is always read too (not only when no gamepad is detected), so a
     // connected-but-idle controller does not silently disable the keyboard.
+    // Rayman Revolution (user's mapping, 2026-11-11): arrows = move, A = jump (Cross), Space = shoot (Square).
+    // The game moves Rayman with the left analog stick only (the D-pad does not move him in a level) and its
+    // menus use the D-pad, so the arrows drive both. Z / X / C / V stay Square / Cross / Circle / Triangle.
     {
-        if (IsKeyDown(KEY_UP))
+        const bool up = IsKeyDown(KEY_UP), down = IsKeyDown(KEY_DOWN);
+        const bool left = IsKeyDown(KEY_LEFT), right = IsKeyDown(KEY_RIGHT);
+        if (up)
             clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN))
+        if (down)
             clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT))
+        if (left)
             clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT))
+        if (right)
             clearBit(PAD_RIGHT);
-        // WASD = left analog stick
+        // Arrows = left analog stick (full deflection) as well
         {
-            int ax = 0, ay = 0;
-            if (IsKeyDown(KEY_D)) ax += 1;
-            if (IsKeyDown(KEY_A)) ax -= 1;
-            if (IsKeyDown(KEY_S)) ay += 1;
-            if (IsKeyDown(KEY_W)) ay -= 1;
+            const int ax = (right ? 1 : 0) - (left ? 1 : 0);
+            const int ay = (down ? 1 : 0) - (up ? 1 : 0);
             if (ax != 0)
                 data[6] = static_cast<uint8_t>(ax > 0 ? 0xFF : 0x00);
             if (ay != 0)
                 data[7] = static_cast<uint8_t>(ay > 0 ? 0xFF : 0x00);
         }
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_A))
             clearBit(PAD_CROSS);
         if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
             clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_KP_0))
             clearBit(PAD_SQUARE);
         if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
             clearBit(PAD_TRIANGLE);
