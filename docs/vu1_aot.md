@@ -232,3 +232,9 @@ code per image: from the profiled entries, following branches and the profiled J
   of 15%. The generated files are now compiled with `/d2OptimizeHugeFunctions` (optimizes them anyway: 0.6 MB, ~3 min
   for that file) and `/w14883` (the warning in the build log). Profiling new levels can make a program bigger: check
   the log for C4883 and the profile for a program that suddenly costs much more.
+- Tried and dropped: an inline fast path in advanceLocal for XGKICK qwords inside a tag's data (kickQword only for
+  tags and tag ends). kickQword 2.0% -> 0.5%, but the programs grew by the same (4ead7b35a3a6 14.5% -> 15.3%): about
+  0.3% in all, for a build of the generated files of 43 min instead of 18 (thousands of inlined sites).
+- Where VU1 time goes now (glade_explore at 60 FPS, game thread): 4ead7b35a3a6 14.5%, 6af8ebd05633 3.6%, the VU0
+  collision e09ad6f75847 2.8%, kickQword 2%, lowerPlain 1.5%; idle 34%. The rest is the work of each pair (VF
+  registers live in Ctx memory); a real gain needs registers kept in SSE locals across a block.
