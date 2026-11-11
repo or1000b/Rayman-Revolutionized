@@ -229,7 +229,18 @@
       very close to it (the user: both cases were in narrow places, a corridor and a nook). Not the VU0 macro VDIV /
       VSQRT / VRSQRT (not used by the game). Careful: GS coordinates wrap at 16 bits (4096 pixels), so a far off-screen
       vertex can look on screen in a capture: judge coverage from VU1-side floats, not from the packets.
-    - Next: find the EE visibility test (camera vs object bounding volume) and why it culls a near object.
+    - Third capture with EE RAM + the user's PCSX2 state at the same spot (slot 6, `D:/PCSX2/sstates/SLES-50044 (55EDA5A0).06.p2s`;
+      out/issue19c, `python -I tools/p2s_extract.py <p2s> <dir> eeMemory.bin vu1Memory.bin`): PCSX2 has no hole. Same
+      memory layout. Rayman (-44.78, 79.79, -31.47) vs PCSX2 (-44.78, 79.09, -30.39); camera actor so 0x97a5c0 (type 2),
+      camera position / two view directions at 0x3807b0 (+0x50 position, +0x60 / +0x70 directions): ours (-38.04, 83.24,
+      -29.50) dir z -0.12, PCSX2 (-38.23, 82.70, -27.53) dir z -0.20: about the same view. Rayman's and the camera's
+      sector are the same (0xa93d00, sector superobjects have type 4). The per-frame render command stream at ~0x355740
+      (`03000000 <element 0x45xxxx> <mask> 1.0 3`, `04000000 <sector>` lists, `05000000 0xa1d0fc 0xa1d1e0`) lists the same
+      sectors (0xa994cc, 0xa43708, 0xa95164, 0xa6c0a0) in both; render elements are a reused 0x40-byte pool
+      (0x440000-0x470000: +4 geometry, +0x28 frame number), so compare geometry pointers, not slots: the current frame's
+      dynamic elements match except animation frames.
+    - Next: the static world inside a visible sector is culled per object somewhere after that list; find that test
+      (object bounding volume vs camera) and compare its inputs / result with PCSX2 for the wall's object.
     - Replay detail to check: a captured run of the flag-free program 4ead7b35a3a6 replays with status 0x0c0 on the interpreter and 0x000 native (live self-checks agree), so the replay's flag setup differs from the live one somewhere.
     - Tools: F11 (GPU renderer) -> `out/gif_capture.bin` (two scanout frames) + `out/gif_capture_frame0..2.bmp`; `python tools/gifhit.py out/gif_capture.bin <gs x> <gs y> --adc` (also the triangles dropped by ADC, and a count of those crossing the camera plane; GS x / y = screen + XYOFFSET, about 1728 + x, 1792 + y); `PS2X_VU1_PC_COUNT="0x1398,0x14c8,..."` (`[vu1-pc]` issue counts per VU1 address, interpreter runs: PS2X_VU1AOT=0). F11 also records every VU1 run of the next 4 guest VSyncs to `out/vu1cap/run_<n>.bin` (replayable snapshot) + `.pkt` (its PATH1 packets); `PS2X_VU1_CAPTURE_VSYNC=<vsync>` does the same from a script; `python tools/vu1capfind.py <kick> [gif_capture.bin] [vu1cap]` finds the run behind a capture kick.
 - Tools: `python tools/vudis.py out/vu1dump0_code.bin` disassembles VU microcode (upper ; lower, flags [I E M D T]).
