@@ -27,7 +27,8 @@
         { "type": "iopcd", "min_host": 1, "max_fail": 0, "label": "UBISOUND reads the disc through the host reader" },
         { "type": "deterministic", "label": "two runs with the same input end in the same state (EE RAM hash per second)" },
         { "type": "log_absent", "pattern": "\\[IOP\\] guest call 0x[0-9a-f]+ did not return", "label": "IOP calls (RPC handlers, callbacks) run to the end" },
-        { "type": "audio_peak", "after_tick": 600, "min": 6000, "label": "music and effects are audible (effects alone peak at ~3300: core 0 streams must reach the output)" }
+        { "type": "audio_peak", "after_tick": 600, "min": 6000, "label": "music and effects are audible (effects alone peak at ~3300: core 0 streams must reach the output)" },
+        { "type": "det_reference", "golden": "boot_to_language_menu.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ]
     },
     {
@@ -46,7 +47,8 @@
         { "type": "log_absent", "pattern": "\\[rayman-ai\\]", "label": "AI trees stay valid (no NULL / low-memory nodes)" },
         { "type": "shot", "tick": 2300, "min_variance": 300, "golden": "english_main_menu.bmp", "max_diff": 20, "label": "MAIN MENU" },
         { "type": "fps", "after_tick": 2000, "min": 20, "label": "game still renders after the language choice" },
-        { "type": "deterministic", "label": "two runs with the same input end in the same state" }
+        { "type": "deterministic", "label": "two runs with the same input end in the same state" },
+        { "type": "det_reference", "golden": "choose_english.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ]
     },
     {
@@ -70,7 +72,8 @@
         { "type": "shot", "tick": 5000, "min_variance": 100, "golden": "intro_cutscene.bmp", "max_diff": 20, "label": "intro cutscene draws" },
         { "type": "fps", "after_tick": 8500, "min": 10, "label": "first level runs" },
         { "type": "shot", "tick": 9600, "min_variance": 100, "golden": "intro_ship_cinematic.bmp", "max_diff": 20, "label": "first level is visible (the prison ship cinematic: was black until SQRT.S read ft, CLAUDE.md issue 7)" },
-        { "type": "shot", "tick": 12900, "min_variance": 100, "golden": "intro_rayman_on_grate.bmp", "max_diff": 20, "label": "Rayman stands on the grate with Murfy's hint (first moments of control)" }
+        { "type": "shot", "tick": 12900, "min_variance": 100, "golden": "intro_rayman_on_grate.bmp", "max_diff": 20, "label": "Rayman stands on the grate with Murfy's hint (first moments of control)" },
+        { "type": "det_reference", "golden": "intro_to_first_level.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ]
     },
     {
@@ -91,7 +94,8 @@
         { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=surface .*depth=[1-9]", "label": "Rayman does not sink through the water plane while swimming on the surface" },
         { "type": "shot", "tick": 8200, "min_variance": 100, "golden": "swim_diving.bmp", "max_diff": 20, "label": "Rayman diving, air bar shown" },
         { "type": "shot", "tick": 8850, "min_variance": 100, "golden": "swim_back_on_beach.bmp", "max_diff": 20, "label": "Rayman back on the beach after jumping out" },
-        { "type": "track", "metric": "air_rate", "min": -4.1, "max": -3.9, "label": "air falls 4 per real second while diving" }
+        { "type": "track", "metric": "air_rate", "min": -4.1, "max": -3.9, "label": "air falls 4 per real second while diving" },
+        { "type": "det_reference", "golden": "swim_tutorial.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ],
       "env": { "PS2X_RAYMAN_TRACK": "7300,8900,5" }
     },
@@ -109,7 +113,8 @@
         { "type": "vu1_hash", "golden": "shoot_minisaurus.vu1hash", "label": "VU1 sent the GS the same bytes as the reference (hash every 600 VSyncs)" },
         { "type": "shot", "tick": 7420, "min_variance": 100, "golden": "shoot_ball_at_hand.bmp", "region": [345, 192, 40, 40], "max_diff": 3, "label": "the energy ball at Rayman's hand" },
         { "type": "shot", "tick": 7432, "min_variance": 100, "golden": "shoot_ball_flying.bmp", "region": [333, 144, 36, 36], "max_diff": 3, "label": "the energy ball flying away" },
-        { "type": "shot", "tick": 7652, "min_variance": 100, "golden": "shoot_third_throw.bmp", "max_diff": 20, "label": "third throw (whole picture)" }
+        { "type": "shot", "tick": 7652, "min_variance": 100, "golden": "shoot_third_throw.bmp", "max_diff": 20, "label": "third throw (whole picture)" },
+        { "type": "det_reference", "golden": "shoot_minisaurus.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ]
     },
     {
@@ -128,7 +133,8 @@
         { "type": "track", "metric": "jump_height", "from": 7340, "to": 7480, "min": 2.93, "max": 3.31, "label": "standing jump: height (original 3.12, +-6%)" },
         { "type": "track", "metric": "z_speed", "from": 7550, "to": 7590, "min": -3.32, "max": -3.0, "label": "helicopter: fall speed while the jump button is held (original -3.16 u/s, +-5%)" },
         { "type": "track", "metric": "top_speed", "state": "ground", "from": 7650, "min": 9.0, "max": 9.75, "label": "walking speed with the stick held (original 9.38 u/s, +-4%)" },
-        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" }
+        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" },
+        { "type": "det_reference", "golden": "rayman_physics.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ]
     },
     {
@@ -147,7 +153,8 @@
         { "type": "track", "metric": "jump_height", "from": 7340, "to": 7480, "min": 2.93, "max": 3.31, "label": "standing jump: height (original 3.12, +-6%)" },
         { "type": "track", "metric": "z_speed", "from": 7550, "to": 7590, "min": -3.32, "max": -3.0, "label": "helicopter: fall speed while the jump button is held (original -3.16 u/s, +-5%)", "known_fail": "falls 11% faster at 50 FPS (-3.50): the engine integrates once per frame (variable time step), measured 2026-11-10" },
         { "type": "track", "metric": "top_speed", "state": "ground", "from": 7650, "min": 9.0, "max": 9.75, "label": "walking speed with the stick held (original 9.38 u/s, +-4%)" },
-        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" }
+        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" },
+        { "type": "det_reference", "golden": "rayman_physics_50.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ]
     },
     {
@@ -166,7 +173,8 @@
         { "type": "track", "metric": "jump_height", "from": 7340, "to": 7480, "min": 2.93, "max": 3.31, "label": "standing jump: height (original 3.12, +-6%)" },
         { "type": "track", "metric": "z_speed", "from": 7550, "to": 7590, "min": -3.32, "max": -3.0, "label": "helicopter: fall speed while the jump button is held (original -3.16 u/s, +-5%)", "known_fail": "falls 13% faster at 60 FPS (-3.58): the engine integrates once per frame (variable time step), measured 2026-11-10" },
         { "type": "track", "metric": "top_speed", "state": "ground", "from": 7650, "min": 9.0, "max": 9.75, "label": "walking speed with the stick held (original 9.38 u/s, +-4%)" },
-        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" }
+        { "type": "track", "metric": "top_speed", "state": "surface", "from": 7650, "min": 8.9, "max": 11.4, "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)" },
+        { "type": "det_reference", "golden": "rayman_physics_60.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ]
     },
     {
@@ -184,7 +192,8 @@
         { "type": "log_absent", "pattern": "water=32767", "label": "the water plane stays detected (CLAUDE.md issue 13: VCALLMSR started VU0 at a garbage address, every ray test missed)" },
         { "type": "log_absent", "pattern": "\\[rayman-state\\] .*state=surface .*depth=[1-9]", "label": "Rayman does not sink through the water plane while swimming on the surface" },
         { "type": "track", "metric": "game_ms_per_s", "from": 7300, "to": 8900, "min": 999, "max": 1001, "label": "game time runs at real time (game clock ms per real second)" },
-        { "type": "track", "metric": "air_rate", "min": -4.1, "max": -3.9, "label": "air falls 4 per real second while diving (original rate: 4)" }
+        { "type": "track", "metric": "air_rate", "min": -4.1, "max": -3.9, "label": "air falls 4 per real second while diving (original rate: 4)" },
+        { "type": "det_reference", "golden": "swim_tutorial_60fps.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ],
       "env": { "PS2X_RAYMAN_TRACK": "7300,8900,5", "PS2X_FRAMERATE": "60" }
     },
@@ -215,7 +224,8 @@
       "env": { "PS2X_FRAMERATE": "60" },
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
-        { "type": "log_absent", "pattern": "aot\\] self-check|aot-diff\\]", "label": "native VU0 / VU1 code agrees with the interpreter (self-check)" }
+        { "type": "log_absent", "pattern": "aot\\] self-check|aot-diff\\]", "label": "native VU0 / VU1 code agrees with the interpreter (self-check)" },
+        { "type": "det_reference", "golden": "glade_explore.det", "label": "the guest did exactly what it did in the reference run (VSync, EE cycle, EE RAM hash every second)" }
       ]
     }
   ]

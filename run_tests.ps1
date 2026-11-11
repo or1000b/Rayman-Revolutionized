@@ -153,9 +153,25 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     # load. The save folders keep their time in a hidden .ps2x-dir-time file, so the copy still loads.
     if ($sc.PSObject.Properties['memcard']) {
         $fixture = Join-Path (Join-Path $Root 'tests') $sc.memcard
-        if (Test-Path $fixture) { Copy-Item -Recurse -Force (Join-Path $fixture '*') $mcRoot }
+        if (Test-Path $fixture) {
+            Copy-Item -Recurse -Force (Join-Path $fixture '*') $mcRoot
+            # The copies keep the fixture's times (the game reads a file's write time in sceMcGetDir).
+            Get-ChildItem -Recurse -Force $mcRoot | ForEach-Object {
+                $source = Join-Path $fixture $_.FullName.Substring($mcRoot.Length + 1)
+                if (Test-Path -LiteralPath $source) {
+                    $item = Get-Item -Force -LiteralPath $source
+                    $_.CreationTime = $item.CreationTime
+                    $_.LastWriteTime = $item.LastWriteTime
+                }
+            }
+        }
         else { Write-Host "  WARNING: memory card fixture $fixture is missing (local only, see CLAUDE.md); empty card" }
     }
+    # The card folder itself gets a fixed time: a save folder's ".." entry reports it (its creation time), and a
+    # folder made fresh for every run made two runs of the same scenario differ from the card load on (vsync 1320).
+    $cardTime = Get-Date -Year 2026 -Month 1 -Day 1 -Hour 12 -Minute 0 -Second 0 -Millisecond 0
+    (Get-Item -Force $mcRoot).CreationTime = $cardTime
+    (Get-Item -Force $mcRoot).LastWriteTime = $cardTime
     $env:PS2X_MC_ROOT = $mcRoot
     # Extra variables of this scenario ("env": { "PS2X_UBI_TRACE": "1" }); cleared again after the run.
     $extraEnv = @()
@@ -364,6 +380,31 @@ if ($buildOk) {
                     if ($split -ge 0) { Write-CheckResult $sc.name $check $false ("differs at $($split + 1) of $($ref.Count)`n  reference: $($ref[$split])`n  this run:  $($got[$split])") }
                     elseif ($ref.Count -ne $got.Count) { Write-CheckResult $sc.name $check $false "same for $n hashes, then $($got.Count) vs $($ref.Count) in the reference" }
                     else { Write-CheckResult $sc.name $check $true "$n hashes identical (last: $($got[$n - 1]))" }
+                }
+                'det_reference' {
+                    # Every [det] fingerprint (VSync, EE cycle, EE RAM hash, once a second) must equal the reference
+                    # (tests\golden\<golden>): the guest did exactly what it did before. For changes that must not
+                    # change the game (speed work); a deliberate behaviour change renews it with -UpdateGolden. Lines
+                    # in the last second before the frame budget race with the end of the run: not counted.
+                    $budget = [int]$sc.frames - 60
+                    $got = @($lines | ForEach-Object {
+                            if ($_ -match '^\[det\] vsync=(\d+) cycle=\d+ ee=[0-9a-f]+' -and [int]$Matches[1] -lt $budget) { $Matches[0] } })
+                    if ($got.Count -eq 0) { Write-CheckResult $sc.name $check $false 'no [det] lines (PS2X_DETERMINISTIC)'; break }
+                    $golden = Join-Path $GoldenDir $check.golden
+                    if ($UpdateGolden -or -not (Test-Path $golden)) {
+                        New-Item -ItemType Directory -Force $GoldenDir | Out-Null
+                        $what = $(if ($UpdateGolden) { 'reference updated' } else { 'no reference yet: written from this run' })
+                        Set-Content -Path $golden -Value $got -Encoding ascii
+                        Write-CheckResult $sc.name $check $true "$($got.Count) fingerprints; $what"
+                        break
+                    }
+                    $ref = @(Get-Content $golden | Where-Object { $_ -match 'vsync=(\d+)' -and [int]$Matches[1] -lt $budget })
+                    $n = [math]::Min($ref.Count, $got.Count)
+                    $split = -1
+                    for ($i = 0; $i -lt $n; $i++) { if ($ref[$i] -ne $got[$i]) { $split = $i; break } }
+                    if ($split -ge 0) { Write-CheckResult $sc.name $check $false ("differs at $($split + 1) of $($ref.Count)`n  reference: $($ref[$split])`n  this run:  $($got[$split])") }
+                    elseif ($ref.Count -ne $got.Count) { Write-CheckResult $sc.name $check $false "same for $n fingerprints, then $($got.Count) vs $($ref.Count) in the reference" }
+                    else { Write-CheckResult $sc.name $check $true "$n fingerprints identical (last: $($got[$n - 1]))" }
                 }
                 'shot' {
                     $shot = $shotFiles | Where-Object { $_.Tick -ge $check.tick } | Select-Object -First 1
