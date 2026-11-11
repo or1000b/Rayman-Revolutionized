@@ -8,6 +8,7 @@
 extern "C" uint16_t ps2xTestPadButtons(int port); // ps2_test_harness.cpp (scripted input for unattended runs)
 extern "C" bool ps2xTestPadAxes(int port, uint8_t axes[4]); // same: scripted analog sticks (rx, ry, lx, ly)
 extern "C" bool ps2xTestMode();                  // ps2_test_harness.cpp: unattended run, ignore real input
+extern "C" bool ps2xHostGamepadRead(uint16_t *buttons, uint8_t axes[4]); // ps2_pad.cpp: Xbox / PlayStation pad
 // --- Rayman debug: log the first calls of each libpad entry point to stderr ---
 namespace
 {
@@ -128,41 +129,19 @@ namespace ps2_stubs
                 return;
             }
 
-            const int gamepad = findFirstGamepad();
-            if (gamepad < 0)
+            // Xbox / PlayStation controller: the same reading as PSPadBackend (ps2_pad.cpp ps2xHostGamepadRead:
+            // first connected pad, buttons by position, sticks with a dead zone).
+            uint16_t padButtons = 0xFFFFu;
+            uint8_t axes[4];
+            if (!ps2xHostGamepadRead(&padButtons, axes))
             {
                 return;
             }
-
-            // Raylib mapping (PS2 -> raylib buttons/axes):
-            // D-Pad -> LEFT_FACE_*, Cross/Circle/Square/Triangle -> RIGHT_FACE_*
-            // L1/R1 -> TRIGGER_1, L2/R2 -> TRIGGER_2, L3/R3 -> THUMB
-            // Select/Start -> MIDDLE_LEFT/MIDDLE_RIGHT
-            state.lx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
-            state.ly = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
-            state.rx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
-            state.ry = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
-
-            setButton(state, kPadBtnUp, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP));
-            setButton(state, kPadBtnDown, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN));
-            setButton(state, kPadBtnLeft, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT));
-            setButton(state, kPadBtnRight, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
-
-            setButton(state, kPadBtnCross, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN));
-            setButton(state, kPadBtnCircle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT));
-            setButton(state, kPadBtnSquare, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT));
-            setButton(state, kPadBtnTriangle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP));
-
-            setButton(state, kPadBtnL1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1));
-            setButton(state, kPadBtnR1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1));
-            setButton(state, kPadBtnL2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2));
-            setButton(state, kPadBtnR2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2));
-
-            setButton(state, kPadBtnL3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB));
-            setButton(state, kPadBtnR3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB));
-
-            setButton(state, kPadBtnSelect, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT));
-            setButton(state, kPadBtnStart, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
+            state.buttons = static_cast<uint16_t>(state.buttons & padButtons);
+            state.rx = axes[0];
+            state.ry = axes[1];
+            state.lx = axes[2];
+            state.ly = axes[3];
         }
 
         void applyKeyboardState(PadInputState &state, bool allowAnalog)

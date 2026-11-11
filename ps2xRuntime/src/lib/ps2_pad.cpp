@@ -1,6 +1,107 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+namespace
+{
+    // PS2X_PAD_DEADZONE (0 .. 0.9, default 0.15): stick travel ignored around the centre (radial). Worn sticks rest a
+    // little off centre, which would walk Rayman by himself.
+    float padDeadZone()
+    {
+        static const float zone = []
+        {
+            const char *env = std::getenv("PS2X_PAD_DEADZONE");
+            const float value = env ? static_cast<float>(std::atof(env)) : 0.15f;
+            return std::clamp(value, 0.0f, 0.9f);
+        }();
+        return zone;
+    }
+
+    // A stick (x, y in -1 .. 1) with the dead zone, rescaled so full travel stays full, as DualShock bytes
+    // (0x00 left / up, 0x80 centre, 0xFF right / down).
+    void stickToBytes(float x, float y, uint8_t &outX, uint8_t &outY)
+    {
+        const float zone = padDeadZone();
+        const float length = std::sqrt(x * x + y * y);
+        if (length <= zone || length <= 0.0f)
+        {
+            x = y = 0.0f;
+        }
+        else
+        {
+            const float scale = std::min(1.0f, (length - zone) / (1.0f - zone)) / length;
+            x *= scale;
+            y *= scale;
+        }
+        auto toByte = [](float v)
+        { return static_cast<uint8_t>(std::lround((std::clamp(v, -1.0f, 1.0f) + 1.0f) * 127.5f)); };
+        outX = toByte(x);
+        outY = toByte(y);
+    }
+}
+
+// Xbox controllers (XInput) and PlayStation 3 / 4 / 5 controllers (DirectInput, through GLFW's built-in SDL
+// GameControllerDB mappings; ps2_runtime.cpp adds the DualSense Edge and PS2X_PAD_MAPPINGS) via raylib. Every pad is
+// seen in the Xbox layout, and the DualShock 2's buttons go by position: A / Cross, B / Circle, X / Square,
+// Y / Triangle, LB / L1, RB / R1, LT / L2, RT / R2, Back (Share, Create) / Select, Start (Options) / Start, stick
+// clicks / L3 / R3, D-pad, both sticks. The first connected pad answers (plugging one in or out while playing works).
+// buttons: active low, DualShock bit order; axes: rx, ry, lx, ly (0x80 = centre). False when no pad is connected.
+extern "C" bool ps2xHostGamepadRead(uint16_t *buttons, uint8_t axes[4])
+{
+    static int s_lastPad = -2;
+    int pad = -1;
+    for (int i = 0; i < 4 && pad < 0; ++i)
+        if (IsGamepadAvailable(i))
+            pad = i;
+    if (pad != s_lastPad)
+    {
+        if (pad >= 0)
+            std::fprintf(stderr, "[pad] controller %d connected: %s\n", pad, GetGamepadName(pad));
+        else if (s_lastPad >= 0)
+            std::fprintf(stderr, "[pad] controller disconnected\n");
+        s_lastPad = pad;
+    }
+    if (pad < 0)
+        return false;
+
+    struct ButtonMap
+    {
+        int raylib;
+        uint16_t ps2;
+    };
+    static constexpr ButtonMap kMap[] = {
+        {GAMEPAD_BUTTON_LEFT_FACE_UP, 0x0010u},     // Up
+        {GAMEPAD_BUTTON_LEFT_FACE_RIGHT, 0x0020u},  // Right
+        {GAMEPAD_BUTTON_LEFT_FACE_DOWN, 0x0040u},   // Down
+        {GAMEPAD_BUTTON_LEFT_FACE_LEFT, 0x0080u},   // Left
+        {GAMEPAD_BUTTON_RIGHT_FACE_UP, 0x1000u},    // Triangle (Y)
+        {GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, 0x2000u}, // Circle (B)
+        {GAMEPAD_BUTTON_RIGHT_FACE_DOWN, 0x4000u},  // Cross (A)
+        {GAMEPAD_BUTTON_RIGHT_FACE_LEFT, 0x8000u},  // Square (X)
+        {GAMEPAD_BUTTON_LEFT_TRIGGER_1, 0x0400u},   // L1
+        {GAMEPAD_BUTTON_RIGHT_TRIGGER_1, 0x0800u},  // R1
+        {GAMEPAD_BUTTON_LEFT_TRIGGER_2, 0x0100u},   // L2 (raylib: trigger past 10%)
+        {GAMEPAD_BUTTON_RIGHT_TRIGGER_2, 0x0200u},  // R2
+        {GAMEPAD_BUTTON_MIDDLE_LEFT, 0x0001u},      // Select
+        {GAMEPAD_BUTTON_MIDDLE_RIGHT, 0x0008u},     // Start
+        {GAMEPAD_BUTTON_LEFT_THUMB, 0x0002u},       // L3
+        {GAMEPAD_BUTTON_RIGHT_THUMB, 0x0004u},      // R3
+    };
+    uint16_t pressed = 0u;
+    for (const ButtonMap &m : kMap)
+        if (IsGamepadButtonDown(pad, m.raylib))
+            pressed |= m.ps2;
+    *buttons = static_cast<uint16_t>(~pressed);
+    stickToBytes(GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_X), GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_Y),
+                 axes[0], axes[1]);
+    stickToBytes(GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X), GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y),
+                 axes[2], axes[3]);
+    return true;
+}
 
 namespace
 {
@@ -38,54 +139,21 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
-    if (useGamepad)
+    // Xbox / PlayStation controller (ps2xHostGamepadRead above): buttons, both sticks with a dead zone.
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
-            clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
-            clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
-            clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
-            clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
-            clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
-            clearBit(PAD_R3);
-
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = static_cast<uint8_t>(128 + lx * 127);
-        data[7] = static_cast<uint8_t>(128 + ly * 127);
-        data[4] = static_cast<uint8_t>(128 + rx * 127);
-        data[5] = static_cast<uint8_t>(128 + ry * 127);
+        uint16_t padButtons = 0xFFFFu;
+        uint8_t axes[4];
+        if (ps2xHostGamepadRead(&padButtons, axes))
+        {
+            btns &= padButtons;
+            data[4] = axes[0];
+            data[5] = axes[1];
+            data[6] = axes[2];
+            data[7] = axes[3];
+        }
     }
     // Keyboard is always read too (not only when no gamepad is detected), so a
     // connected-but-idle controller does not silently disable the keyboard.

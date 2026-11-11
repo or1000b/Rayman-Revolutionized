@@ -908,6 +908,28 @@ bool PS2Runtime::initialize(const char *title)
             const char *testMode = std::getenv("PS2X_TEST_MODE");
             if (full && std::strcmp(full, "1") == 0 && !(testMode && std::atoi(testMode) != 0))
                 ToggleBorderlessWindowed();
+            // raylib closes the window on ESC by default, but ESC is the keyboard's Circle (ps2_pad.cpp: back in
+            // menus): only the window's close button ends the game.
+            SetExitKey(KEY_NULL);
+            // Controllers (ps2_pad.cpp ps2xHostGamepadRead): GLFW knows Xbox (XInput) and DualShock 3 / 4 /
+            // DualSense pads; the DualSense Edge is added here (the DualSense layout). PS2X_PAD_MAPPINGS=<file>, or
+            // gamecontrollerdb.txt in the working folder: more SDL GameControllerDB lines for other pads.
+            SetGamepadMappings("030000004c050000f20d000000000000,DualSense Edge Wireless Controller,a:b1,b:b2,back:b8,"
+                               "dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b12,leftshoulder:b4,leftstick:b10,"
+                               "lefttrigger:a3,leftx:a0,lefty:a1,misc1:b13,rightshoulder:b5,rightstick:b11,"
+                               "righttrigger:a4,rightx:a2,righty:a5,start:b9,x:b0,y:b3,platform:Windows,");
+            const char *mappingFile = std::getenv("PS2X_PAD_MAPPINGS");
+            if (!mappingFile || !*mappingFile)
+                mappingFile = "gamecontrollerdb.txt";
+            if (FileExists(mappingFile))
+            {
+                if (char *mappings = LoadFileText(mappingFile))
+                {
+                    std::cerr << "[pad] controller mappings from " << mappingFile << ": "
+                              << (SetGamepadMappings(mappings) ? "loaded" : "not understood") << std::endl;
+                    UnloadFileText(mappings);
+                }
+            }
         }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
