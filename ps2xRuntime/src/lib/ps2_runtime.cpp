@@ -39,6 +39,7 @@ extern "C" void ps2xRequestGsCapture();         // gs_cpu_backend.cpp
 extern "C" void ps2xRequestVu1Capture();        // ps2_vu1_core.cpp: F11, every VU1 run of the next VSyncs
 extern "C" void ps2xRequestEeDump();            // ps2_test_harness.cpp: F11, EE RAM at the next VSync
 extern "C" uint64_t ps2xGuestDisplayFlips();       // EeScheduler.cpp: display flips counted at guest VBlanks
+extern "C" uint32_t ps2xVBlankRateOverrideHz();    // EeScheduler.cpp: PS2X_FRAMERATE (0 = unset)
 extern "C" int ps2xGsStatsLine(char *buffer, int size);
 extern "C" int ps2xSpu2ReadSamples(int16_t *out, int frames); // ps2xIOP SPU2 output ring
 extern "C" int ps2xSpu2StatsLine(char *buffer, int size);
@@ -912,7 +913,14 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startSpu2Stream();
 #endif
-        SetTargetFPS(60);
+        // The window draws at least as often as the game shows frames (PS2X_FRAMERATE=120: 120 per second; was 60
+        // always, so frames above 60 were never seen). A new frame is only fetched after a guest VSync. Test runs keep
+        // 60: a non-deterministic scenario's ticks are window frames (pacing_realtime at 120).
+        {
+            const char *testMode = std::getenv("PS2X_TEST_MODE");
+            const bool testRun = testMode && std::atoi(testMode) != 0;
+            SetTargetFPS(testRun ? 60 : static_cast<int>(std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz())));
+        }
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);

@@ -26,8 +26,8 @@ set PS2X_ASPECT=
 rem Scaling to the screen: bilinear = smooth, nearest = sharp pixels.
 set PS2X_FILTER=bilinear
 
-rem Frames per second: 60 = smooth, 50 = the original PAL game.
-set PS2X_FRAMERATE=60
+rem Frames per second: 60 = smooth, 50 = the original PAL game. run_rayman_hd_120fps.bat runs these settings at 120.
+if not defined PS2X_FRAMERATE set PS2X_FRAMERATE=60
 
 rem Show the FPS counter: 1 = yes, 0 = no.
 set PS2X_SHOW_FPS=1

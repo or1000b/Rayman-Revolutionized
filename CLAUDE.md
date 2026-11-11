@@ -32,7 +32,7 @@
   - Slow; only needed after changing the recompiler or `rayman.toml`.
 - `rebuild_rayman.bat`: incremental build (`cmake --build out\game --target ps2EntryRunner`, output in `out\build_game.log`), then runs the game.
 - `run_rayman.bat`: moves `out\run.log` to `out\run_prev.log`, then runs `out\game\ps2xRuntime\ps2EntryRunner.exe "<repo>\Rayman revolution files\SLES_500.44"` with stdout and stderr going to `out\run.log`.
-- `run_rayman_hd.bat`: the user's high resolution / full screen settings, then `run_rayman.bat`. Environment, read at start:
+- `run_rayman_hd.bat`: the user's high resolution / full screen settings, then `run_rayman.bat` (`run_rayman_hd_120fps.bat`: the same at `PS2X_FRAMERATE=120`; the window draws max(60, PS2X_FRAMERATE) per second, 60 in test runs because pacing_realtime's ticks are window frames; measured at 120 with SSAA x4 + 16:9 on pacing_realtime: 88-98 game FPS, game time exact). Environment, read at start:
   - `PS2X_GS_SSAA` 1 / 2 / 4 / 8 / 16: paraLLEl-GS super sampling (default 1). From 4 on the scanout is also twice the size (`VSyncInfo::high_resolution_scanout`: 1280 x 1024 PAL; `PS2X_GS_HIRES=0` keeps 640 x 512). `PS2X_GS_SSAA_TEXTURES=1`: super-sampled textures too.
   - `PS2X_FULLSCREEN=1`: borderless full screen at the monitor's resolution (not in test mode); F10 switches while playing. `PS2X_WINDOW=<w>x<h>`: window size (default 640 x 448).
   - `PS2X_ASPECT`: 4:3 (default, black bars), any `w:h`, `stretch`, `pixel` (the frame's own pixel shape, 640 x 512 = 1.25: the look before 2026-11-11). `PS2X_FILTER`: bilinear (default) / nearest. `PS2X_SHOW_FPS=0` hides the counter.
