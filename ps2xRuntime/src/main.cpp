@@ -367,6 +367,78 @@ namespace
             std::cerr << "[hle] Rayman: failed to install the frame rate change" << std::endl;
     }
 
+    // ------------------------------------------------------------------
+    // PS2X_WIDESCREEN=16:9 (any w:h wider than 4:3; 1 = 16:9): the 3D view widened to that aspect, as the PCSX2
+    // widescreen patch for this ELF (SLES-50044 55EDA5A0, ElHecht & ICUP321) does; the window then shows the frame at
+    // that aspect (ps2_runtime.cpp HostDisplayAspect), so 2D (HUD, menus, videos) is stretched as in PCSX2.
+    // - Projection: RenderWare's RwCameraSetViewWindow 0x18C660 (viewWindow at +0x68, recipViewWindow +0x70 / +0x74;
+    //   then marks the camera's frame dirty, 0x18E670) gets recipViewWindow.x scaled by f = (4/3) / aspect (0.75 for
+    //   16:9; the patch's mul.s at 0x18C6A4): x is squeezed, the 4:3 frame holds the wider view.
+    // - Culling: the game's camera planes (0x117FB8) take tanf(fov x / 2) at 0x118140 for the side planes (+0x8C -
+    //   +0xA4); the patch divides that half angle by f (div.s at 0x1180EC), so objects at the new edges stay. Here
+    //   tanf (0x217DA0) does it for the call returning to 0x118148.
+    constexpr uint32_t kRaymanSetViewWindowAddr = 0x0018C660u;
+    constexpr uint32_t kRaymanTanfAddr = 0x00217DA0u;
+    constexpr uint32_t kRaymanSidePlaneTanReturn = 0x00118148u;
+    PS2Runtime::RecompiledFunction g_raymanSetViewWindow = nullptr;
+    PS2Runtime::RecompiledFunction g_raymanTanf = nullptr;
+    float g_raymanWideFactor = 1.0f;
+
+    void raymanSetViewWindowWide(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t camera = getRegU32(ctx, 4);
+        g_raymanSetViewWindow(rdram, ctx, runtime);
+        float recipX = 0.0f;
+        std::memcpy(&recipX, rdram + ((camera + 0x70u) & 0x01FFFFFCu), sizeof(recipX));
+        raymanRamWriteFloat(rdram, camera + 0x70u, recipX * g_raymanWideFactor);
+    }
+
+    void raymanTanfWide(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (getRegU32(ctx, 31) == kRaymanSidePlaneTanReturn)
+            ctx->f[12] = ctx->f[12] / g_raymanWideFactor;
+        g_raymanTanf(rdram, ctx, runtime);
+    }
+
+    void installRaymanWidescreen(PS2Runtime &runtime, uint8_t *rdram)
+    {
+        const char *env = std::getenv("PS2X_WIDESCREEN");
+        if (!env || !*env || std::strcmp(env, "0") == 0)
+            return;
+        float w = 16.0f, h = 9.0f;
+        if (std::strcmp(env, "1") != 0 && (std::sscanf(env, "%f:%f", &w, &h) != 2 || w <= 0.0f || h <= 0.0f))
+        {
+            std::cerr << "[hle] Rayman: PS2X_WIDESCREEN=" << env << " not understood (use e.g. 16:9)" << std::endl;
+            return;
+        }
+        const float factor = (4.0f / 3.0f) / (w / h);
+        if (!(factor > 0.2f && factor < 1.0f))
+        {
+            std::cerr << "[hle] Rayman: PS2X_WIDESCREEN=" << env << " is not wider than 4:3, ignored" << std::endl;
+            return;
+        }
+        const bool codeMatches = raymanRam32(rdram, kRaymanSetViewWindowAddr) == 0x27BDFFE0u &&         // addiu sp,sp,-0x20
+                                 raymanRam32(rdram, kRaymanSetViewWindowAddr + 0x38u) == 0x46010043u && // div.s f1,f0,f1
+                                 raymanRam32(rdram, kRaymanSetViewWindowAddr + 0x4Cu) == 0xE6010070u && // swc1 f1,0x70(s0)
+                                 raymanRam32(rdram, kRaymanSidePlaneTanReturn - 8u) == 0x0C085F68u &&   // jal 0x217DA0
+                                 raymanRam32(rdram, 0x001180D8u) == 0x46166302u &&                      // mul.s f12,f12,f22
+                                 runtime.hasFunction(kRaymanSetViewWindowAddr) && runtime.hasFunction(kRaymanTanfAddr);
+        if (!codeMatches)
+        {
+            std::cerr << "[hle] Rayman: PS2X_WIDESCREEN: camera code not found, the view stays 4:3" << std::endl;
+            return;
+        }
+        g_raymanWideFactor = factor;
+        g_raymanSetViewWindow = runtime.lookupFunction(kRaymanSetViewWindowAddr);
+        g_raymanTanf = runtime.lookupFunction(kRaymanTanfAddr);
+        if (g_raymanSetViewWindow && g_raymanTanf &&
+            runtime.registerFunction(kRaymanSetViewWindowAddr, &raymanSetViewWindowWide) &&
+            runtime.registerFunction(kRaymanTanfAddr, &raymanTanfWide))
+            std::cerr << "[hle] Rayman: widescreen " << w << ":" << h << " (view x scale " << factor << ")" << std::endl;
+        else
+            std::cerr << "[hle] Rayman: failed to install widescreen" << std::endl;
+    }
+
     // 0x1DF7F0 evaluates one AI behaviour tree (a0 = actor context, a1 = first node, a2 = result
     // record in scratchpad). The game crashed in two runs when an actor's rule handed it a NULL tree:
     // the evaluator then walks address 0 upward as nodes until it jumps through a missing table entry.
@@ -1200,6 +1272,7 @@ namespace
             std::cerr << "[hle] Rayman: failed to install wait helper" << std::endl;
 
         installRaymanFramerate(runtime, rdram);
+        installRaymanWidescreen(runtime, rdram);
 
         uint32_t evalEntryWord = 0u;
         std::memcpy(&evalEntryWord, rdram + kRaymanEvalTreeAddr, sizeof(evalEntryWord));

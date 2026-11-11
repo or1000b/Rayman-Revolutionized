@@ -469,7 +469,8 @@ namespace
 }
 
 // Window settings (environment, read once): PS2X_FILTER=nearest keeps sharp pixels when the picture is scaled
-// (default bilinear); PS2X_ASPECT=4:3 (default: the PS2's TV picture), 16:9, stretch (fill the window) or pixel (the
+// (default bilinear); PS2X_ASPECT=4:3 (default: the PS2's TV picture; PS2X_WIDESCREEN's aspect when that is set),
+// 16:9, stretch (fill the window) or pixel (the
 // frame's own pixel ratio, the old look: 640 x 512 at 1.25); PS2X_WINDOW=<width>x<height> (default 640x448);
 // PS2X_FULLSCREEN=1 (borderless at the monitor's resolution; F10 switches); PS2X_SHOW_FPS=0 hides the counter.
 static int HostTextureFilter()
@@ -490,7 +491,16 @@ static float HostDisplayAspect()
     {
         const char *env = std::getenv("PS2X_ASPECT");
         if (!env || !*env)
+        {
+            // PS2X_WIDESCREEN=w:h (main.cpp: the game's 3D view widened to it; 1 = 16:9): shown at that aspect.
+            const char *wide = std::getenv("PS2X_WIDESCREEN");
+            float w = 0.0f, h = 0.0f;
+            if (wide && std::strcmp(wide, "1") == 0)
+                return 16.0f / 9.0f;
+            if (wide && std::sscanf(wide, "%f:%f", &w, &h) == 2 && w > 0.0f && h > 0.0f && w / h > 4.0f / 3.0f)
+                return w / h;
             return 4.0f / 3.0f;
+        }
         if (std::strcmp(env, "stretch") == 0)
             return 0.0f;
         if (std::strcmp(env, "pixel") == 0)
