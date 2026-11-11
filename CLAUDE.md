@@ -215,7 +215,21 @@
     - In a glade_explore frame without holes, 1389 triangles that cross the camera plane (Q of some vertices > 0, others < 0) are sent with ADC = 1 (not drawn), and no drawn vertex lies on a near plane: the dropped parts are hidden by other geometry there. `PS2X_VU1_PC_COUNT` (interpreter): the clipper's DIV at 0x14c8 runs ~445000 times by vsync 5400, and 65% of the triangles reaching 0x1398 take the classification path, so the clipper is not simply skipped.
     - **PCSX2 draws the wall at the same spot** (user's picture 2026-11-11, the cage in the Fairy Glade): a bug of the port. The camera angle in the two pictures differs a little (PCSX2 shows the cage's wooden beam diagonally, ours end-on), so the camera position is not proven equal yet.
     - The user's F11 capture (out/issue19/: guest vsync ~5992, Rayman at -45.6, 77.2, -30.5 in the air): at a hole pixel only the background quad (RGB 0,239,239) is drawn. The rock wall is kick 408: a strip (prim 0x5c, 25 vertices) whose vertices 5, 7 and 9 are behind the camera (Q < 0) and 0-12 all carry ADC = 1; it went through the VU1 program's strip ("drop") path, while the clipping path's output (fans with vertices on the guard band, x = 2560) exists elsewhere in the frame.
-    - Next: with an F11 capture that includes out/vu1cap, find the run behind the dropped strip (tools/vu1capfind.py) and replay it to see where the strip / clip decision is made (VU1 test or an EE flag).
+    - Second F11 capture with the VU1 runs (out/issue19b, guest vsync 11699, Rayman at -44.8, 80.6, -33; the hole is
+      buffer x 55-233, y 96-330, centre (142, 205); the game draws 512 wide, XYOFFSET 1792): **no VU1 output covers the
+      hole centre at all, not even with ADC.** Checked by replaying every run of the main program (image 27ff7b744d06021c,
+      md5 5158c011; out/issue19b/*.py): its strip phase (0x0168-0x0b10: per-vertex flags with the CLIP / FCGET timing
+      trick at 0x0580-0x05c8, ADC loop 0x08a0-0x0978) and its triangle phase (0x0ef8 -> 0x10c8: trivial rejects
+      0x1238-0x1270, near test vs vf6.w = 0.25 at 0x1398, clipper 0x14a8-0x15b8, output 0x1878 -> XGKICK 0x3638)
+      hold no triangle containing the hole centre (clipped at z = 0.25 and projected (x/w + 0.5) * 512). The near-plane
+      classification matched the geometry in all 79 triangles checked, and clipped triangles do reach the GS as fans.
+      Program 6af8ebd05633 (image 9ee1978f6ea52682, md5 ffbe6ea7) has no CLIP at all (objects entirely in view); no
+      drawn vertex in the frame has Q < 0, so it got no object crossing the camera plane.
+    - Conclusion: **the wall is not sent by the EE**: the game's object visibility (CPU side) culls it when the camera is
+      very close to it (the user: both cases were in narrow places, a corridor and a nook). Not the VU0 macro VDIV /
+      VSQRT / VRSQRT (not used by the game). Careful: GS coordinates wrap at 16 bits (4096 pixels), so a far off-screen
+      vertex can look on screen in a capture: judge coverage from VU1-side floats, not from the packets.
+    - Next: find the EE visibility test (camera vs object bounding volume) and why it culls a near object.
     - Replay detail to check: a captured run of the flag-free program 4ead7b35a3a6 replays with status 0x0c0 on the interpreter and 0x000 native (live self-checks agree), so the replay's flag setup differs from the live one somewhere.
     - Tools: F11 (GPU renderer) -> `out/gif_capture.bin` (two scanout frames) + `out/gif_capture_frame0..2.bmp`; `python tools/gifhit.py out/gif_capture.bin <gs x> <gs y> --adc` (also the triangles dropped by ADC, and a count of those crossing the camera plane; GS x / y = screen + XYOFFSET, about 1728 + x, 1792 + y); `PS2X_VU1_PC_COUNT="0x1398,0x14c8,..."` (`[vu1-pc]` issue counts per VU1 address, interpreter runs: PS2X_VU1AOT=0). F11 also records every VU1 run of the next 4 guest VSyncs to `out/vu1cap/run_<n>.bin` (replayable snapshot) + `.pkt` (its PATH1 packets); `PS2X_VU1_CAPTURE_VSYNC=<vsync>` does the same from a script; `python tools/vu1capfind.py <kick> [gif_capture.bin] [vu1cap]` finds the run behind a capture kick.
 - Tools: `python tools/vudis.py out/vu1dump0_code.bin` disassembles VU microcode (upper ; lower, flags [I E M D T]).
