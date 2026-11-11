@@ -36,6 +36,7 @@ extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
 void ps2xDebugDumpSemaphoreHistory(int id); // EeScheduler.cpp (Rayman bring-up)
 extern "C" void ps2xRequestGsCapture();         // gs_cpu_backend.cpp
+extern "C" void ps2xRequestVu1Capture();        // ps2_vu1_core.cpp: F11, every VU1 run of the next VSyncs
 extern "C" uint64_t ps2xGuestDisplayFlips();       // EeScheduler.cpp: display flips counted at guest VBlanks
 extern "C" int ps2xGsStatsLine(char *buffer, int size);
 extern "C" int ps2xSpu2ReadSamples(int16_t *out, int frames); // ps2xIOP SPU2 output ring
@@ -3124,6 +3125,7 @@ void PS2Runtime::run()
                 ps2x::pgs::requestCapture();
             else
                 ps2xRequestGsCapture();
+            ps2xRequestVu1Capture(); // out/vu1cap: the VU1 runs behind those primitives
             std::cerr << "[gs] capture requested (F11)" << std::endl;
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)

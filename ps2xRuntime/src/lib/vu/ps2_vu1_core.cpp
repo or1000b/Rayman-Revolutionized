@@ -6,6 +6,7 @@
 #include "vu1aot.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cfenv>
 #include <cmath>
@@ -254,6 +255,9 @@ namespace
     thread_local bool t_vu1AotReplay = false;
     thread_local const uint32_t *t_vu1AotReplayWorkingClip = nullptr;
 
+    // F11 VU1 capture (vu1Dispatch): the packets of the run being recorded.
+    thread_local std::vector<uint8_t> *t_vu1CapturePackets = nullptr;
+
     // One finished PATH1 packet from VU1 (interpreter or native code): the kick hash, then the GIF.
     // PS2X_VU1_KICK_HASH=1: a running FNV-1a hash of every XGKICK packet, printed every 600 guest VSyncs
     // (`[vu1-hash]`). Two builds that print the same hashes sent the GS the same bytes: an equivalence check for
@@ -262,6 +266,12 @@ namespace
     {
         if (t_vu1AotReplay)
             return;
+        if (t_vu1CapturePackets)
+        {
+            const uint8_t *size = reinterpret_cast<const uint8_t *>(&bytes);
+            t_vu1CapturePackets->insert(t_vu1CapturePackets->end(), size, size + 4u);
+            t_vu1CapturePackets->insert(t_vu1CapturePackets->end(), packet, packet + bytes);
+        }
         static const bool kickHash = []
         {
             const char *env = std::getenv("PS2X_VU1_KICK_HASH");
@@ -662,20 +672,17 @@ namespace
         uint64_t vsync;
     };
 
-    void vu1AotWriteSnapshot(Vu1AotUnit &u, const VU1State &state, uint32_t workingClip, bool resumed, uint32_t maxCycles,
-                             const uint8_t *code, uint32_t codeSize, const uint8_t *dataBefore, uint32_t dataSize)
+    bool writeVuSnapshotFile(const char *path, bool vu0, const VU1State &state, uint32_t workingClip, bool resumed,
+                             uint32_t maxCycles, const uint8_t *code, uint32_t codeSize, const uint8_t *dataBefore,
+                             uint32_t dataSize)
     {
-        if (t_vu1AotReplay || u.snapshots >= kVu1AotSnapshots)
-            return;
-        char path[96];
-        std::snprintf(path, sizeof(path), "out/vu1aot_mismatch_%s_%u.bin", u.tag, u.snapshots++);
         FILE *f = std::fopen(path, "wb");
         if (!f)
-            return;
+            return false;
         Vu1AotSnapshotHeader h{};
         std::memcpy(h.magic, kVu1AotSnapshotMagic, sizeof(h.magic));
         h.stateSize = sizeof(VU1State);
-        h.vu0 = u.vu0 ? 1u : 0u;
+        h.vu0 = vu0 ? 1u : 0u;
         h.resumed = resumed ? 1u : 0u;
         h.entryPc = state.pc;
         h.maxCycles = maxCycles;
@@ -688,7 +695,18 @@ namespace
         std::fwrite(code, 1u, codeSize, f);
         std::fwrite(dataBefore, 1u, dataSize, f);
         std::fclose(f);
-        std::fprintf(stderr, "[%s] mismatch snapshot written to %s (replay: PS2X_VU1AOT_REPLAY=%s)\n", u.tag, path, path);
+        return true;
+    }
+
+    void vu1AotWriteSnapshot(Vu1AotUnit &u, const VU1State &state, uint32_t workingClip, bool resumed, uint32_t maxCycles,
+                             const uint8_t *code, uint32_t codeSize, const uint8_t *dataBefore, uint32_t dataSize)
+    {
+        if (t_vu1AotReplay || u.snapshots >= kVu1AotSnapshots)
+            return;
+        char path[96];
+        std::snprintf(path, sizeof(path), "out/vu1aot_mismatch_%s_%u.bin", u.tag, u.snapshots++);
+        if (writeVuSnapshotFile(path, u.vu0, state, workingClip, resumed, maxCycles, code, codeSize, dataBefore, dataSize))
+            std::fprintf(stderr, "[%s] mismatch snapshot written to %s (replay: PS2X_VU1AOT_REPLAY=%s)\n", u.tag, path, path);
     }
 
     thread_local std::vector<uint8_t> t_vu1AotDataBefore;
@@ -799,6 +817,77 @@ namespace
         }
         vu1AotReport(u);
     }
+
+    // F11 VU1 capture (ps2xRequestVu1Capture, with the GS capture): every VU1 run of the next kVu1CaptureVsyncs guest
+    // VSyncs goes to out/vu1cap/: run_<n>.bin (the mismatch snapshot format: registers, micro memory, data memory at
+    // the start; replay with PS2X_VU1AOT_REPLAY) and run_<n>.pkt (the PATH1 packets it sent the GS: u32 size, bytes),
+    // to find the run behind a primitive of out/gif_capture.bin and replay it (issue 19).
+    constexpr uint64_t kVu1CaptureVsyncs = 4u;
+    std::atomic<bool> g_vu1CaptureRequest{false};
+    bool g_vu1CaptureActive = false;
+    uint64_t g_vu1CaptureEnd = 0;
+    uint32_t g_vu1CaptureRuns = 0;
+    const uint64_t g_vu1CaptureAt = []
+    {
+        const char *env = std::getenv("PS2X_VU1_CAPTURE_VSYNC");
+        return (env && *env) ? std::strtoull(env, nullptr, 10) : 0ull;
+    }();
+    bool g_vu1CaptureScriptedDone = false;
+
+    template <typename RunInterpreter>
+    void vu1Dispatch(Vu1AotUnit &u, Vu1AotAccess a, bool resumed, const uint8_t *code, uint32_t codeSize, uint8_t *data,
+                     uint32_t dataSize, PS2Memory *memory, GS *gs, uint32_t maxCycles, RunInterpreter &&runInterpreter)
+    {
+        if (!u.vu0 && !t_vu1AotReplay)
+        {
+            // PS2X_VU1_CAPTURE_VSYNC=<guest vsync>: the same capture from a script (with PS2X_PGS_CAPTURE_VSYNC).
+            // (Namespace-scope state: this template has one instance per caller.)
+            if (g_vu1CaptureAt != 0u && !g_vu1CaptureScriptedDone && ps2xGuestVsync() >= g_vu1CaptureAt)
+            {
+                g_vu1CaptureScriptedDone = true;
+                g_vu1CaptureRequest.store(true);
+            }
+            if (g_vu1CaptureRequest.exchange(false))
+            {
+                std::error_code ec;
+                std::filesystem::remove_all("out/vu1cap", ec);
+                std::filesystem::create_directories("out/vu1cap", ec);
+                g_vu1CaptureActive = true;
+                g_vu1CaptureEnd = ps2xGuestVsync() + kVu1CaptureVsyncs;
+                g_vu1CaptureRuns = 0u;
+                std::fprintf(stderr, "[vu1-capture] start at guest vsync %llu\n", static_cast<unsigned long long>(ps2xGuestVsync()));
+            }
+            if (g_vu1CaptureActive && ps2xGuestVsync() >= g_vu1CaptureEnd)
+            {
+                g_vu1CaptureActive = false;
+                std::fprintf(stderr, "[vu1-capture] done: %u runs in out/vu1cap\n", g_vu1CaptureRuns);
+            }
+        }
+        if (u.vu0 || t_vu1AotReplay || !g_vu1CaptureActive)
+        {
+            vu1AotDispatch(u, a, resumed, code, codeSize, data, dataSize, memory, gs, maxCycles, runInterpreter);
+            return;
+        }
+        const uint32_t n = g_vu1CaptureRuns++;
+        char path[64];
+        std::snprintf(path, sizeof(path), "out/vu1cap/run_%05u.bin", n);
+        writeVuSnapshotFile(path, false, a.state, a.workingClip, resumed, maxCycles, code, codeSize, data, dataSize);
+        std::vector<uint8_t> packets;
+        t_vu1CapturePackets = &packets;
+        vu1AotDispatch(u, a, resumed, code, codeSize, data, dataSize, memory, gs, maxCycles, runInterpreter);
+        t_vu1CapturePackets = nullptr;
+        std::snprintf(path, sizeof(path), "out/vu1cap/run_%05u.pkt", n);
+        if (FILE *f = std::fopen(path, "wb"))
+        {
+            std::fwrite(packets.data(), 1u, packets.size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
+extern "C" void ps2xRequestVu1Capture()
+{
+    g_vu1CaptureRequest.store(true);
 }
 
 // PS2X_VU1_PROFILE: the last report, called by main once the game thread has finished (main ends with std::_Exit, so
@@ -3260,7 +3349,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
             }
         }
     }
-    vu1AotDispatch(m_unit == Unit::VU1 ? g_vu1Aot : g_vu0Aot,
+    vu1Dispatch(m_unit == Unit::VU1 ? g_vu1Aot : g_vu0Aot,
                    Vu1AotAccess{m_state, m_cycle, m_vfReady, m_viReady, m_accReady, m_efuResourceReady, m_workingClip,
                                 m_viBranchBackupValid, m_viBranchBackupReg, m_viBranchBackupValue, pipelinesPending()},
                    false, vuCode, codeSize, vuData, dataSize, memory, &gs, maxCycles,
@@ -3280,7 +3369,7 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
         m_workingClip = *t_vu1AotReplayWorkingClip;
     g_vu1ProfileResume = true;
     if (m_unit == Unit::VU1)
-        vu1AotDispatch(g_vu1Aot, Vu1AotAccess{m_state, m_cycle, m_vfReady, m_viReady, m_accReady, m_efuResourceReady, m_workingClip,
+        vu1Dispatch(g_vu1Aot, Vu1AotAccess{m_state, m_cycle, m_vfReady, m_viReady, m_accReady, m_efuResourceReady, m_workingClip,
                                     m_viBranchBackupValid, m_viBranchBackupReg, m_viBranchBackupValue, pipelinesPending()},
                        true, vuCode, codeSize, vuData, dataSize, memory, &gs, maxCycles,
                        [&] { run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles); });
