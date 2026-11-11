@@ -111,3 +111,26 @@ Goal (user): more frames per second without changing the game's speed: game time
 type `track` in run_tests.ps1: game_ms_per_s, top_speed, air_rate, jump_airtime, jump_height, z_speed). The helicopter
 check is KNOWN-FAIL at 50 / 60 (integration step), PASS at the original rate. `pacing_realtime` (not deterministic):
 game time per wall-clock second while the host is overloaded (metric game_ms_per_host_s, host_ms in [rayman-track]).
+
+## GS thread (2026-11-11)
+
+- The user's 60 FPS play (after the Fairy Glade fix, docs/vu1_aot.md): mostly 55-60, drops to ~40 in big busy areas.
+  `[prof]` there: VU1 ~29%, GS ~28%, idle 2-4%. `PS2X_NATIVE_PROF` on `glade_explore`: GS 25.7% of the game thread =
+  17.3% the GPU renderer bridge (paraLLEl-GS's CPU side `gif_transfer` 12.3%, the bring-up walk `analyzeGif` 4.1%) +
+  8.4% waiting for the lock while the window thread's scanout (flush, vsync, readback, fence wait: 3-4 ms per frame)
+  held it. (In run_tests another ~12% is `PS2X_VU1_KICK_HASH`, the byte-wise FNV hash of every VU1 packet for the
+  `vu1_hash` check; normal play does not hash. The profiler's tables now also give each top function's module,
+  hottest address and callers: a DLL without symbols, or a name folded by /OPT:ICF, no longer hides what it is.)
+- Now (`gs_pgs_bridge.cpp`, default; `PS2X_GS_THREAD=0` = the old synchronous bridge): the game thread copies each
+  complete GIF packet / register write into a queue (at most 8 MiB ahead, then it waits) and one GS thread runs
+  paraLLEl-GS and the walk, scanouts included: the window thread queues a scanout request with the privileged
+  registers of that moment and waits for that picture (250 ms at most, else the previous picture stays), without
+  holding the GS frontend's lock. What the GS sends back to the guest stays synchronous: SIGNAL / FINISH / LABEL reach
+  it when the game thread queues the write (the rule the deterministic test mode always used), and a GS -> host
+  transfer waits for the queue. `gsthread` in the `pgs:` stats (queued KiB, `full` = waits for room, `drains`,
+  `late_scanouts`).
+- Measured: `glade_explore` (60 FPS) GS 26% -> 6%, idle 1-2% -> 12%, game FPS ~50 -> a steady 60 (test mode, with the
+  hash); `pacing_realtime` GS 19-23% -> 5%. run_tests all PASS; the `[det]` fingerprints of boot / menu / intro are
+  identical to the synchronous bridge (281 lines) and every picture matches its reference with diff 0.0. (The
+  scenarios that load a memory card differ from vsync 1320 on between any two runs, also synchronous against
+  synchronous: something host-dependent in the card load, not the GS.)

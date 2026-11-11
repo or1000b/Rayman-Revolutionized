@@ -634,11 +634,9 @@ void GS::latchHostPresentationFrame()
         }
         static std::vector<uint8_t> s_scanout;
         uint32_t w = 0u, h = 0u;
-        bool ok = false;
-        {
-            std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-            ok = ps2x::pgs::scanout(regs, s_scanout, w, h);
-        }
+        // Without m_stateMutex: the bridge locks for itself, and the scanout (a few ms, longer while the GS thread
+        // catches up) must not hold up the game thread's GIF packets (processGIFPacket takes m_stateMutex).
+        const bool ok = ps2x::pgs::scanout(regs, s_scanout, w, h);
         std::vector<uint8_t> rows;
         uint32_t outW = 0u, outH = 0u;
         if (ok)

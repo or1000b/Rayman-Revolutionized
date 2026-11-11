@@ -447,6 +447,51 @@ namespace
                 ++lines[it->second];
             }
         }
+        // Where the top exclusive functions run and who calls them: the module of the sampled address (a DLL without
+        // symbols reports its nearest export, which can be any function: the module tells what it really is), the
+        // hottest address, and the first caller frames with another name.
+        std::vector<std::string> callerLines;
+        {
+            std::unordered_map<std::string, std::unordered_map<std::string, uint32_t>> callers;
+            std::unordered_map<std::string, std::unordered_map<DWORD64, uint32_t>> addresses;
+            for (const auto &s : samples)
+            {
+                const std::string &leaf = nameOf(s[0]);
+                ++addresses[leaf][s[0]];
+                for (size_t i = 1; i < s.size(); ++i)
+                    if (nameOf(s[i]) != leaf)
+                    {
+                        ++callers[leaf][nameOf(s[i])];
+                        break;
+                    }
+            }
+            std::vector<std::pair<std::string, uint32_t>> top(exclusive.begin(), exclusive.end());
+            std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+            for (size_t i = 0; i < top.size() && i < 10u; ++i)
+            {
+                const auto &adds = addresses[top[i].first];
+                const auto hot = std::max_element(adds.begin(), adds.end(), [](const auto &a, const auto &b) { return a.second < b.second; });
+                IMAGEHLP_MODULE64 module = {};
+                module.SizeOfStruct = sizeof(module);
+                std::string where = "?";
+                DWORD64 rva = 0;
+                if (hot != adds.end() && SymGetModuleInfo64(process, hot->first, &module))
+                {
+                    where = module.ModuleName;
+                    rva = hot->first - module.BaseOfImage;
+                }
+                char head[640];
+                std::snprintf(head, sizeof(head), "%5.1f%%  %s  [%s, hottest +0x%llx: %.1f%%] called from:", 100.0 * top[i].second / std::max<size_t>(1, samples.size()),
+                              top[i].first.c_str(), where.c_str(), static_cast<unsigned long long>(rva),
+                              hot != adds.end() ? 100.0 * hot->second / std::max<size_t>(1, samples.size()) : 0.0);
+                std::string line = head;
+                std::vector<std::pair<std::string, uint32_t>> from(callers[top[i].first].begin(), callers[top[i].first].end());
+                std::sort(from.begin(), from.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                for (size_t k = 0; k < from.size() && k < 4u; ++k)
+                    line += " " + from[k].first + " (" + std::to_string(from[k].second * 100u / std::max<uint32_t>(1u, top[i].second)) + "%)";
+                callerLines.push_back(line);
+            }
+        }
         SymCleanup(process);
         auto print = [&](const char *title, const std::unordered_map<std::string, uint32_t> &table, size_t maxRows) {
             std::vector<std::pair<std::string, uint32_t>> rows(table.begin(), table.end());
@@ -459,6 +504,9 @@ namespace
         print("exclusive", exclusive, 45);
         print("inclusive", inclusive, 45);
         print("exclusive by line", lines, 120);
+        std::fprintf(stderr, "[nprof] top exclusive: module, hottest address, callers:\n");
+        for (const std::string &line : callerLines)
+            std::fprintf(stderr, "[nprof]   %s\n", line.c_str());
         std::fflush(stderr);
     }
 #else

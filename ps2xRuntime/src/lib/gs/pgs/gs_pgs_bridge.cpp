@@ -33,8 +33,11 @@ namespace ps2x::pgs
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
@@ -45,6 +48,10 @@ namespace ps2x::pgs
         // Deterministic mode (PS2X_DETERMINISTIC=1, see ps2_test_harness.cpp): SIGNAL / FINISH / LABEL reach the
         // guest when the register write passes through the bridge (deterministicSignal), not when the GPU thread
         // reports it, whose timing depends on the host.
+        // The GS thread is on (see "the GS thread" below): SIGNAL / FINISH / LABEL then reach the guest from the game
+        // thread when it queues the write, never from paraLLEl-GS's callbacks or noteRegister on the worker.
+        bool g_threaded = false;
+
         bool deterministicMode()
         {
             static const bool on = []()
@@ -61,19 +68,19 @@ namespace ps2x::pgs
             SignalSink *sink = nullptr;
             bool on_signal(uint64_t payload) override
             {
-                if (sink && !deterministicMode())
+                if (sink && !deterministicMode() && !g_threaded)
                     sink->signal(payload);
                 return false;
             }
             bool on_finish(uint64_t payload) override
             {
-                if (sink && !deterministicMode())
+                if (sink && !deterministicMode() && !g_threaded)
                     sink->finish(payload);
                 return false;
             }
             bool on_label(uint64_t payload) override
             {
-                if (sink && !deterministicMode())
+                if (sink && !deterministicMode() && !g_threaded)
                     sink->label(payload);
                 return false;
             }
@@ -98,8 +105,9 @@ namespace ps2x::pgs
 
         State *g_state = nullptr;
 
-        // paraLLEl-GS / Granite are single-threaded: the EE thread streams GIF data while the window thread
-        // scans out frames, so every entry point takes this lock (recursive: scanout calls flush etc.).
+        // paraLLEl-GS / Granite are single-threaded: whoever calls into them (the GS thread; without it the EE
+        // thread streaming GIF data and the window thread scanning out) holds this lock (recursive: scanout calls
+        // flush etc.).
         std::recursive_mutex g_mutex;
 
         PrivRegs g_lastRegs{};
@@ -545,7 +553,7 @@ namespace ps2x::pgs
 
         void deterministicSignal(uint32_t reg, uint64_t value)
         {
-            if (!deterministicMode() || !g_state || !g_state->signals.sink)
+            if (!deterministicMode() || g_threaded || !g_state || !g_state->signals.sink)
                 return;
             if (reg == 0x60u)
                 g_state->signals.sink->signal(value);
@@ -1087,8 +1095,8 @@ namespace ps2x::pgs
             std::fclose(f);
         }
 
-        // Granite keys command pools by a per-thread index. The EE thread and the window thread both
-        // call in (never at the same time: the GS frontend's mutex), so both use index 0.
+        // Granite keys command pools by a per-thread index. The GS thread, the EE thread and the window thread
+        // call in (never at the same time: g_mutex), so all use index 0.
         void bindThread()
         {
             static thread_local bool bound = false;
@@ -1103,6 +1111,417 @@ namespace ps2x::pgs
         {
             // paraLLEl-GS keeps GIF tag state for PATH1..3 in slots 1..3 (slot 0 unused by the runtime).
             return (path >= 1u && path <= 3u) ? path : 3u;
+        }
+    }
+
+    namespace
+    {
+        // ------------------------------------------------------------------ the work itself (under g_mutex)
+
+        // Complete GIF packets of one path to paraLLEl-GS (with the bring-up walk, a running capture, experiments).
+        void forwardNow(uint32_t index, const uint8_t *packets, size_t size)
+        {
+            if (experimentMask() != 0u)
+            {
+                std::vector<uint8_t> changed(packets, packets + size);
+                experimentGif(changed.data(), changed.size(), experimentMask());
+                analyzeGif(changed.data(), changed.size());
+                captureRecord(0u, index, changed.size(), changed.data());
+                g_state->gs->gif_transfer(index, changed.data(), changed.size());
+                return;
+            }
+            analyzeGif(packets, size);
+            captureRecord(0u, index, size, packets);
+            g_state->gs->gif_transfer(index, packets, size);
+        }
+
+        void writeRegisterNow(uint32_t reg, uint64_t value)
+        {
+            noteRegister(reg, value); // also delivers SIGNAL / FINISH / LABEL in deterministic synchronous mode
+            captureRecord(1u, reg, value, nullptr);
+            g_state->gs->write_register(static_cast<ParallelGS::RegisterAddr>(reg), value);
+        }
+
+        size_t readTransferNow(void *dst, size_t bytes)
+        {
+            const size_t qwords = (bytes + 15u) / 16u;
+            if (qwords * 16u == bytes)
+            {
+                g_state->gs->read_transfer_fifo(dst, static_cast<uint32_t>(qwords));
+            }
+            else
+            {
+                std::vector<uint8_t> tmp(qwords * 16u);
+                g_state->gs->read_transfer_fifo(tmp.data(), static_cast<uint32_t>(qwords));
+                std::memcpy(dst, tmp.data(), bytes);
+            }
+            return bytes;
+        }
+
+        bool scanoutNow(const PrivRegs &regs, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
+        {
+            width = height = 0u;
+            const auto begin = std::chrono::steady_clock::now();
+
+            // Privileged registers (PMODE, SMODE*, DISPFB*, DISPLAY*, BGCOLOR ...): 64-bit bitfield structs.
+            auto &priv = g_state->gs->get_priv_register_state();
+            const auto put = [](auto &field, uint64_t value)
+            {
+                // Bitfield structs mirroring the 64-bit registers (one is a few bits wider by declaration).
+                std::memcpy(&field, &value, std::min(sizeof(field), sizeof(value)));
+            };
+            // SMODE1 is written by the BIOS (SetGsCrt), which the runtime high-level emulates without it, so it
+            // can still be 0 here. paraLLEl-GS needs CMOD/LC to know the video mode: use the analog PAL/NTSC
+            // value then (PAL when the display area is taller than NTSC's 480 lines).
+            uint64_t smode1 = regs.smode1;
+            if (((smode1 >> 3) & 0x7Full) == 0ull)
+            {
+                const uint64_t display = (regs.pmode & 2ull) != 0ull ? regs.display2 : regs.display1;
+                const uint32_t lines = static_cast<uint32_t>((display >> 44) & 0x7FFull) + 1u;
+                const uint64_t cmod = lines > 480u ? 3ull : 2ull;
+                smode1 = 4ull | (32ull << 3) | (1ull << 10) | (cmod << 13) | (1ull << 16) | (1ull << 17) |
+                         (4ull << 21) | (1ull << 30);
+            }
+            put(priv.pmode, regs.pmode);
+            put(priv.smode1, smode1);
+            put(priv.smode2, regs.smode2);
+            put(priv.srfsh, regs.srfsh);
+            put(priv.synch1, regs.synch1);
+            put(priv.synch2, regs.synch2);
+            put(priv.syncv, regs.syncv);
+            const bool pal = ((smode1 >> 13) & 3ull) == 3ull;
+            g_lastRegs = regs;
+            put(priv.dispfb1, regs.dispfb1);
+            put(priv.display1, hardwareDisplay(regs.display1, pal));
+            put(priv.dispfb2, regs.dispfb2);
+            put(priv.display2, hardwareDisplay(regs.display2, pal));
+            put(priv.extbuf, regs.extbuf);
+            put(priv.extdata, regs.extdata);
+            put(priv.extwrite, regs.extwrite);
+            put(priv.bgcolor, regs.bgcolor);
+
+            ParallelGS::VSyncInfo info = {};
+            info.phase = 0;
+            info.dst_layout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
+            info.dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            info.dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            info.force_progressive = true;
+            info.anti_blur = true;
+            info.overscan = false;
+            info.crtc_offsets = false;
+            info.adapt_to_internal_horizontal_resolution = false;
+
+            if (watchBound("PS2X_PGS_BIGPRIM", 0u) != 0u && g_frameNumber >= coverFrom() &&
+                g_bigPrimLogs < watchBound("PS2X_PGS_BIGPRIM_MAX", 3000u))
+            {
+                ++g_bigPrimLogs;
+                std::fprintf(stderr, "[pgs-scan] frame %llu guest vsync %llu pmode=%llx dispfb1=%llx dispfb2=%llx\n",
+                             (unsigned long long)g_frameNumber, (unsigned long long)ps2xGuestVsync(), (unsigned long long)regs.pmode,
+                             (unsigned long long)regs.dispfb1, (unsigned long long)regs.dispfb2);
+            }
+            endFrameStats();
+            captureFrameBoundary(g_frameNumber);
+            g_state->gs->flush();
+            ParallelGS::ScanoutResult result = g_state->gs->vsync(info);
+            if (!result.image)
+                return false;
+
+            auto &device = *g_state->device;
+            const uint32_t w = result.image->get_width();
+            const uint32_t h = result.image->get_height();
+            const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4u;
+            if (!g_state->readback || g_state->readbackSize < size)
+            {
+                Vulkan::BufferCreateInfo info = {};
+                info.size = size;
+                info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                info.domain = Vulkan::BufferDomain::CachedHost;
+                g_state->readback = device.create_buffer(info);
+                g_state->readbackSize = size;
+            }
+
+            auto cmd = device.request_command_buffer();
+            cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            cmd->copy_image_to_buffer(*g_state->readback, *result.image, 0, {}, {w, h, 1}, 0, 0,
+                                      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
+            cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+            Vulkan::Fence fence;
+            device.submit(cmd, &fence);
+            fence->wait();
+
+            const auto *pixels = static_cast<const uint8_t *>(device.map_host_buffer(*g_state->readback, Vulkan::MEMORY_ACCESS_READ_BIT));
+            if (!pixels)
+                return false;
+            rgba.resize(static_cast<size_t>(size));
+            std::memcpy(rgba.data(), pixels, static_cast<size_t>(size));
+            device.unmap_host_buffer(*g_state->readback, Vulkan::MEMORY_ACCESS_READ_BIT);
+            for (size_t i = 3; i < rgba.size(); i += 4)
+                rgba[i] = 0xFFu;
+
+            width = w;
+            height = h;
+            static uint64_t s_dumpCounter = 0u;
+            if ((s_dumpCounter++ % 300u) == 30u)
+                dumpFrameBmp(rgba, w, h);
+            g_state->lastWidth = w;
+            g_state->lastHeight = h;
+            ++g_state->frames;
+            g_state->scanoutMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            ++g_state->scanoutSamples;
+            return true;
+        }
+
+        // ------------------------------------------------------------------ the GS thread (PS2X_GS_THREAD)
+        //
+        // paraLLEl-GS's CPU side (building primitives, hazards, batches) and the bring-up walk took ~20% of the
+        // game thread at 60 FPS, and the window thread's scanout (flush, vsync, readback, fence wait: 3-4 ms) held
+        // the lock the game thread needs for every packet (~9% waiting). With the GS thread (default; 0 = the old
+        // synchronous bridge) the game thread only copies each complete packet / register write into a queue; one
+        // worker thread runs everything in order, scanouts included: the window thread queues a scanout request
+        // (with the privileged registers of that moment, so the picture matches that point of the stream) and
+        // waits for that picture. Everything the GS sends back to the guest is kept synchronous:
+        //   - SIGNAL / FINISH / LABEL reach the guest when the game thread queues the write (deterministicSignal's
+        //     rule, which the deterministic test mode always used), not when the worker gets there;
+        //   - a GS -> host image transfer (readTransfer) waits until the worker has done everything queued before.
+        // So the guest sees what it saw before, deterministic runs stay deterministic, and the stream order is kept.
+        struct Command
+        {
+            enum Kind : uint8_t
+            {
+                Gif,
+                Register,
+                Scanout
+            } kind;
+            uint32_t a;    // Gif: path index; Register: register; Scanout: index in Batch::regs
+            uint64_t b;    // Gif: offset in Batch::bytes; Register: value; Scanout: request id
+            uint32_t size; // Gif: bytes
+        };
+        struct Batch
+        {
+            std::vector<Command> commands;
+            std::vector<uint8_t> bytes;
+            std::vector<PrivRegs> regs;
+        };
+
+        constexpr size_t kMaxQueuedBytes = 8u << 20; // the game thread waits when the worker is this far behind
+
+        std::mutex g_queueMutex;
+        std::condition_variable g_workCv;  // the worker waits for work
+        std::condition_variable g_roomCv;  // the game thread waits for room or for a drain
+        Batch g_filling;                   // the commands queued since the worker last took the queue
+        uint64_t g_enqueued = 0, g_done = 0;
+        size_t g_pendingBytes = 0;         // GIF bytes queued or being processed
+        bool g_workerIdle = false, g_workerStop = false;
+        uint64_t g_roomWaits = 0, g_drains = 0;
+        std::atomic<uint64_t> g_scanoutTimeouts{0};
+        std::thread g_worker;
+
+        // Scanout results: the worker's newest picture, handed to the window thread.
+        std::mutex g_scanMutex;
+        std::condition_variable g_scanCv;
+        std::vector<uint8_t> g_scanPixels;
+        uint32_t g_scanWidth = 0, g_scanHeight = 0;
+        bool g_scanOk = false;
+        uint64_t g_scanRequested = 0, g_scanDone = 0;
+
+        // Producer side (game thread): the GIF reassembly buffers and the byte count.
+        std::mutex g_producerMutex;
+        std::atomic<uint64_t> g_gifBytes{0};
+
+        bool gsThreadWanted()
+        {
+            const char *value = std::getenv("PS2X_GS_THREAD");
+            return !(value && std::strcmp(value, "0") == 0);
+        }
+
+        // Called with g_queueMutex held: wakes the worker if it sleeps.
+        bool wakeWorkerLocked()
+        {
+            if (!g_workerIdle)
+                return false;
+            g_workerIdle = false;
+            return true;
+        }
+
+        void enqueueGif(uint32_t index, const uint8_t *packets, size_t size)
+        {
+            std::unique_lock<std::mutex> lock(g_queueMutex);
+            if (g_pendingBytes >= kMaxQueuedBytes)
+            {
+                ++g_roomWaits;
+                g_roomCv.wait(lock, [] { return g_pendingBytes < kMaxQueuedBytes || g_workerStop; });
+            }
+            Command c{Command::Gif, index, g_filling.bytes.size(), static_cast<uint32_t>(size)};
+            g_filling.bytes.insert(g_filling.bytes.end(), packets, packets + size);
+            g_filling.commands.push_back(c);
+            g_pendingBytes += size;
+            ++g_enqueued;
+            const bool wake = wakeWorkerLocked();
+            lock.unlock();
+            if (wake)
+                g_workCv.notify_one();
+        }
+
+        void enqueueRegister(uint32_t reg, uint64_t value)
+        {
+            std::unique_lock<std::mutex> lock(g_queueMutex);
+            g_filling.commands.push_back(Command{Command::Register, reg, value, 0u});
+            ++g_enqueued;
+            const bool wake = wakeWorkerLocked();
+            lock.unlock();
+            if (wake)
+                g_workCv.notify_one();
+        }
+
+        // Waits until the worker has done every command queued so far.
+        void drain()
+        {
+            std::unique_lock<std::mutex> lock(g_queueMutex);
+            const uint64_t target = g_enqueued;
+            if (g_done >= target)
+                return;
+            ++g_drains;
+            const bool wake = wakeWorkerLocked();
+            if (wake)
+                g_workCv.notify_one();
+            g_roomCv.wait(lock, [target] { return g_done >= target || g_workerStop; });
+        }
+
+        void runScanoutRequest(const PrivRegs &regs, uint64_t id)
+        {
+            static std::vector<uint8_t> s_pixels;
+            uint32_t w = 0u, h = 0u;
+            const bool ok = scanoutNow(regs, s_pixels, w, h);
+            {
+                std::lock_guard<std::mutex> lock(g_scanMutex);
+                if (ok)
+                {
+                    std::swap(g_scanPixels, s_pixels);
+                    g_scanWidth = w;
+                    g_scanHeight = h;
+                }
+                g_scanOk = ok;
+                g_scanDone = id;
+            }
+            g_scanCv.notify_all();
+        }
+
+        void workerLoop()
+        {
+            Batch work;
+            for (;;)
+            {
+                {
+                    std::unique_lock<std::mutex> lock(g_queueMutex);
+                    if (g_filling.commands.empty())
+                    {
+                        g_workerIdle = true;
+                        g_workCv.wait(lock, [] { return g_workerStop || !g_filling.commands.empty(); });
+                        g_workerIdle = false;
+                    }
+                    if (g_filling.commands.empty())
+                        return; // stopped, nothing left
+                    std::swap(work, g_filling);
+                }
+                {
+                    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+                    bindThread();
+                    if (g_state)
+                    {
+                        for (const Command &c : work.commands)
+                        {
+                            if (c.kind == Command::Gif)
+                                forwardNow(c.a, work.bytes.data() + c.b, c.size);
+                            else if (c.kind == Command::Register)
+                                writeRegisterNow(c.a, c.b);
+                            else
+                                runScanoutRequest(work.regs[c.a], c.b);
+                        }
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(g_queueMutex);
+                    g_done += work.commands.size();
+                    g_pendingBytes -= work.bytes.size();
+                }
+                g_roomCv.notify_all();
+                work.commands.clear();
+                work.bytes.clear();
+                work.regs.clear();
+            }
+        }
+
+        // SIGNAL / FINISH / LABEL of complete packets, on the game thread when the GS thread is on (see above).
+        void deliverSignal(uint32_t reg, uint64_t value)
+        {
+            if (!g_state || !g_state->signals.sink)
+                return;
+            if (reg == 0x60u)
+                g_state->signals.sink->signal(value);
+            else if (reg == 0x61u)
+                g_state->signals.sink->finish(value);
+            else if (reg == 0x62u)
+                g_state->signals.sink->label(value);
+        }
+
+        // Only A+D in PACKED mode reaches these registers (REGLIST descriptors stop at XYZ3, IMAGE carries pixels).
+        void scanSignals(const uint8_t *data, size_t bytes)
+        {
+            size_t offset = 0u;
+            while (bytes - offset >= 16u)
+            {
+                const size_t packetBytes = gifPacketBytes(data + offset);
+                if (bytes - offset < packetBytes)
+                    break;
+                uint64_t lo = 0u, regs = 0u;
+                std::memcpy(&lo, data + offset, 8u);
+                std::memcpy(&regs, data + offset + 8u, 8u);
+                const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
+                uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
+                if (nreg == 0u)
+                    nreg = 16u;
+                bool anyAd = false;
+                for (uint32_t r = 0; r < nreg && !anyAd; ++r)
+                    anyAd = ((regs >> (4u * r)) & 0xFu) == 0xEu;
+                if (flg == 0u && anyAd)
+                {
+                    const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
+                    const uint8_t *body = data + offset + 16u;
+                    for (uint32_t loop = 0; loop < nloop; ++loop)
+                        for (uint32_t r = 0; r < nreg; ++r)
+                        {
+                            if (((regs >> (4u * r)) & 0xFu) != 0xEu)
+                                continue;
+                            const uint8_t *q = body + (static_cast<size_t>(loop) * nreg + r) * 16u;
+                            uint64_t qlo = 0u, qhi = 0u;
+                            std::memcpy(&qlo, q, 8u);
+                            std::memcpy(&qhi, q + 8u, 8u);
+                            const uint32_t adReg = static_cast<uint32_t>(qhi & 0xFFu);
+                            if (adReg >= 0x60u && adReg <= 0x62u)
+                                deliverSignal(adReg, qlo);
+                        }
+                }
+                offset += packetBytes;
+            }
+        }
+
+        // Complete packets of one path: to the queue (GS thread) or to paraLLEl-GS now.
+        void deliverPackets(uint32_t index, const uint8_t *packets, size_t size)
+        {
+            if (g_threaded)
+            {
+                scanSignals(packets, size);
+                enqueueGif(index, packets, size);
+                return;
+            }
+            std::lock_guard<std::recursive_mutex> lock(g_mutex);
+            if (!g_state)
+                return;
+            bindThread();
+            forwardNow(index, packets, size);
         }
     }
 
@@ -1155,6 +1574,10 @@ namespace ps2x::pgs
         state->signals.sink = sink;
         state->gs->set_signal_interface(&state->signals);
         g_state = state.release();
+        g_threaded = gsThreadWanted();
+        if (g_threaded)
+            g_worker = std::thread(workerLoop);
+        std::fprintf(stderr, "[pgs] GS thread %s (PS2X_GS_THREAD)\n", g_threaded ? "on" : "off");
         return true;
     }
 
@@ -1165,14 +1588,31 @@ namespace ps2x::pgs
 
     void shutdown()
     {
+        if (g_threaded)
+        {
+            drain();
+            {
+                std::lock_guard<std::mutex> lock(g_queueMutex);
+                g_workerStop = true;
+            }
+            g_workCv.notify_all();
+            g_roomCv.notify_all();
+            if (g_worker.joinable())
+                g_worker.join();
+            g_threaded = false;
+        }
+        {
+            // Lock order: g_producerMutex before g_mutex (gifTransfer).
+            std::lock_guard<std::mutex> producer(g_producerMutex);
+            for (auto &pending : g_pendingGif)
+                pending.clear();
+        }
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_state)
             return;
         if (g_state->device)
             g_state->device->wait_idle();
         g_state->readback.reset();
-        for (auto &pending : g_pendingGif)
-            pending.clear();
         g_state->gs.reset();
         g_state->device.reset();
         g_state->context.reset();
@@ -1182,14 +1622,13 @@ namespace ps2x::pgs
 
     void gifTransfer(uint32_t path, const void *data, size_t bytes)
     {
-        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_state || !data)
             return;
-        bindThread();
         bytes &= ~static_cast<size_t>(15u);
         if (bytes == 0u)
             return;
-        g_state->gifBytes += bytes;
+        std::lock_guard<std::mutex> producer(g_producerMutex);
+        g_gifBytes.fetch_add(bytes, std::memory_order_relaxed);
         const uint32_t index = pathIndex(path);
         std::vector<uint8_t> &pending = g_pendingGif[index];
         const auto *input = static_cast<const uint8_t *>(data);
@@ -1201,23 +1640,9 @@ namespace ps2x::pgs
             input = joined.data();
             bytes = joined.size();
         }
-        const auto forward = [index](const uint8_t *packets, size_t size)
-        {
-            analyzeGif(packets, size);
-            captureRecord(0u, index, size, packets);
-            g_state->gs->gif_transfer(index, packets, size);
-        };
         const size_t complete = completeGifBytes(input, bytes);
-        if (complete != 0u && experimentMask() != 0u)
-        {
-            std::vector<uint8_t> changed(input, input + complete);
-            experimentGif(changed.data(), changed.size(), experimentMask());
-            forward(changed.data(), changed.size());
-        }
-        else if (complete != 0u)
-        {
-            forward(input, complete);
-        }
+        if (complete != 0u)
+            deliverPackets(index, input, complete);
         if (complete == bytes)
             return;
 
@@ -1238,7 +1663,7 @@ namespace ps2x::pgs
                 std::vector<uint8_t> partial(rest, rest + 16u + imageQw * 16u);
                 const uint64_t retagged = (tagLo & ~0x7FFFull) | static_cast<uint64_t>(imageQw);
                 std::memcpy(partial.data(), &retagged, sizeof(retagged));
-                forward(partial.data(), partial.size());
+                deliverPackets(index, partial.data(), partial.size());
             }
             return;
         }
@@ -1246,6 +1671,7 @@ namespace ps2x::pgs
         // within 4 MiB means the stream is out of step: drop it rather than parse everything after it as data.
         if (restBytes > (4u << 20))
         {
+            std::lock_guard<std::recursive_mutex> lock(g_mutex);
             logAnomaly("dropped an incomplete GIF packet larger than 4 MiB, tag", tagLo);
             return;
         }
@@ -1254,152 +1680,75 @@ namespace ps2x::pgs
 
     void writeRegister(uint32_t reg, uint64_t value)
     {
+        if (!g_state)
+            return;
+        reg &= 0xFFu;
+        if (g_threaded)
+        {
+            if (reg >= 0x60u && reg <= 0x62u)
+                deliverSignal(reg, value);
+            enqueueRegister(reg, value);
+            return;
+        }
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_state)
             return;
         bindThread();
-        noteRegister(reg & 0xFFu, value); // also delivers SIGNAL / FINISH / LABEL in deterministic mode
-        captureRecord(1u, reg & 0xFFu, value, nullptr);
-        g_state->gs->write_register(static_cast<ParallelGS::RegisterAddr>(reg & 0xFFu), value);
+        writeRegisterNow(reg, value);
     }
 
     size_t readTransfer(void *dst, size_t bytes)
     {
-        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_state || !dst || bytes == 0u)
             return 0u;
+        if (g_threaded)
+            drain();
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (!g_state)
+            return 0u;
         bindThread();
-        const size_t qwords = (bytes + 15u) / 16u;
-        if (qwords * 16u == bytes)
-        {
-            g_state->gs->read_transfer_fifo(dst, static_cast<uint32_t>(qwords));
-        }
-        else
-        {
-            std::vector<uint8_t> tmp(qwords * 16u);
-            g_state->gs->read_transfer_fifo(tmp.data(), static_cast<uint32_t>(qwords));
-            std::memcpy(dst, tmp.data(), bytes);
-        }
-        return bytes;
+        return readTransferNow(dst, bytes);
     }
 
     bool scanout(const PrivRegs &regs, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
     {
-        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         width = height = 0u;
         if (!g_state)
             return false;
-        bindThread();
-        const auto begin = std::chrono::steady_clock::now();
-
-        // Privileged registers (PMODE, SMODE*, DISPFB*, DISPLAY*, BGCOLOR ...): 64-bit bitfield structs.
-        auto &priv = g_state->gs->get_priv_register_state();
-        const auto put = [](auto &field, uint64_t value)
+        if (!g_threaded)
         {
-            // Bitfield structs mirroring the 64-bit registers (one is a few bits wider by declaration).
-            std::memcpy(&field, &value, std::min(sizeof(field), sizeof(value)));
-        };
-        // SMODE1 is written by the BIOS (SetGsCrt), which the runtime high-level emulates without it, so it
-        // can still be 0 here. paraLLEl-GS needs CMOD/LC to know the video mode: use the analog PAL/NTSC
-        // value then (PAL when the display area is taller than NTSC's 480 lines).
-        uint64_t smode1 = regs.smode1;
-        if (((smode1 >> 3) & 0x7Full) == 0ull)
-        {
-            const uint64_t display = (regs.pmode & 2ull) != 0ull ? regs.display2 : regs.display1;
-            const uint32_t lines = static_cast<uint32_t>((display >> 44) & 0x7FFull) + 1u;
-            const uint64_t cmod = lines > 480u ? 3ull : 2ull;
-            smode1 = 4ull | (32ull << 3) | (1ull << 10) | (cmod << 13) | (1ull << 16) | (1ull << 17) |
-                     (4ull << 21) | (1ull << 30);
+            std::lock_guard<std::recursive_mutex> lock(g_mutex);
+            if (!g_state)
+                return false;
+            bindThread();
+            return scanoutNow(regs, rgba, width, height);
         }
-        put(priv.pmode, regs.pmode);
-        put(priv.smode1, smode1);
-        put(priv.smode2, regs.smode2);
-        put(priv.srfsh, regs.srfsh);
-        put(priv.synch1, regs.synch1);
-        put(priv.synch2, regs.synch2);
-        put(priv.syncv, regs.syncv);
-        const bool pal = ((smode1 >> 13) & 3ull) == 3ull;
-        g_lastRegs = regs;
-        put(priv.dispfb1, regs.dispfb1);
-        put(priv.display1, hardwareDisplay(regs.display1, pal));
-        put(priv.dispfb2, regs.dispfb2);
-        put(priv.display2, hardwareDisplay(regs.display2, pal));
-        put(priv.extbuf, regs.extbuf);
-        put(priv.extdata, regs.extdata);
-        put(priv.extwrite, regs.extwrite);
-        put(priv.bgcolor, regs.bgcolor);
-
-        ParallelGS::VSyncInfo info = {};
-        info.phase = 0;
-        info.dst_layout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
-        info.dst_stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-        info.dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-        info.force_progressive = true;
-        info.anti_blur = true;
-        info.overscan = false;
-        info.crtc_offsets = false;
-        info.adapt_to_internal_horizontal_resolution = false;
-
-        if (watchBound("PS2X_PGS_BIGPRIM", 0u) != 0u && g_frameNumber >= coverFrom() &&
-            g_bigPrimLogs < watchBound("PS2X_PGS_BIGPRIM_MAX", 3000u))
+        uint64_t id = 0;
         {
-            ++g_bigPrimLogs;
-            std::fprintf(stderr, "[pgs-scan] frame %llu guest vsync %llu pmode=%llx dispfb1=%llx dispfb2=%llx\n",
-                         (unsigned long long)g_frameNumber, (unsigned long long)ps2xGuestVsync(), (unsigned long long)regs.pmode,
-                         (unsigned long long)regs.dispfb1, (unsigned long long)regs.dispfb2);
+            std::unique_lock<std::mutex> lock(g_queueMutex);
+            id = ++g_scanRequested;
+            g_filling.commands.push_back(Command{Command::Scanout, static_cast<uint32_t>(g_filling.regs.size()), id, 0u});
+            g_filling.regs.push_back(regs);
+            ++g_enqueued;
+            const bool wake = wakeWorkerLocked();
+            lock.unlock();
+            if (wake)
+                g_workCv.notify_one();
         }
-        endFrameStats();
-        captureFrameBoundary(g_frameNumber);
-        g_state->gs->flush();
-        ParallelGS::ScanoutResult result = g_state->gs->vsync(info);
-        if (!result.image)
+        // The worker gets there after what the game queued before; a frame that takes too long keeps the previous
+        // picture on screen (the window thread must not hang).
+        std::unique_lock<std::mutex> lock(g_scanMutex);
+        if (!g_scanCv.wait_for(lock, std::chrono::milliseconds(250), [id] { return g_scanDone >= id; }))
+        {
+            ++g_scanoutTimeouts;
             return false;
-
-        auto &device = *g_state->device;
-        const uint32_t w = result.image->get_width();
-        const uint32_t h = result.image->get_height();
-        const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4u;
-        if (!g_state->readback || g_state->readbackSize < size)
-        {
-            Vulkan::BufferCreateInfo info = {};
-            info.size = size;
-            info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            info.domain = Vulkan::BufferDomain::CachedHost;
-            g_state->readback = device.create_buffer(info);
-            g_state->readbackSize = size;
         }
-
-        auto cmd = device.request_command_buffer();
-        cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
-                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-        cmd->copy_image_to_buffer(*g_state->readback, *result.image, 0, {}, {w, h, 1}, 0, 0,
-                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
-        cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-        Vulkan::Fence fence;
-        device.submit(cmd, &fence);
-        fence->wait();
-
-        const auto *pixels = static_cast<const uint8_t *>(device.map_host_buffer(*g_state->readback, Vulkan::MEMORY_ACCESS_READ_BIT));
-        if (!pixels)
+        if (!g_scanOk)
             return false;
-        rgba.resize(static_cast<size_t>(size));
-        std::memcpy(rgba.data(), pixels, static_cast<size_t>(size));
-        device.unmap_host_buffer(*g_state->readback, Vulkan::MEMORY_ACCESS_READ_BIT);
-        for (size_t i = 3; i < rgba.size(); i += 4)
-            rgba[i] = 0xFFu;
-
-        width = w;
-        height = h;
-        static uint64_t s_dumpCounter = 0u;
-        if ((s_dumpCounter++ % 300u) == 30u)
-            dumpFrameBmp(rgba, w, h);
-        g_state->lastWidth = w;
-        g_state->lastHeight = h;
-        ++g_state->frames;
-        g_state->scanoutMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
-        ++g_state->scanoutSamples;
+        std::swap(rgba, g_scanPixels);
+        width = g_scanWidth;
+        height = g_scanHeight;
+        g_scanOk = false; // handed over
         return true;
     }
 
@@ -1408,13 +1757,25 @@ namespace ps2x::pgs
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_state)
             return {};
-        char line[768];
+        char line[896];
         const double avg = g_state->scanoutSamples ? g_state->scanoutMs / g_state->scanoutSamples : 0.0;
+        uint64_t roomWaits = 0, drains = 0, timeouts = 0;
+        size_t pending = 0;
+        {
+            std::lock_guard<std::mutex> queue(g_queueMutex);
+            roomWaits = g_roomWaits;
+            drains = g_drains;
+            timeouts = g_scanoutTimeouts.exchange(0u);
+            pending = g_pendingBytes;
+            g_roomWaits = g_drains = 0;
+        }
         std::snprintf(line, sizeof(line),
                       "pgs: %s frames=%llu gif=%lluK scanout=%ux%u %.2fms pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx"
-                      " | gifstats kicks=%llu prims=%llu tex0=%llu clut=%llu uploads=%llu copies=%llu maxPrim=%ux%u big=%llu badTex=%llu badXfer=%llu",
+                      " | gifstats kicks=%llu prims=%llu tex0=%llu clut=%llu uploads=%llu copies=%llu maxPrim=%ux%u big=%llu badTex=%llu badXfer=%llu"
+                      " | gsthread %s queued=%zuK full=%llu drains=%llu late_scanouts=%llu",
                       g_state->gpuName.c_str(), static_cast<unsigned long long>(g_state->frames),
-                      static_cast<unsigned long long>(g_state->gifBytes / 1024u), g_state->lastWidth, g_state->lastHeight, avg,
+                      static_cast<unsigned long long>(g_gifBytes.exchange(0u, std::memory_order_relaxed) / 1024u), g_state->lastWidth,
+                      g_state->lastHeight, avg,
                       static_cast<unsigned long long>(g_lastRegs.pmode), static_cast<unsigned long long>(g_lastRegs.smode2),
                       static_cast<unsigned long long>(g_lastRegs.dispfb1), static_cast<unsigned long long>(g_lastRegs.display1),
                       static_cast<unsigned long long>(g_lastRegs.dispfb2), static_cast<unsigned long long>(g_lastRegs.display2),
@@ -1422,10 +1783,11 @@ namespace ps2x::pgs
                       (unsigned long long)g_windowStats.tex0, (unsigned long long)g_windowStats.clutLoads,
                       (unsigned long long)g_windowStats.uploads, (unsigned long long)g_windowStats.localCopies,
                       g_windowStats.maxPrimW, g_windowStats.maxPrimH, (unsigned long long)g_windowStats.bigPrims,
-                      (unsigned long long)g_windowStats.badTex, (unsigned long long)g_windowStats.badTransfers);
+                      (unsigned long long)g_windowStats.badTex, (unsigned long long)g_windowStats.badTransfers,
+                      g_threaded ? "on" : "off", pending / 1024u, (unsigned long long)roomWaits, (unsigned long long)drains,
+                      (unsigned long long)timeouts);
         g_windowStats = GifStats{};
         g_state->frames = 0;
-        g_state->gifBytes = 0;
         g_state->scanoutMs = 0.0;
         g_state->scanoutSamples = 0;
         return line;

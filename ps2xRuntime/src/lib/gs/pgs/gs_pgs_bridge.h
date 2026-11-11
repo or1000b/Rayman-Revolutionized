@@ -7,7 +7,9 @@
 // built only when PS2X_ENABLE_PARALLEL_GS is on; otherwise every call reports "not active" and the
 // CPU renderer stays in charge.
 //
-// Threading: the bridge is not thread-safe. The GS frontend calls it under its own state mutex.
+// Threading: every entry point may be called from any thread. With the GS thread (default, PS2X_GS_THREAD=0
+// turns it off) the game thread's GIF data and register writes are queued and one worker thread runs
+// paraLLEl-GS; scanout() queues a request and waits for that picture; readTransfer() waits for the queue.
 
 #include <cstddef>
 #include <cstdint>
