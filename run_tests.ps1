@@ -5,13 +5,15 @@
     run_tests.bat -NoBuild              skip the build
     run_tests.bat -Only choose_english  one scenario
     run_tests.bat -UpdateGolden         save this run's checkpoint pictures as the new golden pictures
+    run_tests.bat -NoKickHash           no PS2X_VU1_KICK_HASH (~10% of the game thread): for profiling; vu1_hash checks fail
   Scenarios and checks: tests\scenarios.json. Report: out\test_report.txt. Exit code 0 = no FAIL.
   Written for Windows PowerShell 5.1 (no PowerShell 7 syntax).
 #>
 param(
     [switch]$NoBuild,
     [string]$Only = '',
-    [switch]$UpdateGolden
+    [switch]$UpdateGolden,
+    [switch]$NoKickHash
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,6 +141,7 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     $env:PS2X_DETERMINISTIC = '1'
     # [vu1-hash] every 600 VSyncs: hash of every byte VU1 sent to the GS (check type vu1_hash).
     $env:PS2X_VU1_KICK_HASH = '1'
+    if ($NoKickHash) { Remove-Item Env:PS2X_VU1_KICK_HASH -ErrorAction SilentlyContinue }
     if ($sc.PSObject.Properties['deterministic'] -and -not $sc.deterministic) { $env:PS2X_DETERMINISTIC = '0' }
     if ($sc.renderer -eq 'cpu') { $env:PS2X_GS_RENDERER = 'cpu' } else { Remove-Item Env:PS2X_GS_RENDERER -ErrorAction SilentlyContinue }
     # Every run gets an empty memory card of its own (<shot dir>\mc0): the user's saves in

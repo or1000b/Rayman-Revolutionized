@@ -1,6 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,136 @@ enum VIFCmd : uint8_t
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+
+    // The VU1 data memory at the latest MSCAL / MSCNT for dumpVu1Snapshot (out/vu1dump*_data_at_mscal.bin): 16 KiB
+    // copied per microprogram start (~16000 a second at 60 FPS), so only when a bug hunt asks for it
+    // (PS2X_VU1_DUMP_MSCAL=1, or the PS2X_VU1_DUMP_RGBA / _NEGQ hunts).
+    bool vu1MscalSnapshotWanted()
+    {
+        static const bool wanted = []
+        {
+            for (const char *name : {"PS2X_VU1_DUMP_MSCAL", "PS2X_VU1_DUMP_RGBA", "PS2X_VU1_DUMP_NEGQ"})
+            {
+                const char *value = std::getenv(name);
+                if (value && *value && std::strcmp(value, "0") != 0)
+                    return true;
+            }
+            return false;
+        }();
+        return wanted;
+    }
+
+    // UNPACK fast path: no mask, a write cycle that never skips (CL >= WL: every written vector has a source
+    // vector), the formats S / V2 / V3 / V4 x 32 / 16 / 8 bits and V4-5. The same results as the generic loop in
+    // processVIF1Data (PS2X_VIF_UNPACK_CHECK=1 runs both and compares): V3 takes W from the next source element
+    // when the stream has it (else W keeps its old value), modes 1 / 2 add ROW (2 also writes it back), V4-5 never
+    // adds. ~6% of the game thread went to the generic per-vector loop at 60 FPS.
+    template <uint32_t VN, uint32_t VL>
+    void unpackFast(uint8_t *vu1Data, const uint8_t *data, uint32_t sizeBytes, uint32_t pos, uint32_t writeVectorCount,
+                    uint32_t cl, uint32_t wl, uint32_t vuAddr, bool zeroExtend, uint32_t mode, uint32_t row[4])
+    {
+        constexpr uint32_t compBytes = VL == 0u ? 4u : VL == 1u ? 2u : 1u;
+        constexpr uint32_t components = VN + 1u;
+        constexpr uint32_t bytesPerVector = VL == 3u ? 2u : components * compBytes;
+        const bool addRow = VL != 3u && (mode == 1u || mode == 2u);
+        for (uint32_t w = 0; w < writeVectorCount; ++w)
+        {
+            const uint32_t cyclePos = w % wl;
+            const uint32_t destVec = (vuAddr + (w / wl) * cl + cyclePos) & 0x3FFu;
+            uint8_t *dst = vu1Data + destVec * 16u;
+            const uint8_t *src = data + pos + static_cast<size_t>(w) * bytesPerVector;
+            uint32_t out[4];
+            if constexpr (VL == 3u)
+            {
+                uint16_t packed = 0;
+                std::memcpy(&packed, src, sizeof(packed));
+                out[0] = static_cast<uint32_t>(packed & 0x001Fu) << 3;
+                out[1] = static_cast<uint32_t>(packed & 0x03E0u) >> 2;
+                out[2] = static_cast<uint32_t>(packed & 0x7C00u) >> 7;
+                out[3] = static_cast<uint32_t>(packed & 0x8000u) >> 8;
+            }
+            else
+            {
+                const auto read = [&](uint32_t i) -> uint32_t
+                {
+                    const uint8_t *p = src + i * compBytes;
+                    if constexpr (VL == 0u)
+                    {
+                        uint32_t v;
+                        std::memcpy(&v, p, 4u);
+                        return v;
+                    }
+                    else if constexpr (VL == 1u)
+                    {
+                        uint16_t v;
+                        std::memcpy(&v, p, 2u);
+                        return zeroExtend ? static_cast<uint32_t>(v) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v)));
+                    }
+                    else
+                    {
+                        return zeroExtend ? static_cast<uint32_t>(*p) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(*p)));
+                    }
+                };
+                if constexpr (components == 1u)
+                {
+                    out[0] = out[1] = out[2] = out[3] = read(0u);
+                }
+                else if constexpr (components == 2u)
+                {
+                    out[0] = out[2] = read(0u);
+                    out[1] = out[3] = read(1u);
+                }
+                else if constexpr (components == 3u)
+                {
+                    out[0] = read(0u);
+                    out[1] = read(1u);
+                    out[2] = read(2u);
+                    const size_t wEnd = static_cast<size_t>(src - data) + 4u * compBytes;
+                    if (wEnd <= sizeBytes)
+                        out[3] = read(3u);
+                    else
+                        std::memcpy(&out[3], dst + 12u, 4u);
+                }
+                else
+                {
+                    out[0] = read(0u);
+                    out[1] = read(1u);
+                    out[2] = read(2u);
+                    out[3] = read(3u);
+                }
+                if (addRow)
+                {
+                    for (uint32_t f = 0; f < 4u; ++f)
+                    {
+                        out[f] += row[f];
+                        if (mode == 2u)
+                            row[f] = out[f];
+                    }
+                }
+            }
+            std::memcpy(dst, out, 16u);
+        }
+    }
+
+    using UnpackFastFn = void (*)(uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool,
+                                  uint32_t, uint32_t *);
+    // [vn][vl]; V4-5 is [3][3]; the other vl = 3 formats are not on the fast path.
+    constexpr UnpackFastFn kUnpackFast[4][4] = {
+        {unpackFast<0, 0>, unpackFast<0, 1>, unpackFast<0, 2>, nullptr},
+        {unpackFast<1, 0>, unpackFast<1, 1>, unpackFast<1, 2>, nullptr},
+        {unpackFast<2, 0>, unpackFast<2, 1>, unpackFast<2, 2>, nullptr},
+        {unpackFast<3, 0>, unpackFast<3, 1>, unpackFast<3, 2>, unpackFast<3, 3>},
+    };
+
+    int unpackCheckMode()
+    {
+        static const int mode = []
+        {
+            const char *value = std::getenv("PS2X_VIF_UNPACK_CHECK");
+            return (value && *value && std::strcmp(value, "0") != 0) ? 1 : 0;
+        }();
+        return mode;
+    }
 
     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
@@ -406,7 +537,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             g_ps2xDbgVif1MscalPos = pos - 4u;
             ++g_ps2xDbgVif1MscalCount;
             g_ps2xDbgVif1RegsAtMscal = vif1_regs;
-            if (g_ps2xDbgVu1DumpsRemaining > 0 && m_vu1Data)
+            if (g_ps2xDbgVu1DumpsRemaining > 0 && m_vu1Data && vu1MscalSnapshotWanted())
                 std::memcpy(g_ps2xDbgVu1DataAtMscal, m_vu1Data, PS2_VU1_DATA_SIZE);
 
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
@@ -430,7 +561,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             g_ps2xDbgVif1MscalPos = pos - 4u;
             ++g_ps2xDbgVif1MscalCount;
             g_ps2xDbgVif1RegsAtMscal = vif1_regs;
-            if (g_ps2xDbgVu1DumpsRemaining > 0 && m_vu1Data)
+            if (g_ps2xDbgVu1DumpsRemaining > 0 && m_vu1Data && vu1MscalSnapshotWanted())
                 std::memcpy(g_ps2xDbgVu1DataAtMscal, m_vu1Data, PS2_VU1_DATA_SIZE);
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
@@ -640,8 +771,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            static_assert(PS2_VU1_DATA_SIZE == 0x400u * 16u, "the fast path wraps VU1 addresses at 0x400 qwords");
+            const bool fastUnpack = !maskEnable && cl >= wl && kUnpackFast[vn][vl] != nullptr;
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && fastUnpack && unpackCheckMode() == 0)
             {
+                kUnpackFast[vn][vl](m_vu1Data, data, sizeBytes, pos, writeVectorCount, cl, wl, vuAddr, zeroExtend,
+                                    vif1_regs.mode & 3u, vif1_regs.row);
+            }
+            else if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            {
+                // PS2X_VIF_UNPACK_CHECK=1: the fast path on copies, then the generic loop for real, then compare.
+                static std::vector<uint8_t> s_checkData;
+                uint32_t checkRow[4] = {};
+                if (fastUnpack)
+                {
+                    s_checkData.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                    std::memcpy(checkRow, vif1_regs.row, sizeof(checkRow));
+                    kUnpackFast[vn][vl](s_checkData.data(), data, sizeBytes, pos, writeVectorCount, cl, wl, vuAddr, zeroExtend,
+                                        vif1_regs.mode & 3u, checkRow);
+                }
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
@@ -828,6 +976,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                }
+                if (fastUnpack)
+                {
+                    static uint64_t s_checked = 0u, s_mismatches = 0u;
+                    ++s_checked;
+                    const bool sameData = std::memcmp(s_checkData.data(), m_vu1Data, PS2_VU1_DATA_SIZE) == 0;
+                    const bool sameRow = std::memcmp(checkRow, vif1_regs.row, sizeof(checkRow)) == 0;
+                    if ((!sameData || !sameRow) && s_mismatches++ < 20u)
+                    {
+                        uint32_t firstQw = 0u;
+                        while (firstQw < 0x400u && std::memcmp(s_checkData.data() + firstQw * 16u, m_vu1Data + firstQw * 16u, 16u) == 0)
+                            ++firstQw;
+                        std::fprintf(stderr, "[vif-unpack-check] MISMATCH vn %u vl %u num %u cl %u wl %u mode %u addr %#x zero %d: %s qword %#x\n",
+                                     vn, vl, writeVectorCount, cl, wl, vif1_regs.mode & 3u, vuAddr, zeroExtend ? 1 : 0,
+                                     sameData ? "row" : "data", firstQw);
+                    }
+                    if ((s_checked & (s_checked - 1u)) == 0u)
+                        std::fprintf(stderr, "[vif-unpack-check] %llu fast-path UNPACKs compared, %llu mismatches\n",
+                                     static_cast<unsigned long long>(s_checked), static_cast<unsigned long long>(s_mismatches));
                 }
             }
             pos += totalBytes;

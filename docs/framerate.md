@@ -134,3 +134,10 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
   identical to the synchronous bridge (281 lines) and every picture matches its reference with diff 0.0. (The
   scenarios that load a memory card differ from vsync 1320 on between any two runs, also synchronous against
   synchronous: something host-dependent in the card load, not the GS.)
+- VIF1 (2026-11-11, same profile without the kick hash: idle 28%, VU1 27%, `processVIF1Data` 6.5% exclusive): the
+  generic per-vector UNPACK loop now has a fast path for the common case (no mask, CL >= WL, S / V2 / V3 / V4 x 32 /
+  16 / 8 and V4-5; `ps2_vif1_interpreter.cpp` `unpackFast`), the same results bit for bit (`PS2X_VIF_UNPACK_CHECK=1`
+  runs both and compares: 0 differences in 12.6 million UNPACKs of intro + glade_explore; run_tests' VU1 hashes are
+  identical). The 16 KiB VU1 memory copy at every MSCAL / MSCNT for the bad-packet dumps is only made when a bug hunt
+  asks (`PS2X_VU1_DUMP_MSCAL=1` or the RGBA / NEGQ hunts). `processVIF1Data` 6.5% -> 1.7%, idle 28% -> 33%.
+  `run_tests -NoKickHash` drops the hash for profiling runs.
