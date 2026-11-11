@@ -70,31 +70,8 @@ namespace
             std::cout << "[gs] renderer: CPU (GPU renderer unavailable: " << error << ")" << std::endl;
     }
 
-    // The GPU scanout as host presentation rows (640-pixel stride, at most 640 x 512, RGBA8).
-    void fitScanout(const std::vector<uint8_t> &src, uint32_t srcW, uint32_t srcH,
-                    std::vector<uint8_t> &dst, uint32_t &outW, uint32_t &outH)
-    {
-        constexpr uint32_t kMaxW = 640u, kMaxH = 512u;
-        outW = std::min(srcW, kMaxW);
-        outH = std::min(srcH, kMaxH);
-        dst.assign(static_cast<size_t>(kMaxW) * 4u * outH, 0u);
-        for (uint32_t y = 0; y < outH; ++y)
-        {
-            const uint32_t sy = (srcH == outH) ? y : static_cast<uint32_t>((static_cast<uint64_t>(y) * srcH) / outH);
-            const uint8_t *row = src.data() + static_cast<size_t>(sy) * srcW * 4u;
-            uint8_t *out = dst.data() + static_cast<size_t>(y) * kMaxW * 4u;
-            if (srcW == outW)
-            {
-                std::memcpy(out, row, static_cast<size_t>(outW) * 4u);
-                continue;
-            }
-            for (uint32_t x = 0; x < outW; ++x)
-            {
-                const uint32_t sx = static_cast<uint32_t>((static_cast<uint64_t>(x) * srcW) / outW);
-                std::memcpy(out + x * 4u, row + sx * 4u, 4u);
-            }
-        }
-    }
+    // The largest GPU scanout side taken for presentation (1280 x 1024 with PS2X_GS_SSAA >= 4 on a PAL game).
+    constexpr uint32_t kMaxScanoutSide = 4096u;
 
     static constexpr uint32_t kHostFrameWidth = 640u;
 
@@ -636,17 +613,16 @@ void GS::latchHostPresentationFrame()
         uint32_t w = 0u, h = 0u;
         // Without m_stateMutex: the bridge locks for itself, and the scanout (a few ms, longer while the GS thread
         // catches up) must not hold up the game thread's GIF packets (processGIFPacket takes m_stateMutex).
-        const bool ok = ps2x::pgs::scanout(regs, s_scanout, w, h);
-        std::vector<uint8_t> rows;
-        uint32_t outW = 0u, outH = 0u;
-        if (ok)
-            fitScanout(s_scanout, w, h, rows, outW, outH);
+        const bool ok = ps2x::pgs::scanout(regs, s_scanout, w, h) && w != 0u && h != 0u && w <= kMaxScanoutSide &&
+                        h <= kMaxScanoutSide && s_scanout.size() >= static_cast<size_t>(w) * h * 4u;
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         if (ok)
         {
-            m_hostPresentationFrame = std::move(rows);
-            m_hostPresentationWidth = outW;
-            m_hostPresentationHeight = outH;
+            // The scanout as it is (any size: 640 x 512 for PAL, 1280 x 1024 with PS2X_GS_SSAA >= 4), rows packed at
+            // its own width (copyLatchedHostPresentationFrame; the CPU renderer's frames keep a 640-pixel stride).
+            m_hostPresentationFrame.assign(s_scanout.begin(), s_scanout.begin() + static_cast<size_t>(w) * h * 4u);
+            m_hostPresentationWidth = w;
+            m_hostPresentationHeight = h;
             m_hostPresentationDisplayFbp = static_cast<uint32_t>(regs.dispfb2 & 0x1FFu);
             m_hostPresentationSourceFbp = m_hostPresentationDisplayFbp;
             m_hostPresentationUsedPreferred = false;
@@ -739,7 +715,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        // GPU renderer frames are packed at their own width; the CPU renderer's keep a 640-pixel stride.
+        const size_t sourceRowBytes = static_cast<size_t>(g_pgs ? outWidth : kHostFrameWidth) * 4u;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;

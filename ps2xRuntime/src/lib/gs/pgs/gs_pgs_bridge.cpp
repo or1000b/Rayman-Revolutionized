@@ -51,6 +51,8 @@ namespace ps2x::pgs
         // The GS thread is on (see "the GS thread" below): SIGNAL / FINISH / LABEL then reach the guest from the game
         // thread when it queues the write, never from paraLLEl-GS's callbacks or noteRegister on the worker.
         bool g_threaded = false;
+        // PS2X_GS_SSAA >= 4 (start()): VSyncInfo::high_resolution_scanout.
+        bool g_hiresScanout = false;
 
         bool deterministicMode()
         {
@@ -1225,6 +1227,8 @@ namespace ps2x::pgs
             info.overscan = false;
             info.crtc_offsets = false;
             info.adapt_to_internal_horizontal_resolution = false;
+            // PS2X_GS_SSAA >= 4: scan out at twice the resolution from the super samples (see start()).
+            info.high_resolution_scanout = g_hiresScanout;
 
             if (watchBound("PS2X_PGS_BIGPRIM", 0u) != 0u && g_frameNumber >= coverFrom() &&
                 g_bigPrimLogs < watchBound("PS2X_PGS_BIGPRIM_MAX", 3000u))
@@ -1584,7 +1588,21 @@ namespace ps2x::pgs
 
         state->gs = std::make_unique<ParallelGS::GSInterface>();
         ParallelGS::GSOptions options = {};
-        options.super_sampling = ParallelGS::SuperSampling::X1;
+        // PS2X_GS_SSAA=1/2/4/8/16 (default 1): samples per pixel (super-sampling anti-aliasing). From 4 on, the picture
+        // is also scanned out at twice the width and height (high-resolution scanout, 1280 x 1024 for PAL), unless
+        // PS2X_GS_HIRES=0. PS2X_GS_SSAA_TEXTURES=1: also super-sample render targets used as textures (paraLLEl-GS
+        // super_sampled_textures; helps effects that draw into a texture first). Only the picture changes: what the
+        // game sees (signals, transfers) does not.
+        const uint32_t ssaa = watchBound("PS2X_GS_SSAA", 1u);
+        options.super_sampling = ssaa >= 16u ? ParallelGS::SuperSampling::X16
+                                 : ssaa >= 8u ? ParallelGS::SuperSampling::X8
+                                 : ssaa >= 4u ? ParallelGS::SuperSampling::X4
+                                 : ssaa >= 2u ? ParallelGS::SuperSampling::X2
+                                              : ParallelGS::SuperSampling::X1;
+        options.super_sampled_textures = watchBound("PS2X_GS_SSAA_TEXTURES", 0u) != 0u;
+        g_hiresScanout = ssaa >= 4u && watchBound("PS2X_GS_HIRES", 1u) != 0u;
+        std::fprintf(stderr, "[pgs] super-sampling x%u%s%s\n", static_cast<unsigned>(options.super_sampling),
+                     g_hiresScanout ? ", high-resolution scanout" : "", options.super_sampled_textures ? ", super-sampled textures" : "");
         if (!state->gs->init(state->device.get(), options))
         {
             error = "paraLLEl-GS init failed on " + state->gpuName;

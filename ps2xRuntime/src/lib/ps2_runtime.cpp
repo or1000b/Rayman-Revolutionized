@@ -468,6 +468,41 @@ namespace
     }
 }
 
+// Window settings (environment, read once): PS2X_FILTER=nearest keeps sharp pixels when the picture is scaled
+// (default bilinear); PS2X_ASPECT=4:3 (default: the PS2's TV picture), 16:9, stretch (fill the window) or pixel (the
+// frame's own pixel ratio, the old look: 640 x 512 at 1.25); PS2X_WINDOW=<width>x<height> (default 640x448);
+// PS2X_FULLSCREEN=1 (borderless at the monitor's resolution; F10 switches); PS2X_SHOW_FPS=0 hides the counter.
+static int HostTextureFilter()
+{
+    static const int filter = []
+    {
+        const char *env = std::getenv("PS2X_FILTER");
+        return (env && (std::strcmp(env, "nearest") == 0 || std::strcmp(env, "point") == 0)) ? TEXTURE_FILTER_POINT
+                                                                                            : TEXTURE_FILTER_BILINEAR;
+    }();
+    return filter;
+}
+
+// Display aspect ratio of the picture, 0 = stretch to the window, -1 = the frame's pixel ratio.
+static float HostDisplayAspect()
+{
+    static const float aspect = []
+    {
+        const char *env = std::getenv("PS2X_ASPECT");
+        if (!env || !*env)
+            return 4.0f / 3.0f;
+        if (std::strcmp(env, "stretch") == 0)
+            return 0.0f;
+        if (std::strcmp(env, "pixel") == 0)
+            return -1.0f;
+        float w = 0.0f, h = 0.0f;
+        if (std::sscanf(env, "%f:%f", &w, &h) == 2 && w > 0.0f && h > 0.0f)
+            return w / h;
+        return 4.0f / 3.0f;
+    }();
+    return aspect;
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -479,7 +514,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastHeight = 0u;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    static std::vector<uint8_t> s_uploadBuffer;
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
@@ -509,7 +544,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(tex.width, tex.height, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -545,29 +580,25 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
+    // The texture follows the picture's size (640 x 512 for PAL; 1280 x 1024 with PS2X_GS_SSAA >= 4).
+    if (width == 0u || height == 0u || s_scratch.size() < static_cast<size_t>(width) * height * 4u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
-        for (uint32_t y = 0; y < copyHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > s_scratch.size() ||
-                dstOffset + copyRowBytes > s_uploadBuffer.size())
-            {
-                break;
-            }
-            std::memcpy(s_uploadBuffer.data() + dstOffset, s_scratch.data() + srcOffset, copyRowBytes);
-        }
+        width = static_cast<uint32_t>(tex.width);
+        height = static_cast<uint32_t>(tex.height);
+        s_uploadBuffer.assign(static_cast<size_t>(width) * height * 4u, 0u);
+        s_scratch.swap(s_uploadBuffer);
+    }
+    if (tex.width != static_cast<int>(width) || tex.height != static_cast<int>(height))
+    {
+        UnloadTexture(tex);
+        Image blank = GenImageColor(static_cast<int>(width), static_cast<int>(height), BLANK);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        SetTextureFilter(tex, HostTextureFilter());
     }
 
-    ps2xTestHarnessFrame(s_uploadBuffer.data(), std::min<uint32_t>(width, FB_WIDTH), std::min<uint32_t>(height, FB_HEIGHT), FB_WIDTH);
-    UpdateTexture(tex, s_uploadBuffer.data());
+    ps2xTestHarnessFrame(s_scratch.data(), width, height, width);
+    UpdateTexture(tex, s_scratch.data());
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -848,7 +879,25 @@ bool PS2Runtime::initialize(const char *title)
                 windowFlags |= FLAG_WINDOW_UNFOCUSED;
             SetConfigFlags(windowFlags);
         }
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        {
+            // PS2X_WINDOW=<width>x<height>: the window's size (default 640 x 448); PS2X_FULLSCREEN=1: borderless
+            // full screen at the monitor's resolution (F10 switches while playing).
+            int windowWidth = HOST_WINDOW_WIDTH, windowHeight = HOST_WINDOW_HEIGHT;
+            if (const char *size = std::getenv("PS2X_WINDOW"))
+            {
+                int w = 0, h = 0;
+                if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240 && w <= 7680 && h <= 4320)
+                {
+                    windowWidth = w;
+                    windowHeight = h;
+                }
+            }
+            InitWindow(windowWidth, windowHeight, title);
+            const char *full = std::getenv("PS2X_FULLSCREEN");
+            const char *testMode = std::getenv("PS2X_TEST_MODE");
+            if (full && std::strcmp(full, "1") == 0 && !(testMode && std::atoi(testMode) != 0))
+                ToggleBorderlessWindowed();
+        }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startSpu2Stream();
@@ -2934,6 +2983,7 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    SetTextureFilter(frameTex, HostTextureFilter());
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -3107,9 +3157,20 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // The picture at its display aspect (default 4:3, as on a TV), as large as the window allows.
+        const float aspect = HostDisplayAspect();
+        float dstWidth = screenWidth, dstHeight = screenHeight;
+        if (aspect < 0.0f)
+        {
+            const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+            dstWidth = srcWidth * scale;
+            dstHeight = srcHeight * scale;
+        }
+        else if (aspect > 0.0f)
+        {
+            dstWidth = std::min(screenWidth, screenHeight * aspect);
+            dstHeight = dstWidth / aspect;
+        }
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -3117,7 +3178,15 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        DrawText(TextFormat("Game FPS: %.1f", gameFps), 12, 12, 24, YELLOW);
+        static const bool showFps = []
+        {
+            const char *env = std::getenv("PS2X_SHOW_FPS");
+            return !(env && std::strcmp(env, "0") == 0);
+        }();
+        if (showFps)
+            DrawText(TextFormat("Game FPS: %.1f", gameFps), 12, 12, 24, YELLOW);
+        if (IsKeyPressed(KEY_F10))
+            ToggleBorderlessWindowed(); // full screen at the monitor's resolution, and back
         if (IsKeyPressed(KEY_F11))
         {
             // Bug reports: record GS commands for offline analysis. The GPU renderer (normal play) writes
