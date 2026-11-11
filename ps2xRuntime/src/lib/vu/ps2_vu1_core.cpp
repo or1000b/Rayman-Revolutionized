@@ -3388,6 +3388,47 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
         if (m_cycle >= budgetEnd)
             break;
+        // PS2X_VU1_PC_COUNT="0x13d0,0x14c8,...": how often VU1 issues the pairs at those addresses (interpreter runs
+        // only: PS2X_VU1AOT=0 or diff), `[vu1-pc]` every 600 guest VSyncs. Bug hunt: which way a microprogram's
+        // branches go (issue 19, the near-plane clipper).
+        if (m_unit == Unit::VU1)
+        {
+            static const std::vector<uint32_t> watchPcs = []
+            {
+                std::vector<uint32_t> pcs;
+                if (const char *env = std::getenv("PS2X_VU1_PC_COUNT"))
+                    for (const char *p = env; *p;)
+                    {
+                        char *end = nullptr;
+                        const unsigned long v = std::strtoul(p, &end, 0);
+                        if (end == p)
+                            break;
+                        pcs.push_back(static_cast<uint32_t>(v));
+                        p = (*end == ',') ? end + 1 : end;
+                    }
+                return pcs;
+            }();
+            if (!watchPcs.empty())
+            {
+                static std::vector<uint64_t> counts(watchPcs.size(), 0u);
+                static uint64_t nextReport = 600u;
+                for (size_t i = 0; i < watchPcs.size(); ++i)
+                    if (watchPcs[i] == m_state.pc)
+                        ++counts[i];
+                if (ps2xGuestVsync() >= nextReport)
+                {
+                    nextReport = (ps2xGuestVsync() / 600u + 1u) * 600u;
+                    std::string line = "[vu1-pc] vsync " + std::to_string(ps2xGuestVsync());
+                    for (size_t i = 0; i < watchPcs.size(); ++i)
+                    {
+                        char item[40];
+                        std::snprintf(item, sizeof(item), " %04x=%llu", watchPcs[i], static_cast<unsigned long long>(counts[i]));
+                        line += item;
+                    }
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
+            }
+        }
 
         uint8_t writtenVi = 0u;
         int32_t oldVi = 0;

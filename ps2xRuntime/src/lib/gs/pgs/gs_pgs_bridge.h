@@ -71,6 +71,10 @@ namespace ps2x::pgs
     // One line for the periodic log ("pgs: <gpu name> frames=N ...").
     std::string statsLine();
 
+    // F11: everything the GS receives in the next two scanout frames to out/gif_capture.bin (tools/gifcap.py,
+    // tools/gifhit.py), the scanout pictures to out/gif_capture_frame0..2.bmp.
+    void requestCapture();
+
     // GIF path (1..3) of the packet the GIF arbiter is handing to the GS frontend right now, so each
     // path keeps its own GIF tag state on the GPU renderer (a PATH3 image can be split across DMA tags).
     void setCurrentPath(uint32_t path);

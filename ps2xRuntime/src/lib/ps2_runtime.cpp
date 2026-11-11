@@ -3118,8 +3118,12 @@ void PS2Runtime::run()
         DrawText(TextFormat("Game FPS: %.1f", gameFps), 12, 12, 24, YELLOW);
         if (IsKeyPressed(KEY_F11))
         {
-            // Rayman bring-up: record one frame of GS commands to out/gscapture.bin for offline replay.
-            ps2xRequestGsCapture();
+            // Bug reports: record GS commands for offline analysis. The GPU renderer (normal play) writes
+            // out/gif_capture.bin + out/gif_capture_frame*.bmp; the CPU renderer out/gscapture.bin.
+            if (ps2x::pgs::active())
+                ps2x::pgs::requestCapture();
+            else
+                ps2xRequestGsCapture();
             std::cerr << "[gs] capture requested (F11)" << std::endl;
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)

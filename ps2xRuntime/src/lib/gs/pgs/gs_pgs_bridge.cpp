@@ -274,6 +274,11 @@ namespace ps2x::pgs
         // u64 byte count or register value, then the bytes (GIF data only). Game content: never commit a capture.
         std::FILE *g_captureFile = nullptr;
         bool g_captureDone = false;
+        // F11 in the window (requestCapture): the next two scanout frames, with the scanout pictures at the start, in
+        // between and at the end (out/gif_capture_frame0..2.bmp), so the commands can be matched to what was on screen.
+        std::atomic<bool> g_captureRequested{false};
+        uint32_t g_captureFramesLeft = 0;
+        uint32_t g_capturePictures = 0, g_capturePictureIndex = 0;
 
         void captureRecord(uint32_t kind, uint32_t id, uint64_t sizeOrValue, const uint8_t *data)
         {
@@ -292,16 +297,26 @@ namespace ps2x::pgs
             static const uint32_t at = watchBound("PS2X_PGS_CAPTURE_VSYNC", 0u);
             if (g_captureFile)
             {
+                if (g_captureFramesLeft > 1u)
+                {
+                    --g_captureFramesLeft;
+                    return;
+                }
                 std::fclose(g_captureFile);
                 g_captureFile = nullptr;
                 g_captureDone = true;
                 std::fprintf(stderr, "[pgs-capture] done: out/gif_capture.bin (frame %llu)\n", (unsigned long long)frame);
                 return;
             }
-            if (at == 0u || g_captureDone || ps2xGuestVsync() < at)
+            const bool requested = g_captureRequested.exchange(false);
+            if (!requested && (at == 0u || g_captureDone || ps2xGuestVsync() < at))
                 return;
             g_captureFile = std::fopen("out/gif_capture.bin", "wb");
-            g_captureDone = g_captureFile == nullptr;
+            if (!requested)
+                g_captureDone = g_captureFile == nullptr;
+            g_captureFramesLeft = requested ? 2u : 1u;
+            g_capturePictures = g_captureFile ? g_captureFramesLeft + 1u : 0u;
+            g_capturePictureIndex = 0u;
             std::fprintf(stderr, "[pgs-capture] %s at frame %llu, guest vsync %llu\n", g_captureFile ? "start" : "cannot open out/gif_capture.bin",
                          (unsigned long long)frame, (unsigned long long)ps2xGuestVsync());
         }
@@ -1061,11 +1076,11 @@ namespace ps2x::pgs
         }
 
         // Rayman bring-up: a picture of the GPU output every ~5 s (out/pgs_frame.bmp, 32-bit top-down).
-        void dumpFrameBmp(const std::vector<uint8_t> &rgba, uint32_t w, uint32_t h)
+        void dumpFrameBmp(const std::vector<uint8_t> &rgba, uint32_t w, uint32_t h, const char *path = "out/pgs_frame.bmp")
         {
             if (w == 0u || h == 0u || rgba.size() < static_cast<size_t>(w) * h * 4u)
                 return;
-            FILE *f = std::fopen("out/pgs_frame.bmp", "wb");
+            FILE *f = std::fopen(path, "wb");
             if (!f)
                 return;
             const uint32_t imageBytes = w * h * 4u;
@@ -1266,6 +1281,13 @@ namespace ps2x::pgs
             static uint64_t s_dumpCounter = 0u;
             if ((s_dumpCounter++ % 300u) == 30u)
                 dumpFrameBmp(rgba, w, h);
+            if (g_capturePictures != 0u)
+            {
+                --g_capturePictures;
+                char path[64];
+                std::snprintf(path, sizeof(path), "out/gif_capture_frame%u.bmp", g_capturePictureIndex++);
+                dumpFrameBmp(rgba, w, h, path);
+            }
             g_state->lastWidth = w;
             g_state->lastHeight = h;
             ++g_state->frames;
@@ -1792,6 +1814,13 @@ namespace ps2x::pgs
         g_state->scanoutSamples = 0;
         return line;
     }
+
+    void requestCapture()
+    {
+        g_captureRequested.store(true);
+        std::fprintf(stderr, "[pgs-capture] requested (F11): the next two frames go to out/gif_capture.bin, pictures to "
+                             "out/gif_capture_frame0..2.bmp\n");
+    }
 }
 
 #else // !PS2X_HAS_PARALLEL_GS
@@ -1815,6 +1844,7 @@ namespace ps2x::pgs
         return false;
     }
     std::string statsLine() { return {}; }
+    void requestCapture() {}
 }
 
 #endif

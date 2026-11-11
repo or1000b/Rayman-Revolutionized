@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # Which primitives of a GS capture (PS2X_PGS_CAPTURE_VSYNC -> out/gif_capture.bin) cover one GS pixel, in stream order.
-#   python tools/gifhit.py out/gif_capture.bin <gs x> <gs y>      (screen pixel + XYOFFSET, e.g. 1728 + x, 1792 + y)
+#   python tools/gifhit.py out/gif_capture.bin <gs x> <gs y> [--adc]  (screen pixel + XYOFFSET, e.g. 1728 + x, 1792 + y)
+# --adc: also the triangles not drawn because their kicking vertex has ADC = 1, and at the end a count of the triangles
+# that cross the camera plane (Q of some vertices > 0, of others < 0): the VU1 code drops those instead of clipping them,
+# which leaves holes where a wall passes close to the camera (CLAUDE.md issue 19).
 # Triangles, strips and fans of PACKED GIF data; a triangle counts only if its kicking vertex has ADC = 0 (XYZ2 bit 111),
 # as on the GS (vertices behind the camera carry ADC = 1, so tests that ignore ADC see giant false triangles).
 import struct, sys
-blob = open(sys.argv[1],'rb').read()
-px, py = float(sys.argv[2]), float(sys.argv[3])
+args = [a for a in sys.argv[1:] if not a.startswith('--')]
+show_adc = '--adc' in sys.argv
+blob = open(args[0],'rb').read()
+px, py = float(args[1]), float(args[2])
+crossing = 0; crossing_here = 0
 def inside(a, b, c):
     def s(p, q, r): return (p[0]-r[0])*(q[1]-r[1]) - (q[0]-r[0])*(p[1]-r[1])
     d1, d2, d3 = s((px,py),a,b), s((px,py),b,c), s((px,py),c,a)
@@ -49,5 +55,14 @@ while off + 16 <= len(blob):
         for a, b, c in tris:
             A, B, C = verts[a]['xy'], verts[b]['xy'], verts[c]['xy']
             area = (B[0]-A[0])*(C[1]-A[1]) - (C[0]-A[0])*(B[1]-A[1])
+            qs = [verts[k].get('stq', (0, 0, 0))[2] for k in (a, b, c)]
+            crosses = any(q > 0 for q in qs) and any(q < 0 for q in qs)
+            if crosses and verts[c].get('adc', 0):
+                crossing += 1
+            if show_adc and abs(area) > 1e-6 and inside(A, B, C) and verts[c].get('adc', 0):
+                crossing_here += 1 if crosses else 0
+                print(f'kick {kick} path {ident} prim {prim:#x} tri {a},{b},{c} [ADC: not drawn{", crosses the camera plane" if crosses else ""}]: ' + ' '.join(f'({V["xy"][0]:.0f},{V["xy"][1]:.0f} z{V["xy"][2]:x} q={V.get("stq",(0,0,0))[2]:.4g})' for V in (verts[a], verts[b], verts[c])))
             if abs(area) > 1e-6 and inside(A, B, C) and not verts[c].get('adc', 0):
                 print(f'kick {kick} path {ident} prim {prim:#x} tri {a},{b},{c}: ' + ' '.join(f'({V["xy"][0]:.0f},{V["xy"][1]:.0f} z{V["xy"][2]:x} stq={tuple(round(x,4) for x in V.get("stq",()))} rgba={V.get("rgba")})' for V in (verts[a], verts[b], verts[c])))
+if show_adc:
+    print(f'triangles dropped by ADC that cross the camera plane: {crossing} in the capture, {crossing_here} over this pixel')
