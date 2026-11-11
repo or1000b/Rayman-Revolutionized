@@ -748,6 +748,13 @@ extern "C" uint64_t ps2xGuestVsync()
     return g_guestVsync.load(std::memory_order_relaxed);
 }
 
+// F11 (window thread): EE RAM at the next guest VSync (ps2xTestOnGuestVSync).
+static std::atomic<bool> g_eeDumpRequest{false};
+extern "C" void ps2xRequestEeDump()
+{
+    g_eeDumpRequest.store(true);
+}
+
 // EE thread, at every VBlank start (EeScheduler). Feeds the guest clock used in deterministic mode and
 // logs the state fingerprint used to compare two runs.
 extern "C" void ps2xSetGuestVsyncHook(void (*fn)(uint64_t scriptTime, uint64_t vsync, const uint8_t *rdram))
@@ -788,6 +795,18 @@ extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uin
     // PS2X_EE_DUMP_AT="7150,9000": EE RAM (32 MiB) to out/ee_ram_<vsync>.bin at those guest VSyncs. In deterministic
     // mode two dumps of the same VSync from two runs are identical, so state can be diffed across runs and times.
     static const std::vector<uint64_t> eeDumpAt = vsyncList("PS2X_EE_DUMP_AT");
+    // F11 (ps2xRequestEeDump): EE RAM to out/gif_capture_ee_ram.bin at the next guest VSync, next to the GS / VU1
+    // captures, to compare the game's state (camera, objects) with a PCSX2 save state at the same spot
+    // (tools/p2s_extract.py: eeMemory.bin; CLAUDE.md issue 19).
+    if (rdram && g_eeDumpRequest.exchange(false))
+    {
+        if (FILE *f = std::fopen("out/gif_capture_ee_ram.bin", "wb"))
+        {
+            std::fwrite(rdram, 1u, ramBytes, f);
+            std::fclose(f);
+            std::fprintf(stderr, "[ee-dump] F11: guest vsync %llu -> out/gif_capture_ee_ram.bin\n", static_cast<unsigned long long>(vsync));
+        }
+    }
     if (rdram && std::find(eeDumpAt.begin(), eeDumpAt.end(), vsync) != eeDumpAt.end())
     {
         char path[64];
