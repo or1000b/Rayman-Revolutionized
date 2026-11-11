@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <unordered_map>
@@ -248,12 +249,19 @@ namespace
     Vu1Profile g_vu0Profile{"out/vu0prof", "PS2X_VU0_PROFILE", true};
     bool g_vu1ProfileResume = false; // set by resume() for the next run()
 
+    // PS2X_VU1AOT_REPLAY (ps2xVu1AotReplay): an offline replay of a mismatch snapshot. Packets go nowhere, no
+    // snapshot is written, and resume() takes the snapshot's working clip flag.
+    thread_local bool t_vu1AotReplay = false;
+    thread_local const uint32_t *t_vu1AotReplayWorkingClip = nullptr;
+
     // One finished PATH1 packet from VU1 (interpreter or native code): the kick hash, then the GIF.
     // PS2X_VU1_KICK_HASH=1: a running FNV-1a hash of every XGKICK packet, printed every 600 guest VSyncs
     // (`[vu1-hash]`). Two builds that print the same hashes sent the GS the same bytes: an equivalence check for
     // VU1 changes (run_tests check type vu1_hash).
     void vu1DeliverPath1Packet(PS2Memory *memory, GS *gs, const uint8_t *packet, uint32_t bytes)
     {
+        if (t_vu1AotReplay)
+            return;
         static const bool kickHash = []
         {
             const char *env = std::getenv("PS2X_VU1_KICK_HASH");
@@ -328,8 +336,9 @@ namespace
         int modeState = -1;
         Vu1AotStats stats;
         Vu1AotSelection selection;
-        std::unordered_map<uint64_t, uint8_t> selfChecked; // (program index << 32) | entry -> runs compared
-        std::vector<bool> programOff;
+        // (program index << 32) | entry -> runs compared (kVu1AotSelfChecks), or kVu1AotEntryOff once one differed.
+        std::unordered_map<uint64_t, uint8_t> selfChecked;
+        uint32_t snapshots = 0; // mismatch snapshots written (out/vu1aot_mismatch_<tag>_<n>.bin)
         vu1aot::Ctx ctx;
         Vu1AotUnit(const char *t, const char *e, bool v0, const vu1aot::Program *p, const uint32_t *n)
             : tag(t), modeEnv(e), vu0(v0), programs(p), programCount(n) {}
@@ -454,8 +463,13 @@ namespace
             ++u.stats.notCovered;
             return false;
         }
-        // The generated entries assume an idle pipeline (everything ready, nothing queued, no branch hazard).
-        bool idle = !a.pipelinesBusy && !a.branchBackupValid && a.efuResourceReady <= a.cycle;
+        // The generated entries assume an idle pipeline (everything ready, nothing queued, no branch hazard) and a
+        // pair outside any delay slot. A run the interpreter stopped at its cycle budget between a taken branch and
+        // its delay slot (or between an E-bit pair and its slot) resumes with branchPending (haltAfterDelaySlot)
+        // set: the entry there would run straight on (Fairy Glade, program 4ead7b35a3a6 entry 10e8: the delay slot
+        // of B 0x1110, native 233 cycles against 202, 2026-11-11). Those resumes stay on the interpreter.
+        bool idle = !a.pipelinesBusy && !a.branchBackupValid && a.efuResourceReady <= a.cycle && !a.state.branchPending &&
+                    !a.state.haltAfterDelaySlot && !a.state.ebit;
         for (uint32_t r = 0; r < 32u && idle; ++r)
             for (uint32_t l = 0; l < 4u; ++l)
                 idle = idle && a.vfReady[r][l] <= a.cycle;
@@ -527,11 +541,19 @@ namespace
                        uint32_t dataSize, const Vu1AotCapture &capture, const vu1aot::Program *program, uint32_t entryPc)
     {
         ++u.stats.compared;
-        char what[1024] = {};
+        // Every difference, "; " between them (the first one alone hid the cause: a cycle count differs because a
+        // branch went the other way).
+        char what[2048] = {};
+        size_t whatLength = 0;
         auto differ = [&](const char *fmt, auto... args)
         {
-            if (what[0] == 0)
-                std::snprintf(what, sizeof(what), fmt, args...);
+            if (whatLength + 8u >= sizeof(what))
+                return;
+            if (whatLength != 0)
+                whatLength += static_cast<size_t>(std::snprintf(what + whatLength, sizeof(what) - whatLength, "; "));
+            const int n = std::snprintf(what + whatLength, sizeof(what) - whatLength, fmt, args...);
+            if (n > 0)
+                whatLength = std::min(sizeof(what) - 1u, whatLength + static_cast<size_t>(n));
         };
         if (!nativeOk)
             return true; // bails are counted, not compared (the interpreter ran the run)
@@ -586,12 +608,12 @@ namespace
                 if (interp != c.vfResidue[r][l])
                     differ("vf%u lane %u residue native %u interpreter %llu", r, l, c.vfResidue[r][l], static_cast<unsigned long long>(interp));
             }
+        uint32_t dataDiffs = 0, firstDataDiff = 0;
         for (uint32_t q = 0; q < dataSize; q += 16u)
-            if (std::memcmp(t_vu1AotDataCopy.data() + q, data + q, 16u) != 0)
-            {
-                differ("data qword 0x%x", q / 16u);
-                break;
-            }
+            if (std::memcmp(t_vu1AotDataCopy.data() + q, data + q, 16u) != 0 && dataDiffs++ == 0)
+                firstDataDiff = q / 16u;
+        if (dataDiffs != 0)
+            differ("data: %u qwords, the first 0x%x", dataDiffs, firstDataDiff);
         if (c.packetSizes != capture.sizes)
         {
             std::string sizes;
@@ -616,14 +638,65 @@ namespace
     }
 
     // Native mode checks itself: the first kVu1AotSelfChecks finished runs of every (program, entry) take the diff
-    // path (the interpreter's result is kept). A difference turns that program off for the rest of the session
-    // (interpreter only) and says so in the log. This covers entries the test scenarios never reach (other levels).
+    // path (the interpreter's result is kept). A difference turns that entry of that program off for the rest of the
+    // session (interpreter only; the program's other entries stay native, each checks itself) and says so in the log.
+    // This covers entries the test scenarios never reach (other levels).
     constexpr uint8_t kVu1AotSelfChecks = 2u;
+    constexpr uint8_t kVu1AotEntryOff = 0xFFu;
+
+    // Mismatch snapshot: everything a run starts from, for an offline replay (PS2X_VU1AOT_REPLAY=<file>,
+    // ps2xVu1AotReplay). Written for the first kVu1AotSnapshots mismatches of each unit.
+    constexpr uint32_t kVu1AotSnapshots = 4u;
+    constexpr char kVu1AotSnapshotMagic[8] = {'V', 'U', 'A', 'O', 'T', 'S', 'N', '1'};
+    struct Vu1AotSnapshotHeader
+    {
+        char magic[8];
+        uint32_t stateSize; // sizeof(VU1State) of the build that wrote it
+        uint32_t vu0;
+        uint32_t resumed;   // started by resume() (MSCNT) rather than execute() (MSCAL)
+        uint32_t entryPc;
+        uint32_t maxCycles;
+        uint32_t workingClip;
+        uint32_t codeSize;
+        uint32_t dataSize;
+        uint64_t vsync;
+    };
+
+    void vu1AotWriteSnapshot(Vu1AotUnit &u, const VU1State &state, uint32_t workingClip, bool resumed, uint32_t maxCycles,
+                             const uint8_t *code, uint32_t codeSize, const uint8_t *dataBefore, uint32_t dataSize)
+    {
+        if (t_vu1AotReplay || u.snapshots >= kVu1AotSnapshots)
+            return;
+        char path[96];
+        std::snprintf(path, sizeof(path), "out/vu1aot_mismatch_%s_%u.bin", u.tag, u.snapshots++);
+        FILE *f = std::fopen(path, "wb");
+        if (!f)
+            return;
+        Vu1AotSnapshotHeader h{};
+        std::memcpy(h.magic, kVu1AotSnapshotMagic, sizeof(h.magic));
+        h.stateSize = sizeof(VU1State);
+        h.vu0 = u.vu0 ? 1u : 0u;
+        h.resumed = resumed ? 1u : 0u;
+        h.entryPc = state.pc;
+        h.maxCycles = maxCycles;
+        h.workingClip = workingClip;
+        h.codeSize = codeSize;
+        h.dataSize = dataSize;
+        h.vsync = ps2xGuestVsync();
+        std::fwrite(&h, sizeof(h), 1u, f);
+        std::fwrite(&state, sizeof(state), 1u, f);
+        std::fwrite(code, 1u, codeSize, f);
+        std::fwrite(dataBefore, 1u, dataSize, f);
+        std::fclose(f);
+        std::fprintf(stderr, "[%s] mismatch snapshot written to %s (replay: PS2X_VU1AOT_REPLAY=%s)\n", u.tag, path, path);
+    }
+
+    thread_local std::vector<uint8_t> t_vu1AotDataBefore;
 
     // execute() / resume(): native code when it covers the run, else (or in diff mode, also) the interpreter.
     template <typename RunInterpreter>
-    void vu1AotDispatch(Vu1AotUnit &u, Vu1AotAccess a, const uint8_t *code, uint32_t codeSize, uint8_t *data, uint32_t dataSize,
-                        PS2Memory *memory, GS *gs, uint32_t maxCycles, RunInterpreter &&runInterpreter)
+    void vu1AotDispatch(Vu1AotUnit &u, Vu1AotAccess a, bool resumed, const uint8_t *code, uint32_t codeSize, uint8_t *data,
+                        uint32_t dataSize, PS2Memory *memory, GS *gs, uint32_t maxCycles, RunInterpreter &&runInterpreter)
     {
         const Vu1AotMode mode = vu1AotMode(u);
         if (mode == Vu1AotMode::Off)
@@ -652,19 +725,17 @@ namespace
             }
         };
         const size_t programIndex = static_cast<size_t>(program - u.programs);
-        if (u.programOff.size() < *u.programCount)
-            u.programOff.resize(*u.programCount, false);
-        if (u.programOff[programIndex])
-        {
-            ++u.stats.disabled;
-            runInterpreter();
-            vu1AotReport(u);
-            return;
-        }
         uint8_t *selfChecked = nullptr;
         if (mode == Vu1AotMode::Native)
         {
             uint8_t &count = u.selfChecked[(static_cast<uint64_t>(programIndex) << 32) | entryPc];
+            if (count == kVu1AotEntryOff)
+            {
+                ++u.stats.disabled;
+                runInterpreter();
+                vu1AotReport(u);
+                return;
+            }
             if (count < kVu1AotSelfChecks)
                 selfChecked = &count;
         }
@@ -692,6 +763,10 @@ namespace
             return;
         }
         // Diff (or a self-check): native code on a copy of the data memory, then the interpreter for real, then compare.
+        // The starting point is kept for a mismatch snapshot.
+        const VU1State stateBefore = a.state;
+        const uint32_t workingClipBefore = a.workingClip;
+        t_vu1AotDataBefore.assign(data, data + dataSize);
         t_vu1AotDataCopy.assign(data, data + dataSize);
         c.data = t_vu1AotDataCopy.data();
         c.logUndo = false;
@@ -709,15 +784,17 @@ namespace
         runInterpreter();
         g_vu1AotCapture = nullptr;
         const bool same = vu1AotCompare(u, c, nativeOk, a, a.cycle - startCycle, data, dataSize, capture, program, entryPc);
+        if (!same)
+            vu1AotWriteSnapshot(u, stateBefore, workingClipBefore, resumed, maxCycles, code, codeSize, t_vu1AotDataBefore.data(), dataSize);
         if (selfChecked)
         {
             if (nativeOk)
                 ++*selfChecked;
             if (!same)
             {
-                u.programOff[programIndex] = true;
+                *selfChecked = kVu1AotEntryOff;
                 std::fprintf(stderr, "[%s] self-check: program %s entry %04x differs from the interpreter; "
-                                     "program switched off (interpreter only)\n", u.tag, program->key, entryPc);
+                                     "this entry switched off (interpreter only)\n", u.tag, program->key, entryPc);
             }
         }
         vu1AotReport(u);
@@ -731,6 +808,152 @@ void ps2xVu1ProfileFlush()
     for (const Vu1Profile *profile : {&g_vu1Profile, &g_vu0Profile})
         if (profile->enabled() && !profile->images.empty())
             profile->report();
+}
+
+// PS2X_VU1AOT_REPLAY=<snapshot> (main calls this instead of starting the game; returns the exit code): an offline
+// replay of a mismatch snapshot (vu1AotWriteSnapshot). 1) The run in diff mode: the [vu1aot-diff] line again.
+// 2) A trace without instrumentation: for every cycle budget B the pc where each side stops (the native code bails
+// at the first pair that would issue at cycle >= B, the interpreter stops at the same point), so the first budget at
+// which the two stop at different pcs shows where they part (PS2X_VU1AOT_REPLAY_TRACE=0: the diff run only).
+int ps2xVu1AotReplay(const char *path)
+{
+    FILE *f = std::fopen(path, "rb");
+    if (!f)
+    {
+        std::fprintf(stderr, "[replay] cannot open %s\n", path);
+        return 2;
+    }
+    Vu1AotSnapshotHeader h{};
+    VU1State st{};
+    bool ok = std::fread(&h, sizeof(h), 1u, f) == 1u && std::memcmp(h.magic, kVu1AotSnapshotMagic, sizeof(h.magic)) == 0 &&
+              h.stateSize == sizeof(VU1State) && h.codeSize <= 0x10000u && h.dataSize <= 0x10000u && h.dataSize >= 16u &&
+              std::fread(&st, sizeof(st), 1u, f) == 1u;
+    std::vector<uint8_t> code(ok ? h.codeSize : 0u), dataBefore(ok ? h.dataSize : 0u), data;
+    ok = ok && std::fread(code.data(), 1u, code.size(), f) == code.size() &&
+         std::fread(dataBefore.data(), 1u, dataBefore.size(), f) == dataBefore.size();
+    std::fclose(f);
+    if (!ok)
+    {
+        std::fprintf(stderr, "[replay] %s is not a snapshot of this build\n", path);
+        return 2;
+    }
+    st.cycles = 0; // a fresh interpreter counts from 0 (m_state.cycles mirrors m_cycle)
+    Vu1AotUnit &u = h.vu0 ? g_vu0Aot : g_vu1Aot;
+    std::fprintf(stderr, "[replay] %s: %s entry %04x (%s) max cycles %u, from vsync %llu\n", path, h.vu0 ? "VU0" : "VU1",
+                 h.entryPc, h.resumed ? "resume" : "execute", h.maxCycles, static_cast<unsigned long long>(h.vsync));
+    t_vu1AotReplay = true;
+    t_vu1AotReplayWorkingClip = h.resumed ? &h.workingClip : nullptr;
+    auto interp = std::make_unique<VU1Interpreter>(h.vu0 ? VU1Interpreter::Unit::VU0 : VU1Interpreter::Unit::VU1);
+    auto gs = std::make_unique<GS>();
+    bool flagsLive = true;
+    (void)vu1AotSelect(u, code.data(), h.codeSize, nullptr, flagsLive);
+    // The interpreter from the snapshot (fresh scheduler: the snapshot was taken with idle pipelines).
+    auto runInterpreter = [&](uint32_t budget)
+    {
+        interp->reset();
+        if (VuSideState *side = vuSide(interp.get()))
+            side->macStatusUnread = !flagsLive; // what rebuildDecodedCodeCache sets (it needs a PS2Memory)
+        interp->state() = st;
+        data = dataBefore;
+        if (h.resumed)
+            interp->resume(code.data(), h.codeSize, data.data(), h.dataSize, *gs, nullptr, st.top, st.itop, budget);
+        else
+            interp->execute(code.data(), h.codeSize, data.data(), h.dataSize, *gs, nullptr, st.pc, st.top, st.itop, budget);
+    };
+
+    // 1) Diff mode.
+    u.modeState = 2;
+    u.stats = {};
+    runInterpreter(h.maxCycles);
+    std::fprintf(stderr, "[replay] diff: compared %llu mismatches %llu not_covered %llu not_idle %llu bails %llu\n",
+                 static_cast<unsigned long long>(u.stats.compared), static_cast<unsigned long long>(u.stats.mismatches),
+                 static_cast<unsigned long long>(u.stats.notCovered), static_cast<unsigned long long>(u.stats.notIdle),
+                 static_cast<unsigned long long>(u.stats.bails[1] + u.stats.bails[2] + u.stats.bails[3] + u.stats.bails[4] +
+                                                 u.stats.bails[5] + u.stats.bails[6] + u.stats.bails[7]));
+    const char *traceEnv = std::getenv("PS2X_VU1AOT_REPLAY_TRACE");
+    if (traceEnv && std::strcmp(traceEnv, "0") == 0)
+        return u.stats.mismatches == 0 ? 0 : 1;
+
+    // 2) The budget sweep: interpreter alone (mode off), native alone (on its own copy of the data).
+    u.modeState = 0;
+    VU1State nativeState = st;
+    uint64_t nativeCycle = 0;
+    std::array<std::array<uint64_t, 4>, 32> vfReady{};
+    std::array<uint64_t, 16> viReady{};
+    std::array<uint64_t, 4> accReady{};
+    uint32_t workingClip = h.resumed ? h.workingClip : st.clip;
+    bool backupValid = false;
+    uint8_t backupReg = 0;
+    int32_t backupValue = 0;
+    vu1aot::Ctx c;
+    std::vector<uint8_t> nativeData;
+    struct Stop
+    {
+        uint32_t pc;
+        uint64_t cycles;
+        bool ended;
+        int bail;
+    };
+    auto runNative = [&](uint32_t budget) -> Stop
+    {
+        nativeState = st;
+        nativeData = dataBefore;
+        Vu1AotAccess a{nativeState, nativeCycle, vfReady, viReady, accReady, 0u, workingClip, backupValid, backupReg, backupValue, false};
+        const vu1aot::Program *program = nullptr;
+        if (!vu1AotPrepare(u, c, a, program, code.data(), h.codeSize, nativeData.data(), h.dataSize, nullptr, budget))
+            return {~0u, 0u, false, -1};
+        c.logUndo = false;
+        c.bail = vu1aot::BailNone;
+        const int previous = std::fegetround();
+        std::fesetround(FE_TOWARDZERO);
+        const bool done = program->run(c, st.pc) && c.bail == vu1aot::BailNone;
+        std::fesetround(previous);
+        return done ? Stop{c.s.pc, c.cycles, true, 0} : Stop{c.bailPc, c.cycles, false, c.bail};
+    };
+    auto interpreterStop = [&](uint32_t budget) -> Stop
+    {
+        runInterpreter(budget);
+        const VU1State &s = interp->state();
+        return Stop{s.pc, s.cycles, s.cycles < budget, 0};
+    };
+    const Stop nativeFull = runNative(h.maxCycles), interpFull = interpreterStop(h.maxCycles);
+    if (nativeFull.bail < 0)
+    {
+        std::fprintf(stderr, "[replay] the native code does not take this run (not covered, or not idle: a pending branch, "
+                             "an E-bit slot, pipelines busy); interpreter pc %04x cycles %llu\n",
+                     interpFull.pc, static_cast<unsigned long long>(interpFull.cycles));
+        return u.stats.mismatches == 0 ? 0 : 1;
+    }
+    std::fprintf(stderr, "[replay] full run: native %s pc %04x cycles %llu (bail %d), interpreter pc %04x cycles %llu\n",
+                 nativeFull.ended ? "ended" : "stopped", nativeFull.pc, static_cast<unsigned long long>(nativeFull.cycles),
+                 nativeFull.bail, interpFull.pc, static_cast<unsigned long long>(interpFull.cycles));
+    auto nativeLabel = [](const Stop &n) -> std::string
+    {
+        if (n.ended)
+            return "end ";
+        return n.bail == vu1aot::BailBudget ? "stop" : "bail" + std::to_string(n.bail); // other bails: vu1aot::Bail
+    };
+    const uint64_t last = std::min<uint64_t>(h.maxCycles, std::max(nativeFull.cycles, interpFull.cycles) + 1u);
+    Stop previousNative{~1u, 0u, false, 0}, previousInterp{~1u, 0u, false, 0};
+    uint32_t afterDifference = 0;
+    bool differed = false;
+    for (uint64_t budget = 1; budget <= last && afterDifference < 24u; ++budget)
+    {
+        const Stop n = runNative(static_cast<uint32_t>(budget)), i = interpreterStop(static_cast<uint32_t>(budget));
+        const bool differs = n.pc != i.pc || n.ended != i.ended;
+        if (differs && !differed)
+            differed = true;
+        if (differed)
+            ++afterDifference;
+        if (n.pc != previousNative.pc || i.pc != previousInterp.pc || n.ended != previousNative.ended || differs)
+            std::fprintf(stderr, "[replay] budget %4llu: native %s %04x interpreter %s %04x%s\n", static_cast<unsigned long long>(budget),
+                         nativeLabel(n).c_str(), n.pc, i.ended ? "end " : "stop", i.pc, differs ? "   <-- differ" : "");
+        previousNative = n;
+        previousInterp = i;
+    }
+    if (!differed)
+        std::fprintf(stderr, "[replay] the two stop at the same pcs at every budget up to %llu\n", static_cast<unsigned long long>(last));
+    return u.stats.mismatches == 0 ? 0 : 1;
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
@@ -3040,7 +3263,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     vu1AotDispatch(m_unit == Unit::VU1 ? g_vu1Aot : g_vu0Aot,
                    Vu1AotAccess{m_state, m_cycle, m_vfReady, m_viReady, m_accReady, m_efuResourceReady, m_workingClip,
                                 m_viBranchBackupValid, m_viBranchBackupReg, m_viBranchBackupValue, pipelinesPending()},
-                   vuCode, codeSize, vuData, dataSize, memory, &gs, maxCycles,
+                   false, vuCode, codeSize, vuData, dataSize, memory, &gs, maxCycles,
                    [&] { run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles); });
 }
 
@@ -3053,11 +3276,13 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+    if (t_vu1AotReplayWorkingClip)
+        m_workingClip = *t_vu1AotReplayWorkingClip;
     g_vu1ProfileResume = true;
     if (m_unit == Unit::VU1)
         vu1AotDispatch(g_vu1Aot, Vu1AotAccess{m_state, m_cycle, m_vfReady, m_viReady, m_accReady, m_efuResourceReady, m_workingClip,
                                     m_viBranchBackupValid, m_viBranchBackupReg, m_viBranchBackupValue, pipelinesPending()},
-                       vuCode, codeSize, vuData, dataSize, memory, &gs, maxCycles,
+                       true, vuCode, codeSize, vuData, dataSize, memory, &gs, maxCycles,
                        [&] { run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles); });
     else
         run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);

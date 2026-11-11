@@ -45,7 +45,7 @@ XGKICK packets (bytes and order) and the cycle count. Two reasons:
 ## Validation
 
 - `PS2X_VU1AOT=diff`: every run executes natively on a copy and on the interpreter, compares everything (registers,
-  flags, data memory, packets, cycles) and reports the first difference; the interpreter's result is kept.
+  flags, data memory, packets, cycles) and reports every difference; the interpreter's result is kept.
 - `run_tests`: all golden pictures and `[vu1-hash]` references must stay identical; the unit tests must not regress.
 
 ## Steps
@@ -89,7 +89,7 @@ code per image: from the profiled entries, following branches and the profiled J
   packets; on a bail it is undone and the interpreter runs the whole program. The rounding mode is the interpreter's
   (round toward zero) during native runs: without it every float differed by 1-3 ULP.
 - `PS2X_VU1AOT`: unset / `1` native, `0` interpreter only, `diff` native on a copy + interpreter for real, compared
-  (`[vu1aot-diff]` first difference, `[vu1aot]` counters every 600 VSyncs).
+  (`[vu1aot-diff]` every difference of a run, `[vu1aot]` counters every 600 VSyncs).
 - Recording new levels: `run_rayman_profile.bat` plays the game with `PS2X_VU1_PROFILE=1` (translated programs stay
   native; untranslated ones run on the interpreter and are recorded; the report is written every 600 VSyncs and by
   `ps2xVu1ProfileFlush` when the game exits). Then regenerate, rebuild, `PS2X_VU1AOT=diff` run_tests.
@@ -175,8 +175,9 @@ code per image: from the profiled entries, following branches and the profiled J
   together reach (one program knows all of them; 39 images -> 9 programs; stale `prog_*.cpp` files are removed), and
   the runtime takes the first matching program that has the entry (`vu1AotSelect` keeps all matches).
 - Self-check in native mode (`vu1AotDispatch`): the first 2 finished runs of every (program, entry) also run on the
-  interpreter and are compared (the interpreter's result is kept); a difference switches that program off for the
-  session (`[vu1aot] self-check: ... switched off`, counter `disabled`). This covers entries the tests never reach.
+  interpreter and are compared (the interpreter's result is kept); a difference switches that entry of that program
+  off for the session (`[vu1aot] self-check: ... switched off`, counter `disabled`; until 2026-11-11 the whole
+  program, see "Fairy Glade" below). This covers entries the tests never reach.
 - PAL timing (CLAUDE.md issue 15) changed the VSync rate, so the references were renewed; the suite was profiled again
   under PAL. Diff mode, all 5 scenarios: 2.90 million runs, 0 differences, 0 not covered, 0 JR bails.
 
@@ -198,3 +199,23 @@ code per image: from the profiled entries, following branches and the profiled J
 - Diff mode, all 9 scenarios: 6.8 million VU0 runs compared, 0 differences, 0 bails, 0 not covered. Native: run_tests
   all PASS. Collision function 0x20C660 at 60 FPS 18-24% -> 7-11% of the time; idle at 60 FPS on land 3-6% -> 13-25%,
   at 50 FPS 7-21% -> 22-28%. The heaviest scenes at 60 are now bound by VU1 (~25%) and GS (~25%).
+
+## Fairy Glade: a resume inside a delay slot (2026-11-11)
+
+- The user saw 6-9 FPS in the Fairy Glade (Ly's cutscene). Their log: `[vu1aot-diff] vsync 22014 program
+  4ead7b35a3a6 entry 10e8: cycles native 233 interpreter 202`; the self-check then switched the whole program off
+  (28.7% of VU1 cycles): 1.35 million runs on the interpreter (`disabled`), 45-60 FPS -> 15-20, then 6-9.
+- Cause: 0x10E0 is `B 0x1110`, 0x10E8 its delay slot. A run the interpreter stopped at the 65536-cycle budget right
+  after the branch resumes (MSCNT) at 0x10E8 with `branchPending` set; the profile recorded 0x10E8 as an entry and the
+  generated entry runs from there as ordinary code (on to 0x10F0 instead of 0x1110). Generated entries assume a pair
+  outside any delay slot: `vu1AotPrepare` now leaves such resumes to the interpreter (counted `not_idle`), also those
+  between an E-bit pair and its slot (`ebit` / `haltAfterDelaySlot`).
+- The self-check now switches off only the (program, entry) that differed; the other entries stay native.
+- Mismatch snapshots: the first 4 mismatches of each unit write `out/vu1aot_mismatch_<vu1aot|vu0aot>_<n>.bin`
+  (registers, working clip flag, micro memory, data memory before the run, budget, MSCAL / MSCNT).
+  `PS2X_VU1AOT_REPLAY=<file> ps2EntryRunner.exe` replays one without the game: the run in diff mode (the
+  `[vu1aot-diff]` line), then a trace without instrumentation: for every cycle budget B the pc where each side stops
+  (native: the pair it bails at, `BailBudget`; interpreter: where run() stops), so the first `<-- differ` line shows
+  where the two part (`PS2X_VU1AOT_REPLAY_TRACE=0`: the diff run only). A hand-made snapshot of this case (entry 0x10E8,
+  `branchPending`, target 0x1110) now reports `not_idle 1` (interpreter jumps to 0x1110); the same without a pending
+  branch: both stop at the same pcs at every budget.

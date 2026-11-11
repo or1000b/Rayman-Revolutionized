@@ -203,6 +203,20 @@
         { "type": "log_present", "pattern": "\\[pace\\] VBlank", "label": "the host fell behind and real-time pacing skipped time (else the test had no load)" },
         { "type": "track", "metric": "game_ms_per_host_s", "from": 6000, "to": 8970, "min": 970, "max": 1030, "label": "game time keeps wall-clock time while the host cannot keep up (game ms per wall-clock second)" }
       ]
+    },
+    {
+      "name": "glade_explore",
+      "description": "Load the user's save of 2026-11-11 (stage 2: The Fairy Glade, where the user saw 6-9 FPS around Ly's cutscene: a VU1 program switched off by its self-check) at 60 FPS, walk a little: pictures every 10 s.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_glade\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
+      "frames": 9000,
+      "shots": [4500, 5000, 5500, 6000, 6500, 7000, 7500, 8000, 8500, 8950],
+      "env": { "PS2X_FRAMERATE": "60" },
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "log_absent", "pattern": "aot\\] self-check|aot-diff\\]", "label": "native VU0 / VU1 code agrees with the interpreter (self-check)" }
+      ]
     }
   ]
 }

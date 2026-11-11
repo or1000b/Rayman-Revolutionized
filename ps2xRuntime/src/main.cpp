@@ -25,6 +25,7 @@
 extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 extern "C" void ps2xSetGameStatsLine(int (*fn)(const uint8_t *rdram, char *buffer, int size)); // ps2_runtime.cpp
 void ps2xVu1ProfileFlush(); // ps2_vu1_core.cpp
+int ps2xVu1AotReplay(const char *path); // ps2_vu1_core.cpp: PS2X_VU1AOT_REPLAY
 extern "C" uint32_t ps2xVBlankRateOverrideHz(); // EeScheduler.cpp (PS2X_FRAMERATE)
 extern "C" bool ps2xGuestYieldPending();        // ps2_runtime.cpp
 extern "C" void ps2xSetGuestVsyncHook(void (*fn)(uint64_t scriptTime, uint64_t vsync, const uint8_t *rdram)); // ps2_test_harness.cpp
@@ -1401,6 +1402,9 @@ int main(int argc, char *argv[])
 #if defined(_WIN32)
     SetUnhandledExceptionFilter(ps2xCrashFilter);
 #endif
+    // PS2X_VU1AOT_REPLAY=<out/vu1aot_mismatch_*.bin>: replay a native-vs-interpreter mismatch offline, no game.
+    if (const char *replay = std::getenv("PS2X_VU1AOT_REPLAY"); replay && *replay)
+        return ps2xVu1AotReplay(replay);
 
     try
     {
