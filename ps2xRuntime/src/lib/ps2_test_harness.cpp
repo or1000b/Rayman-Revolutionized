@@ -492,6 +492,62 @@ namespace
                 callerLines.push_back(line);
             }
         }
+        // PS2X_NATIVE_PROF_CHAIN="malloc,Mtx_lock": for samples whose leaf name contains one of these, the most
+        // common call chains (8 frames of other names), to find who calls a small helper that the one-level caller
+        // list cannot explain (an allocation, a lock).
+        std::vector<std::string> chainLines;
+        if (const char *chainEnv = std::getenv("PS2X_NATIVE_PROF_CHAIN"))
+        {
+            std::vector<std::string> wanted;
+            for (const char *p = chainEnv; *p;)
+            {
+                const char *end = std::strchr(p, ',');
+                const size_t n = end ? static_cast<size_t>(end - p) : std::strlen(p);
+                if (n)
+                    wanted.emplace_back(p, n);
+                p += n + (end ? 1u : 0u);
+            }
+            for (const std::string &want : wanted)
+            {
+                std::unordered_map<std::string, uint32_t> chains;
+                uint32_t total = 0;
+                for (const auto &s : samples)
+                {
+                    bool match = false;
+                    // The leaf or one of the first frames (a helper called by the function in the name).
+                    for (size_t i = 0; i < s.size() && i < 4u && !match; ++i)
+                        match = nameOf(s[i]).find(want) != std::string::npos;
+                    if (!match)
+                        continue;
+                    ++total;
+                    std::string chain;
+                    std::string last;
+                    size_t frames = 0;
+                    for (size_t i = 0; i < s.size() && frames < 8u; ++i)
+                    {
+                        const std::string &name = nameOf(s[i]);
+                        if (name == last)
+                            continue;
+                        chain += (frames ? " < " : "") + name;
+                        last = name;
+                        ++frames;
+                    }
+                    ++chains[chain];
+                }
+                std::vector<std::pair<std::string, uint32_t>> rows(chains.begin(), chains.end());
+                std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                char head[256];
+                std::snprintf(head, sizeof(head), "chains of '%s' (%.1f%% of the samples):", want.c_str(),
+                              100.0 * total / std::max<size_t>(1, samples.size()));
+                chainLines.push_back(head);
+                for (size_t k = 0; k < rows.size() && k < 10u; ++k)
+                {
+                    char pct[32];
+                    std::snprintf(pct, sizeof(pct), "  %5.1f%%  ", 100.0 * rows[k].second / std::max<size_t>(1, samples.size()));
+                    chainLines.push_back(pct + rows[k].first);
+                }
+            }
+        }
         SymCleanup(process);
         auto print = [&](const char *title, const std::unordered_map<std::string, uint32_t> &table, size_t maxRows) {
             std::vector<std::pair<std::string, uint32_t>> rows(table.begin(), table.end());
@@ -506,6 +562,8 @@ namespace
         print("exclusive by line", lines, 120);
         std::fprintf(stderr, "[nprof] top exclusive: module, hottest address, callers:\n");
         for (const std::string &line : callerLines)
+            std::fprintf(stderr, "[nprof]   %s\n", line.c_str());
+        for (const std::string &line : chainLines)
             std::fprintf(stderr, "[nprof]   %s\n", line.c_str());
         std::fflush(stderr);
     }
