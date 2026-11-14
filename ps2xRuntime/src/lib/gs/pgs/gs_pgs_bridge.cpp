@@ -1372,39 +1372,69 @@ namespace ps2x::pgs
             return true;
         }
 
-        void enqueueGif(uint32_t index, const uint8_t *packets, size_t size)
+        // Staging (2026-11-12): the game sends thousands of small VU1 packets per frame, and queueing each one took
+        // the queue lock (contended with the worker's swap) and woke the worker, which had gone back to sleep after
+        // the previous one: ~5% of the game thread at 120 FPS. Packets and register writes now collect here and move
+        // to the queue kStageBytes at a time; a scanout request, a drain and the stop flush what is staged, so the
+        // order of the stream is unchanged and a picture never misses what was sent before it.
+        constexpr size_t kStageBytes = 32u << 10;
+        std::mutex g_stageMutex;
+        Batch g_staged;
+
+        // Called with g_stageMutex held.
+        void flushStagedLocked()
         {
+            if (g_staged.commands.empty())
+                return;
             std::unique_lock<std::mutex> lock(g_queueMutex);
             if (g_pendingBytes >= kMaxQueuedBytes)
             {
                 ++g_roomWaits;
                 g_roomCv.wait(lock, [] { return g_pendingBytes < kMaxQueuedBytes || g_workerStop; });
             }
-            Command c{Command::Gif, index, g_filling.bytes.size(), static_cast<uint32_t>(size)};
-            g_filling.bytes.insert(g_filling.bytes.end(), packets, packets + size);
-            g_filling.commands.push_back(c);
-            g_pendingBytes += size;
-            ++g_enqueued;
+            const size_t base = g_filling.bytes.size();
+            g_filling.bytes.insert(g_filling.bytes.end(), g_staged.bytes.begin(), g_staged.bytes.end());
+            for (Command c : g_staged.commands)
+            {
+                if (c.kind == Command::Gif)
+                    c.b += base;
+                g_filling.commands.push_back(c);
+            }
+            g_pendingBytes += g_staged.bytes.size();
+            g_enqueued += g_staged.commands.size();
             const bool wake = wakeWorkerLocked();
             lock.unlock();
             if (wake)
                 g_workCv.notify_one();
+            g_staged.commands.clear();
+            g_staged.bytes.clear();
+        }
+
+        void flushStaged()
+        {
+            std::lock_guard<std::mutex> stage(g_stageMutex);
+            flushStagedLocked();
+        }
+
+        void enqueueGif(uint32_t index, const uint8_t *packets, size_t size)
+        {
+            std::lock_guard<std::mutex> stage(g_stageMutex);
+            g_staged.commands.push_back(Command{Command::Gif, index, g_staged.bytes.size(), static_cast<uint32_t>(size)});
+            g_staged.bytes.insert(g_staged.bytes.end(), packets, packets + size);
+            if (g_staged.bytes.size() >= kStageBytes)
+                flushStagedLocked();
         }
 
         void enqueueRegister(uint32_t reg, uint64_t value)
         {
-            std::unique_lock<std::mutex> lock(g_queueMutex);
-            g_filling.commands.push_back(Command{Command::Register, reg, value, 0u});
-            ++g_enqueued;
-            const bool wake = wakeWorkerLocked();
-            lock.unlock();
-            if (wake)
-                g_workCv.notify_one();
+            std::lock_guard<std::mutex> stage(g_stageMutex);
+            g_staged.commands.push_back(Command{Command::Register, reg, value, 0u});
         }
 
         // Waits until the worker has done every command queued so far.
         void drain()
         {
+            flushStaged();
             std::unique_lock<std::mutex> lock(g_queueMutex);
             const uint64_t target = g_enqueued;
             if (g_done >= target)
@@ -1646,6 +1676,8 @@ namespace ps2x::pgs
             std::lock_guard<std::mutex> producer(g_producerMutex);
             for (auto &pending : g_pendingGif)
                 pending.clear();
+            std::lock_guard<std::mutex> stage(g_stageMutex);
+            g_staged = Batch{};
         }
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_state)
@@ -1765,6 +1797,10 @@ namespace ps2x::pgs
         }
         uint64_t id = 0;
         {
+            // What the game staged so far comes before this picture; the stage lock keeps a packet staged
+            // meanwhile behind the request.
+            std::lock_guard<std::mutex> stage(g_stageMutex);
+            flushStagedLocked();
             std::unique_lock<std::mutex> lock(g_queueMutex);
             id = ++g_scanRequested;
             g_filling.commands.push_back(Command{Command::Scanout, static_cast<uint32_t>(g_filling.regs.size()), id, 0u});
