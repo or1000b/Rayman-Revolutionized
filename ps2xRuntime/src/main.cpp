@@ -288,8 +288,40 @@ namespace
     {
         const uint32_t gp = getRegU32(ctx, 28);
         g_raymanVBlankHandler(rdram, ctx, runtime); // counter++, ei, return 0
-        if (!raymanDemoPlayback(rdram, gp))
-            raymanRamWrite32(rdram, gp - 0x71D8u, raymanRam32(rdram, gp - 0x71D8u) + 1u);
+        if (raymanDemoPlayback(rdram, gp))
+            return;
+        // PS2X_RAYMAN_RATE_SWITCH="fromVsync:divisor" (experiments, CLAUDE.md issue 22): from that guest VSync the game
+        // runs at N / divisor FPS (a frame every divisor VBlanks) with the matching clock unit. A replay recorded at
+        // 120 FPS can then show the same moment at 24 FPS.
+        static const auto rateSwitch = []()
+        {
+            std::pair<uint64_t, uint32_t> s{0u, 1u};
+            if (const char *text = std::getenv("PS2X_RAYMAN_RATE_SWITCH"))
+            {
+                unsigned long long from = 0u;
+                unsigned divisor = 1u;
+                if (std::sscanf(text, "%llu:%u", &from, &divisor) == 2 && divisor >= 2u && divisor <= 10u)
+                    s = {from, divisor};
+            }
+            return s;
+        }();
+        if (rateSwitch.second > 1u && ps2xGuestVsync() >= rateSwitch.first)
+        {
+            static uint64_t phase = 0u;
+            if (phase == 0u)
+            {
+                g_raymanUnitHz = g_raymanFrameRate / rateSwitch.second;
+                g_raymanClockRemainder = 0u;
+                raymanRamWriteFloat(rdram, kRaymanClockUnitAddr, 1.0f / static_cast<float>(g_raymanUnitHz));
+                std::fprintf(stderr, "[hle] Rayman: VSync %llu: now %u FPS (PS2X_RAYMAN_RATE_SWITCH)\n",
+                             static_cast<unsigned long long>(ps2xGuestVsync()), g_raymanUnitHz);
+            }
+            // Two counts every divisor-th VBlank (the frame may end), none in between (undo the handler's one).
+            const uint32_t counter = raymanRam32(rdram, gp - 0x71D8u);
+            raymanRamWrite32(rdram, gp - 0x71D8u, (phase++ % rateSwitch.second) == 0u ? counter + 1u : counter - 1u);
+            return;
+        }
+        raymanRamWrite32(rdram, gp - 0x71D8u, raymanRam32(rdram, gp - 0x71D8u) + 1u);
     }
 
     // The update just made (frame counter one past the last one corrected): the exact ms step instead of trunc(n * unit).
