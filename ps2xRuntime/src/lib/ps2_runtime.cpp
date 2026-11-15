@@ -14,6 +14,7 @@
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 #include "gs/pgs/gs_pgs_bridge.h"
+#include "ps2_gfx_thread.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -813,11 +814,26 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     {
+                                        if (ps2x::gfx::onWorker())
+                                        {
+                                            // The graphics thread: the profiler's activity is the game thread's.
+                                            m_gs.processGIFPacket(data, size);
+                                            return;
+                                        }
                                         ProfActivityScope profScope(2);
                                         m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
+                                     if (ps2x::gfx::onWorker())
+                                     {
+                                         // The graphics thread: the EE context (D / T bit enables, VPU_STAT) is
+                                         // the game thread's; no retail game runs VU1 with those debug bits.
+                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                       m_gs, &m_memory, startPC, top, itop, 65536);
+                                         return;
+                                     }
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -837,6 +853,13 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
+                                     if (ps2x::gfx::onWorker())
+                                     {
+                                         m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                      m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                      m_gs, &m_memory, top, itop, 65536);
+                                         return;
+                                     }
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -3259,6 +3282,7 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    ps2x::gfx::stop(); // the graphics thread finishes what the game posted
     profilerStop.store(true, std::memory_order_relaxed);
     if (profilerThread.joinable())
     {

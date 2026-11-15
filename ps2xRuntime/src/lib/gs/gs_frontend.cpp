@@ -3,6 +3,7 @@
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include "pgs/gs_pgs_bridge.h"
+#include "../ps2_gfx_thread.h"
 #include <cstdlib>
 #include <string>
 #include <atomic>
@@ -60,6 +61,7 @@ namespace
         if (choice && (std::string(choice) == "cpu" || std::string(choice) == "CPU"))
         {
             std::cout << "[gs] renderer: CPU (PS2X_GS_RENDERER=cpu)" << std::endl;
+            ps2x::gfx::forceOff(); // the CPU renderer's picture is read from GS memory by the window thread
             return;
         }
         std::string error;
@@ -608,6 +610,17 @@ void GS::latchHostPresentationFrame()
             regs.extdata = m_privRegs->extdata;
             regs.extwrite = m_privRegs->extwrite;
             regs.bgcolor = m_privRegs->bgcolor;
+            // The graphics thread is behind the game: the display registers as of the work it is doing (a flip
+            // the game made after posting its frame shows once that frame is drawn).
+            uint64_t shadow[5];
+            if (ps2x::gfx::shadowDisplay(shadow))
+            {
+                regs.pmode = shadow[0];
+                regs.dispfb1 = shadow[1];
+                regs.display1 = shadow[2];
+                regs.dispfb2 = shadow[3];
+                regs.display2 = shadow[4];
+            }
         }
         static std::vector<uint8_t> s_scanout;
         uint32_t w = 0u, h = 0u;
@@ -1211,6 +1224,12 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    if (ps2x::gfx::shouldPost(4u))
+    {
+        // From the game thread (HLE stubs): in order behind what the graphics thread still has.
+        ps2x::gfx::post([this, regAddr, value] { writeRegister(regAddr, value); }, 16u, m_privRegs);
+        return;
+    }
     if (g_pgs)
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -1789,6 +1808,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    ps2x::gfx::sync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (g_pgs)
         return static_cast<uint32_t>(ps2x::pgs::readTransfer(dst, maxBytes));

@@ -236,11 +236,11 @@
       "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
       "frames": 9000,
       "shots": [6000],
-      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9" },
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1" },
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
         { "type": "log_absent", "pattern": "aot\\] self-check|aot-diff\\]", "label": "native VU0 / VU1 code agrees with the interpreter (self-check)" },
-        { "type": "fps", "after_tick": 4500, "min": 110, "label": "the Fairy Glade at 120 FPS with SSAA x4 and 16:9 (average game FPS)", "known_fail": "target: 84 FPS on 2026-11-11 (VU1 43% of the game thread, -NoKickHash), the speed work's goal is 110+" }
+        { "type": "fps", "after_tick": 4500, "min": 110, "label": "the Fairy Glade at 120 FPS with SSAA x4 and 16:9 (average game FPS)" }
       ]
     }
   ]

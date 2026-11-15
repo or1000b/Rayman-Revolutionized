@@ -141,3 +141,39 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
   identical). The 16 KiB VU1 memory copy at every MSCAL / MSCNT for the bad-packet dumps is only made when a bug hunt
   asks (`PS2X_VU1_DUMP_MSCAL=1` or the RGBA / NEGQ hunts). `processVIF1Data` 6.5% -> 1.7%, idle 28% -> 33%.
   `run_tests -NoKickHash` drops the hash for profiling runs.
+
+## 120 FPS: the graphics thread (2026-11-12 .. 15)
+
+- Goal (user): a steady 120 with SSAA x4 and 16:9 (`run_rayman_hd_120fps.bat`). Scenario `glade_120_hd` (the Fairy
+  Glade save at those settings, `fps` check 110+). Before: 84-88 game FPS; `PS2X_NATIVE_PROF` on the game thread: VU1
+  43% (generated program 4ead7b35a3a6 alone 21.6%), the GS bridge's lock and worker wake-ups ~5%, idle 3%.
+  `PS2X_NATIVE_PROF_CHAIN="RtlAllocateHeap,Mtx_lock"` (new) prints the call chains of chosen functions;
+  `PS2X_NATIVE_PROF_THREAD=GfxThread` samples another thread.
+- GS bridge staging (`gs_pgs_bridge.cpp`): packets and register writes collect in a stage and move to the GS queue
+  32 KiB at a time (a scanout request, a drain and the stop flush it first). 85.6 -> 87.9.
+- **Graphics thread** (`ps2_gfx_thread.h`, code `ps2_gfx_thread.inc` included by `ps2_memory.cpp`;
+  `PS2X_GFX_THREAD` = unset: on in normal play, off in deterministic runs; `1` / `0` force it). Like PCSX2's MTVU, but
+  for the whole graphics side: `processPendingTransfers` copies the data of the GIF and VIF1 transfers and posts them
+  to one worker, which runs the VIF1 unpacks, the VU1 programs and the GIF arbiter in order; HLE stubs' GIF packets
+  (`submitGifPacket`) and GS register writes (`GS::writeRegister`) are posted behind them. The game still sees the
+  transfer complete at once (as before). What the game can read back waits for the worker first (`sync`): reads and
+  writes of 0x10003000-0x10006FFF (GIF / VIF registers and FIFOs), VU1 code / data memory, GS -> host transfers, the
+  native GIF chain paths. The window's scanout uses the display registers (PMODE, DISPFB, DISPLAY) as of the task the
+  worker is running (`shadowDisplay`): a buffer flip the game made after posting its frame shows once that frame is
+  drawn. On the worker the VU1 run skips the EE context's D / T bit enables and VPU_STAT (debug bits no retail game
+  uses). The CPU renderer switches it off. `[gfx] posts N, the game waited ...: S syncs, F full queue` at exit.
+- Races found on the way (`tools/crashstack.py`, new: runs the exe under a minimal debugger and prints the faulting
+  thread's stack, for heap corruption 0xC0000374 that no in-process handler sees): `processPendingTransfers` drained
+  the GIF arbiter on the game thread when a stub called it with nothing pending (the arbiter belongs to the worker);
+  the VU1 self-check's packet capture pointer was a global that a VU0 self-check on the game thread set (now
+  thread-local).
+- Measured (`glade_120_hd` family, game FPS after tick 4500, `-NoKickHash`):
+
+  | SSAA | without graphics thread | with |
+  |---|---|---|
+  | x1 | 81.6 | 119.1 |
+  | x2 | 80.7 | 103.1 |
+  | x4 | 87.5 | 119.9 (min 119.4, median 119.8; GPU ~29%, scanout 2.6 ms) |
+
+  One x4 run gave 74.7 with the scanout at 19 ms and the worker waiting 52% of its time for room in the GS queue: the
+  GS thread / GPU was slow then (another program on the GPU?); not reproduced.

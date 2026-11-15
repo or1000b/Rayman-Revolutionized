@@ -303,7 +303,9 @@ namespace
         std::vector<uint8_t> packets;
         std::vector<uint32_t> sizes;
     };
-    Vu1AotCapture *g_vu1AotCapture = nullptr;
+    // Per thread: VU1 runs on the graphics thread while VU0 runs on the game thread (a VU0 self-check must not
+    // collect VU1 packets).
+    thread_local Vu1AotCapture *g_vu1AotCapture = nullptr;
 
     // ---------------------------------------------------------------- VU1 ahead-of-time translation (docs/vu1_aot.md)
 

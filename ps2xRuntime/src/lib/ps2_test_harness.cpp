@@ -328,6 +328,14 @@ namespace
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // PS2X_NATIVE_PROF_THREAD=GfxThread: the thread the native profiler samples (default GameThread).
+    std::wstring profThreadName()
+    {
+        const char *env = std::getenv("PS2X_NATIVE_PROF_THREAD");
+        const std::string name = (env && *env) ? env : "GameThread";
+        return std::wstring(name.begin(), name.end());
+    }
+
     // Native sampling profiler: PS2X_NATIVE_PROF="fromTick,toTick" samples the GameThread's native stack about every
     // millisecond between those window ticks, then prints `[nprof]` tables: functions by exclusive samples (the
     // function the thread was in) and by inclusive samples (anywhere on the stack). Bug hunt / performance tool.
@@ -351,7 +359,7 @@ namespace
                     PWSTR desc = nullptr;
                     if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc)
                     {
-                        if (std::wstring(desc) == L"GameThread")
+                        if (std::wstring(desc) == profThreadName())
                             gameThreadId = te.th32ThreadID;
                         LocalFree(desc);
                     }

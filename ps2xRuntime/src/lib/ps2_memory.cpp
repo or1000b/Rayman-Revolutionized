@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include "ps2_gfx_thread.inc"
 
 namespace
 {
@@ -568,11 +569,16 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     {
         return ptr;
     }
+    // VU1 memory belongs to the graphics thread while it works: the game's access waits for it.
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
+        ps2x::gfx::sync();
         return ptr;
     }
-    return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    const uint8_t *vu1Data = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    if (vu1Data)
+        ps2x::gfx::sync();
+    return vu1Data;
 }
 
 uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
@@ -1134,6 +1140,9 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    // GIF / VIF registers and FIFOs: the graphics thread's state, wait for it.
+    if (address >= 0x10003000u && address < 0x10007000u)
+        ps2x::gfx::sync();
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1689,9 +1698,10 @@ void PS2Memory::processPendingTransfers()
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
     }
 
-    for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+    auto runGif = [this](std::vector<PendingTransfer> &transfers)
     {
-        auto &p = m_pendingGifTransfers[idx];
+    for (auto &p : transfers)
+    {
         if (!p.chainData.empty())
         {
             m_seenGifCopy = true;
@@ -1751,7 +1761,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingGifTransfers.clear();
+    };
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
     for (auto &p : m_pendingVif0Transfers)
@@ -1812,7 +1822,9 @@ void PS2Memory::processPendingTransfers()
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
-    for (auto &p : m_pendingVif1Transfers)
+    auto runVif1 = [this](std::vector<PendingTransfer> &transfers)
+    {
+    for (auto &p : transfers)
     {
         if (!p.chainData.empty())
         {
@@ -1867,10 +1879,75 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif1Transfers.clear();
+    };
 
-    if (m_gifArbiter)
-        m_gifArbiter->drain();
+    if (ps2x::gfx::shouldPost(1u) && (hadGif || hadVif1))
+    {
+        // The graphics thread runs these transfers: it gets its own copy of the data (the game sees the transfer
+        // complete now and may reuse its buffers).
+        size_t bytes = 0;
+        auto own = [this, &bytes](std::vector<PendingTransfer> &transfers)
+        {
+            for (auto &p : transfers)
+            {
+                if (p.chainData.empty() && p.qwc > 0)
+                {
+                    const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+                    const uint32_t sizeBytes = (bytes64 > 0x04000000ull) ? 0x04000000u : static_cast<uint32_t>(bytes64);
+                    uint32_t srcPhys = 0;
+                    try
+                    {
+                        srcPhys = translateAddress(p.srcAddr);
+                    }
+                    catch (const std::exception &)
+                    {
+                        p.qwc = 0;
+                        continue;
+                    }
+                    const uint8_t *base = p.fromScratchpad ? m_scratchpad : m_rdram;
+                    const uint32_t regionSize = p.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                    p.chainData.resize(sizeBytes);
+                    uint32_t done = 0;
+                    while (done < sizeBytes)
+                    {
+                        if (srcPhys >= regionSize)
+                            srcPhys = 0;
+                        const uint32_t chunk = std::min(sizeBytes - done, regionSize - srcPhys);
+                        std::memcpy(p.chainData.data() + done, base + srcPhys, chunk);
+                        done += chunk;
+                        srcPhys += chunk;
+                    }
+                    p.qwc = 0;
+                }
+                bytes += p.chainData.size();
+            }
+        };
+        own(m_pendingGifTransfers);
+        own(m_pendingVif1Transfers);
+        auto gifs = std::make_shared<std::vector<PendingTransfer>>(std::move(m_pendingGifTransfers));
+        auto vif1s = std::make_shared<std::vector<PendingTransfer>>(std::move(m_pendingVif1Transfers));
+        m_pendingGifTransfers.clear();
+        m_pendingVif1Transfers.clear();
+        ps2x::gfx::post([this, gifs, vif1s, runGif, runVif1]
+                        {
+                            runGif(*gifs);
+                            runVif1(*vif1s);
+                            if (m_gifArbiter)
+                                m_gifArbiter->drain();
+                        },
+                        bytes, &gs_regs);
+    }
+    else if (!ps2x::gfx::shouldPost(1u))
+    {
+        runGif(m_pendingGifTransfers);
+        m_pendingGifTransfers.clear();
+        runVif1(m_pendingVif1Transfers);
+        m_pendingVif1Transfers.clear();
+        if (m_gifArbiter)
+            m_gifArbiter->drain();
+    }
+    // else: nothing to transfer (a stub called this without a transfer pending), and the GIF arbiter is the
+    // graphics thread's: draining it here raced with the worker (heap corruption, found with tools/crashstack.py).
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
@@ -1958,6 +2035,16 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     if (!data || sizeBytes < 16)
         return;
 
+    if (ps2x::gfx::shouldPost(2u))
+    {
+        // From the game thread (HLE stubs): in order behind what the graphics thread still has.
+        auto copy = std::make_shared<std::vector<uint8_t>>(data, data + sizeBytes);
+        ps2x::gfx::post([this, pathId, copy, path2DirectHl]
+                        { submitGifPacket(pathId, copy->data(), static_cast<uint32_t>(copy->size()), true, path2DirectHl); },
+                        sizeBytes, &gs_regs);
+        return;
+    }
+
     if (pathId == GifPathId::Path3)
     {
         if (m_path3Masked)
@@ -2017,6 +2104,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
+    ps2x::gfx::sync();
     if (!m_rdram || !m_gsVRAM || m_path3Masked)
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
@@ -2209,6 +2297,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
 
+    ps2x::gfx::sync();
     if (!m_rdram || !m_gsVRAM || m_path3Masked)
         return false;
     if (m_gifArbiter && !m_gifArbiter->empty())
@@ -2290,6 +2379,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (address >= 0x10003000u && address < 0x10007000u)
+        ps2x::gfx::sync();
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
