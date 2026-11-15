@@ -21,7 +21,16 @@ namespace ps2x::gfx
             size_t bytes = 0;
             uint64_t display[5]{};
         };
-        constexpr size_t kMaxQueuedBytes = 4u << 20;
+        // How far the game may run ahead of the worker, in bytes of queued transfers (PS2X_GFX_QUEUE_MB, default 16).
+        // Busy scenes send ~4 MiB per frame: the old 4 MiB kept the two threads in lock-step (hub run at 120 FPS:
+        // plain 54.6 -> 71.6 game FPS with 16). 16 MiB is ~4 frames, so at most ~33 ms more picture lag at 120 FPS,
+        // and only while the worker is the slower one.
+        const size_t kMaxQueuedBytes = []
+        {
+            const char *env = std::getenv("PS2X_GFX_QUEUE_MB");
+            const int mb = env ? std::atoi(env) : 0;
+            return static_cast<size_t>(mb > 0 ? mb : 16) << 20;
+        }();
 
         std::mutex g_mutex;
         std::condition_variable g_workCv; // the worker waits for a task
@@ -36,6 +45,7 @@ namespace ps2x::gfx
         thread_local bool t_onWorker = false;
         // Counters for the [gfx] line at the end: how often the game had to wait for the worker.
         std::atomic<uint64_t> g_syncWaits{0}, g_roomWaits{0};
+        uint64_t g_bytesPosted = 0, g_maxQueued = 0; // under g_mutex
 
         void workerLoop()
         {
@@ -137,6 +147,8 @@ namespace ps2x::gfx
             g_doneCv.wait(lock, [] { return g_bytes < kMaxQueuedBytes || g_stop; });
         }
         g_bytes += bytes;
+        g_bytesPosted += bytes;
+        g_maxQueued = std::max<uint64_t>(g_maxQueued, g_bytes);
         ++g_posted;
         g_queue.push_back(std::move(t));
         lock.unlock();
@@ -175,8 +187,12 @@ namespace ps2x::gfx
         g_doneCv.notify_all();
         if (g_thread.joinable())
             g_thread.join();
-        std::fprintf(stderr, "[gfx] posts %llu, the game waited for the worker: %llu syncs, %llu full queue\n",
+        std::fprintf(stderr, "[gfx] posts %llu, the game waited for the worker: %llu syncs, %llu full queue; %llu MiB posted, "
+                             "queue limit %llu MiB, most queued %llu KiB\n",
                      static_cast<unsigned long long>(g_posted), static_cast<unsigned long long>(g_syncWaits.load()),
-                     static_cast<unsigned long long>(g_roomWaits.load()));
+                     static_cast<unsigned long long>(g_roomWaits.load()),
+                     static_cast<unsigned long long>(g_bytesPosted >> 20),
+                     static_cast<unsigned long long>(kMaxQueuedBytes >> 20),
+                     static_cast<unsigned long long>(g_maxQueued >> 10));
     }
 }

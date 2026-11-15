@@ -13,6 +13,39 @@
 
 namespace
 {
+    // DMA chain buffers are recycled. A new vector for every transfer (megabytes in busy scenes) cost the game thread
+    // page faults while copying into fresh memory, and the graphics thread a VirtualFree per transfer (hub run at
+    // 120 FPS, 2026-11-15). Any thread may take or give back; a buffer keeps its capacity.
+    std::mutex g_chainPoolMutex;
+    std::vector<std::vector<uint8_t>> g_chainPool;
+    constexpr size_t kChainPoolMax = 64;
+    constexpr size_t kChainBufferMaxKeep = 32u << 20;
+
+    std::vector<uint8_t> takeChainBuffer()
+    {
+        std::lock_guard<std::mutex> lock(g_chainPoolMutex);
+        if (g_chainPool.empty())
+            return {};
+        std::vector<uint8_t> buffer = std::move(g_chainPool.back());
+        g_chainPool.pop_back();
+        buffer.clear();
+        return buffer;
+    }
+
+    template <class Transfer>
+    void recycleChainBuffers(std::vector<Transfer> &transfers)
+    {
+        std::lock_guard<std::mutex> lock(g_chainPoolMutex);
+        for (auto &transfer : transfers)
+        {
+            if (transfer.chainData.capacity() == 0u || transfer.chainData.capacity() > kChainBufferMaxKeep ||
+                g_chainPool.size() >= kChainPoolMax)
+                continue;
+            g_chainPool.push_back(std::move(transfer.chainData));
+            transfer.chainData = {};
+        }
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -1364,7 +1397,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuffer();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1819,6 +1852,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBuffers(m_pendingVif0Transfers);
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
@@ -1906,6 +1940,7 @@ void PS2Memory::processPendingTransfers()
                     }
                     const uint8_t *base = p.fromScratchpad ? m_scratchpad : m_rdram;
                     const uint32_t regionSize = p.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                    p.chainData = takeChainBuffer();
                     p.chainData.resize(sizeBytes);
                     uint32_t done = 0;
                     while (done < sizeBytes)
@@ -1934,14 +1969,18 @@ void PS2Memory::processPendingTransfers()
                             runVif1(*vif1s);
                             if (m_gifArbiter)
                                 m_gifArbiter->drain();
+                            recycleChainBuffers(*gifs);
+                            recycleChainBuffers(*vif1s);
                         },
                         bytes, &gs_regs);
     }
     else if (!ps2x::gfx::shouldPost(1u))
     {
         runGif(m_pendingGifTransfers);
+        recycleChainBuffers(m_pendingGifTransfers);
         m_pendingGifTransfers.clear();
         runVif1(m_pendingVif1Transfers);
+        recycleChainBuffers(m_pendingVif1Transfers);
         m_pendingVif1Transfers.clear();
         if (m_gifArbiter)
             m_gifArbiter->drain();

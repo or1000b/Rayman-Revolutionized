@@ -177,3 +177,24 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
 
   One x4 run gave 74.7 with the scanout at 19 ms and the worker waiting 52% of its time for room in the GS queue: the
   GS thread / GPU was slow then (another program on the GPU?); not reproduced.
+- **Crowded places (2026-11-15, the user's run `hub_run_120`: the plain, the Fairy Glade portal and bridge).** The user
+  still saw drops: 40-56 game FPS for ~25 s on the plain. There the game thread waited for the worker ~21% of its time
+  (`ps2x::gfx::post`, full queue) while the worker was idle ~37% of its own: busy scenes post ~4.1 MiB of transfers per
+  frame (`[gfx] ... MiB posted` at exit, new), so the 4 MiB queue let the game run at most one frame ahead and the two
+  threads went in lock-step. The game thread also copied every DMA chain into a new vector (page faults on fresh memory)
+  that the worker then freed (VirtualFree for the big ones).
+  - DMA chain buffers are recycled (`takeChainBuffer` / `recycleChainBuffers` in `ps2_memory.cpp`, up to 64 kept).
+  - The queue holds 16 MiB (~4 frames; `PS2X_GFX_QUEUE_MB`): at most ~33 ms more picture lag at 120 FPS, and only
+    while the worker is the slower thread.
+
+  | hub_run_120, game FPS (`-NoKickHash`) | all | plain | after the plain | Fairy Glade |
+  |---|---|---|---|---|
+  | before | 85.3 | 54.6 | 79.9 | 70.9 |
+  | buffer pool | 89.3 | 56.6 | 85.8 | 71.8 |
+  | pool + 16 MiB queue | 95.6 | 71.6 | 123.5 | 80.1 |
+  | pool + 32 MiB queue | 93.9 | 75.4 | 116.6 | 77.0 |
+
+  Still short of 120 there: both threads are near their limit (worker: VU1 programs ~32%, `prog_6af8ebd05633` alone
+  ~21%; game thread: the chain copies, ~4 MiB per frame, and guest code). From VSync 9060 (the Fairy Glade) every replay
+  of this recording has its own EE hash at the same cycle counts, also between two runs of one build: an older
+  nondeterminism there, not from these changes (to look at).
