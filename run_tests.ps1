@@ -273,6 +273,13 @@ if ($Record) {
     if (-not $Only -or $sc.Count -ne 1) { Write-Host "-Record needs -Only <scenario name>"; exit 1 }
     $sc = $sc[0]
     Write-Host "=== Recording scenario $($sc.name): play from the start, close the game window when done ==="
+    # A recording made before is kept: <name>_<date>.input (only <name>.input is replayed).
+    $previous = Join-Path (Join-Path $Root 'tests\fixtures') ($sc.name + '.input')
+    if ((Test-Path $previous) -and -not $RecordScript) {
+        $kept = Join-Path (Join-Path $Root 'tests\fixtures') ($sc.name + '_' + (Get-Item $previous).LastWriteTime.ToString('yyyy-MM-dd_HH-mm-ss') + '.input')
+        Move-Item -Force $previous $kept
+        Write-Host "  the previous recording is kept as $kept"
+    }
     $dir = Join-Path $TestsOut ($sc.name + '_record')
     if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
     New-Item -ItemType Directory -Force $dir | Out-Null

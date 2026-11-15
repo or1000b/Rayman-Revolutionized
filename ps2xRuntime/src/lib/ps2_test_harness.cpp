@@ -134,6 +134,18 @@ namespace
         return vsyncClock ? g_guestVsync.load(std::memory_order_relaxed) : scriptClock();
     }
 
+    // PS2X_TEST_INPUT_PORTS=2: the pad script drives port 2 as well (recordings made before 2026-11-15 17:30, when the
+    // real pad still reached port 2 while recording).
+    bool scriptDrivesPort(int port)
+    {
+        static const bool both = []
+        {
+            const char *env = std::getenv("PS2X_TEST_INPUT_PORTS");
+            return env && std::atoi(env) >= 2;
+        }();
+        return port == 0 || (port == 1 && both);
+    }
+
     // ---- PS2X_RECORD_INPUT=<file>: the real pad as the game reads it, as a pad script on the VSync clock (run_tests
     // -Record: deterministic like a test run, so replaying the file with PS2X_TEST_INPUT_FILE and
     // PS2X_TEST_INPUT_CLOCK=vsync does what the player did).
@@ -815,8 +827,17 @@ extern "C" void ps2xTestHarnessExiting()
 // whole VSync (Recorder::latched).
 extern "C" void ps2xTestRecordPad(int port, uint16_t *buttonsInOut, uint8_t axes[4])
 {
-    if (g_recorder.path.empty() || port != 0)
+    if (g_recorder.path.empty())
         return;
+    if (port != 0)
+    {
+        // The real pad and keyboard reach every port, and the game reads port 2 too: while recording only port 1
+        // gets them (the recording and the replay drive port 1 alone).
+        *buttonsInOut = 0xFFFFu;
+        for (int i = 0; i < 4; ++i)
+            axes[i] = 0x80;
+        return;
+    }
     std::lock_guard<std::mutex> lock(g_recorder.mutex);
     if (g_recorder.finished)
         return;
@@ -878,7 +899,7 @@ extern "C" void ps2xTestRecordPad(int port, uint16_t *buttonsInOut, uint8_t axes
 // EE thread (scePadRead): buttons the script holds down right now, active-high.
 extern "C" uint16_t ps2xTestPadButtons(int port)
 {
-    if (port != 0 || g_padScript.empty())
+    if (!scriptDrivesPort(port) || g_padScript.empty())
         return 0;
     const uint64_t tick = inputClock();
     uint16_t mask = 0;
@@ -894,7 +915,7 @@ extern "C" uint16_t ps2xTestPadButtons(int port)
 // Returns false when no stick event is active, so the caller keeps its own values.
 extern "C" bool ps2xTestPadAxes(int port, uint8_t axes[4])
 {
-    if (port != 0 || g_padScript.empty())
+    if (!scriptDrivesPort(port) || g_padScript.empty())
         return false;
     const uint64_t tick = inputClock();
     bool any = false;

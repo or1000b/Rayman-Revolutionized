@@ -250,7 +250,7 @@
       "memcard": "fixtures\\mc_shop\\mc0",
       "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
       "frames": 6500,
-      "shots": [2000, 2150, 2300, 2450, 2600, 2750, 2900, 3050, 3200, 3350, 3500, 3650, 3800, 3950, 4100, 4250, 4400, 4550, 4700, 4850, 5000, 5150, 5300, 5450, 5600, 5750, 5900, 6050, 6200, 6350],
+      "shots": [1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750, 3000, 3250, 3500, 3750, 4000, 4250, 4500, 4750, 5000, 5250, 5500, 5750, 6000, 6250],
       "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "1" },
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
@@ -258,12 +258,13 @@
     },
     {
       "name": "hub_run_120",
-      "description": "The user's run through crowded places (the portal hub, the Fairy Glade entrance) at run_rayman_hd_120fps.bat settings, where 120 FPS drops (recorded with record_for_claude.bat hub_run_120).",
+      "description": "The user's run through crowded places at run_rayman_hd_120fps.bat settings, where 120 FPS drops: across the plain, through the Fairy Glade portal, onto the bridge (recorded 2026-11-15 16:58; PS2X_TEST_INPUT_PORTS=2 because it was made before port 2 was kept out of recordings).",
       "renderer": "gpu",
       "memcard": "fixtures\\mc_shop\\mc0",
       "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
-      "frames": 20000,
-      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "1" },
+      "frames": 5000,
+      "shots": [1500, 2500, 3500, 4000, 4500],
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "1", "PS2X_TEST_INPUT_PORTS": "2" },
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
       ]
