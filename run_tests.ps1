@@ -6,6 +6,9 @@
     run_tests.bat -Only choose_english  one scenario
     run_tests.bat -UpdateGolden         save this run's checkpoint pictures as the new golden pictures
     run_tests.bat -NoKickHash           no PS2X_VU1_KICK_HASH (~10% of the game thread): for profiling; vu1_hash checks fail
+    run_tests.bat -Record -Only <name>  play the scenario yourself (its memory card, env, deterministic, real pad, no
+                                        frame budget); the pad goes to tests\fixtures\<name>.input, which the
+                                        scenario replays from then on (VSync clock) instead of its "input"
   Scenarios and checks: tests\scenarios.json. Report: out\test_report.txt. Exit code 0 = no FAIL.
   Written for Windows PowerShell 5.1 (no PowerShell 7 syntax).
 #>
@@ -13,7 +16,8 @@ param(
     [switch]$NoBuild,
     [string]$Only = '',
     [switch]$UpdateGolden,
-    [switch]$NoKickHash
+    [switch]$NoKickHash,
+    [switch]$Record
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,6 +143,26 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     $env:PS2X_TEST_SHOTS = (@($sc.shots) -join ',')
     $env:PS2X_WATCHDOG_SEC = '15'
     $env:PS2X_DETERMINISTIC = '1'
+    Remove-Item Env:PS2X_TEST_INPUT_FILE -ErrorAction SilentlyContinue
+    Remove-Item Env:PS2X_TEST_INPUT_CLOCK -ErrorAction SilentlyContinue
+    Remove-Item Env:PS2X_RECORD_INPUT -ErrorAction SilentlyContinue
+    # A recording made with -Record (tests\fixtures\<name>.input, local like the memory cards): replayed on the VSync
+    # clock instead of the scenario's "input".
+    $recording = Join-Path (Join-Path $Root 'tests\fixtures') ($sc.name + '.input')
+    if (-not $Record -and (Test-Path $recording)) {
+        Remove-Item Env:PS2X_TEST_INPUT -ErrorAction SilentlyContinue
+        $env:PS2X_TEST_INPUT_FILE = $recording
+        $env:PS2X_TEST_INPUT_CLOCK = 'vsync'
+        Write-Host "  input: the recording $recording"
+    }
+    if ($Record) {
+        # The player drives: real pad and keyboard (no test mode), no frame budget, no watchdog; the pad is recorded.
+        $env:PS2X_TEST_MODE = '0'
+        Remove-Item Env:PS2X_TEST_INPUT -ErrorAction SilentlyContinue
+        $env:PS2X_TEST_FRAMES = '0'
+        $env:PS2X_WATCHDOG_SEC = '0'
+        $env:PS2X_RECORD_INPUT = $recording
+    }
     # [vu1-hash] every 600 VSyncs: hash of every byte VU1 sent to the GS (check type vu1_hash).
     $env:PS2X_VU1_KICK_HASH = '1'
     if ($NoKickHash) { Remove-Item Env:PS2X_VU1_KICK_HASH -ErrorAction SilentlyContinue }
@@ -184,9 +208,10 @@ function Invoke-GameRun($sc, $log, $shotDir) {
 
     # The game paces itself to ~60 frames per second; allow 3x plus start-up before giving up.
     $timeoutSec = [int]($sc.frames / 60 * 3) + 120
+    if ($Record) { $timeoutSec = 6 * 3600 }
     $started = Get-Date
     $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"`"$Exe`" `"$Elf`" > `"$log`" 2>&1`"" `
-        -WorkingDirectory $Root -WindowStyle Minimized -PassThru
+        -WorkingDirectory $Root -WindowStyle $(if ($Record) { 'Normal' } else { 'Minimized' }) -PassThru
     $finished = $proc.WaitForExit($timeoutSec * 1000)
     if (-not $finished) {
         & taskkill.exe /T /F /PID $proc.Id | Out-Null
@@ -211,6 +236,21 @@ function Get-DetLines($log) {
 }
 
 $spec = Get-Content (Join-Path $Root 'tests\scenarios.json') -Raw | ConvertFrom-Json
+if ($Record) {
+    # -Record: one scenario, played by hand; no checks.
+    $sc = @($spec.scenarios | Where-Object { $_.name -eq $Only })
+    if (-not $Only -or $sc.Count -ne 1) { Write-Host "-Record needs -Only <scenario name>"; exit 1 }
+    $sc = $sc[0]
+    Write-Host "=== Recording scenario $($sc.name): play from the start, close the game window when done ==="
+    $dir = Join-Path $TestsOut ($sc.name + '_record')
+    if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $code = Invoke-GameRun $sc (Join-Path $dir 'run.log') $dir
+    $recording = Join-Path (Join-Path $Root 'tests\fixtures') ($sc.name + '.input')
+    if (Test-Path $recording) { Write-Host "Recorded: $recording ($((Get-Item $recording).Length) bytes). run_tests.bat -Only $($sc.name) replays it." }
+    else { Write-Host "No recording was written (see $dir\run.log)." }
+    exit 0
+}
 if ($buildOk) {
     foreach ($sc in $spec.scenarios) {
         if ($Only -and $sc.name -ne $Only) { continue }

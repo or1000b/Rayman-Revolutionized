@@ -255,6 +255,18 @@
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
       ]
+    },
+    {
+      "name": "hub_run_120",
+      "description": "The user's run through crowded places (the portal hub, the Fairy Glade entrance) at run_rayman_hd_120fps.bat settings, where 120 FPS drops (recorded with record_for_claude.bat hub_run_120).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_shop\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
+      "frames": 20000,
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1" },
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
+      ]
     }
   ]
 }

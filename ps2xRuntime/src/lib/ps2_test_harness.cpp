@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -75,6 +76,17 @@ namespace
                 return true;
             }
         }
+        // Any position (recordings, PS2X_RECORD_INPUT): "rx=NN" / "ry=NN" / "lx=NN" / "ly=NN", NN in hex.
+        static const char *const kAxes[4] = {"rx=", "ry=", "lx=", "ly="};
+        for (int i = 0; i < 4; ++i)
+        {
+            if (name.size() > 3u && name.compare(0, 3, kAxes[i]) == 0)
+            {
+                ev.axis = static_cast<int8_t>(i);
+                ev.value = static_cast<uint8_t>(std::strtoul(name.c_str() + 3, nullptr, 16) & 0xFFu);
+                return true;
+            }
+        }
         return false;
     }
 
@@ -108,6 +120,44 @@ namespace
             return g_tick.load(std::memory_order_relaxed);
         const uint64_t vsync = g_guestVsync.load(std::memory_order_relaxed);
         return rateHz != 0u ? vsync * 50u / rateHz : vsync;
+    }
+
+    // The clock of the pad script: script ticks (scriptClock), or guest VSyncs with PS2X_TEST_INPUT_CLOCK=vsync
+    // (recordings: the game reads the pad at most once per VSync, so a replay gives every read the recorded state).
+    uint64_t inputClock()
+    {
+        static const bool vsyncClock = []
+        {
+            const char *env = std::getenv("PS2X_TEST_INPUT_CLOCK");
+            return env && std::strcmp(env, "vsync") == 0;
+        }();
+        return vsyncClock ? g_guestVsync.load(std::memory_order_relaxed) : scriptClock();
+    }
+
+    // ---- PS2X_RECORD_INPUT=<file>: the real pad as the game reads it, as a pad script on the VSync clock (run_tests
+    // -Record: deterministic like a test run, so replaying the file with PS2X_TEST_INPUT_FILE and
+    // PS2X_TEST_INPUT_CLOCK=vsync does what the player did).
+    struct Recorder
+    {
+        std::mutex mutex;
+        std::string path;
+        std::string out;
+        size_t items = 0;
+        uint64_t pressedSince[16] = {};
+        bool pressed[16] = {};
+        uint8_t axis[4] = {0x80, 0x80, 0x80, 0x80};
+        uint64_t axisSince[4] = {};
+        bool finished = false;
+    };
+    Recorder g_recorder;
+
+    void recorderEmit(uint64_t tick, const char *name, uint64_t hold)
+    {
+        char item[48];
+        std::snprintf(item, sizeof(item), "%s%llu:%s:%llu", g_recorder.items ? "," : "", static_cast<unsigned long long>(tick),
+                      name, static_cast<unsigned long long>(hold ? hold : 1u));
+        g_recorder.out += item;
+        ++g_recorder.items;
     }
 
     int64_t nowMs()
@@ -627,6 +677,31 @@ extern "C" void ps2xTestHarnessStart()
 {
     if (const char *input = std::getenv("PS2X_TEST_INPUT"))
         parsePadScript(input);
+    // A long script (a recording) from a file: PS2X_TEST_INPUT_FILE=<path> (same format, commas and line breaks).
+    if (const char *file = std::getenv("PS2X_TEST_INPUT_FILE"))
+    {
+        if (FILE *f = std::fopen(file, "rb"))
+        {
+            std::string text;
+            char buf[4096];
+            size_t n;
+            while ((n = std::fread(buf, 1u, sizeof(buf), f)) > 0u)
+                text.append(buf, n);
+            std::fclose(f);
+            for (char &c : text)
+                if (c == '\n' || c == '\r')
+                    c = ',';
+            parsePadScript(text.c_str());
+            std::fprintf(stderr, "[test] %zu pad events from %s\n", g_padScript.size(), file);
+        }
+        else
+            std::fprintf(stderr, "[test] cannot read PS2X_TEST_INPUT_FILE %s\n", file);
+    }
+    if (const char *record = std::getenv("PS2X_RECORD_INPUT"))
+    {
+        g_recorder.path = record;
+        std::fprintf(stderr, "[record] recording the pad to %s (VSync clock)\n", record);
+    }
     if (const char *frames = std::getenv("PS2X_TEST_FRAMES"))
         g_frameBudget = std::strtoull(frames, nullptr, 10);
     if (const char *sec = std::getenv("PS2X_WATCHDOG_SEC"))
@@ -687,6 +762,83 @@ extern "C" void ps2xTestHarnessExiting()
 {
     g_exiting.store(true);
     g_lastTickMs.store(nowMs(), std::memory_order_relaxed);
+    if (!g_recorder.path.empty())
+    {
+        // Close what is still held and write the recording.
+        std::lock_guard<std::mutex> lock(g_recorder.mutex);
+        if (!g_recorder.finished)
+        {
+            g_recorder.finished = true;
+            const uint64_t tick = g_guestVsync.load(std::memory_order_relaxed);
+            static const char *const names[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
+                                                  "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square"};
+            for (int i = 0; i < 16; ++i)
+                if (g_recorder.pressed[i])
+                    recorderEmit(g_recorder.pressedSince[i], names[i], tick - g_recorder.pressedSince[i]);
+            static const char *const axes[4] = {"rx", "ry", "lx", "ly"};
+            for (int i = 0; i < 4; ++i)
+                if (g_recorder.axis[i] != 0x80u)
+                {
+                    char name[8];
+                    std::snprintf(name, sizeof(name), "%s=%02x", axes[i], g_recorder.axis[i]);
+                    recorderEmit(g_recorder.axisSince[i], name, tick - g_recorder.axisSince[i]);
+                }
+            if (FILE *f = std::fopen(g_recorder.path.c_str(), "wb"))
+            {
+                std::fwrite(g_recorder.out.data(), 1u, g_recorder.out.size(), f);
+                std::fclose(f);
+                std::fprintf(stderr, "[record] %zu pad events written to %s (last VSync %llu)\n", g_recorder.items,
+                             g_recorder.path.c_str(), static_cast<unsigned long long>(tick));
+            }
+            else
+                std::fprintf(stderr, "[record] cannot write %s\n", g_recorder.path.c_str());
+        }
+    }
+}
+
+// Pad.cpp (scePadRead, the real pad, before scripted input): with PS2X_RECORD_INPUT, what the game reads. buttons is
+// libpad's active-low word, axes rx, ry, lx, ly. Sticks are kept in steps of 4 (0x80 within 8 = centre) so a resting
+// stick does not fill the file.
+extern "C" void ps2xTestRecordPad(int port, uint16_t buttons, const uint8_t axes[4])
+{
+    if (g_recorder.path.empty() || port != 0)
+        return;
+    std::lock_guard<std::mutex> lock(g_recorder.mutex);
+    if (g_recorder.finished)
+        return;
+    const uint64_t tick = g_guestVsync.load(std::memory_order_relaxed);
+    static const char *const names[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
+                                          "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square"};
+    for (int i = 0; i < 16; ++i)
+    {
+        const bool down = ((buttons >> i) & 1u) == 0u;
+        if (down == g_recorder.pressed[i])
+            continue;
+        if (down)
+            g_recorder.pressedSince[i] = tick;
+        else
+            recorderEmit(g_recorder.pressedSince[i], names[i], tick - g_recorder.pressedSince[i]);
+        g_recorder.pressed[i] = down;
+    }
+    static const char *const axisNames[4] = {"rx", "ry", "lx", "ly"};
+    for (int i = 0; i < 4; ++i)
+    {
+        int v = axes[i];
+        if (v >= 0x78 && v <= 0x88)
+            v = 0x80;
+        else
+            v = std::min(0xFF, ((v + 2) / 4) * 4);
+        if (v == g_recorder.axis[i])
+            continue;
+        if (g_recorder.axis[i] != 0x80u)
+        {
+            char name[8];
+            std::snprintf(name, sizeof(name), "%s=%02x", axisNames[i], g_recorder.axis[i]);
+            recorderEmit(g_recorder.axisSince[i], name, tick - g_recorder.axisSince[i]);
+        }
+        g_recorder.axis[i] = static_cast<uint8_t>(v);
+        g_recorder.axisSince[i] = tick;
+    }
 }
 
 // EE thread (scePadRead): buttons the script holds down right now, active-high.
@@ -694,7 +846,7 @@ extern "C" uint16_t ps2xTestPadButtons(int port)
 {
     if (port != 0 || g_padScript.empty())
         return 0;
-    const uint64_t tick = scriptClock();
+    const uint64_t tick = inputClock();
     uint16_t mask = 0;
     for (const PadEvent &ev : g_padScript)
     {
@@ -710,7 +862,7 @@ extern "C" bool ps2xTestPadAxes(int port, uint8_t axes[4])
 {
     if (port != 0 || g_padScript.empty())
         return false;
-    const uint64_t tick = scriptClock();
+    const uint64_t tick = inputClock();
     bool any = false;
     for (int i = 0; i < 4; ++i)
         axes[i] = 0x80;
