@@ -85,10 +85,45 @@ Pictures of the draw-only frames are complete (Rayman, Murfy, texts, water). The
 original run because the pad is read on another grid. Without in-between pictures the motion is still 25 steps per
 second, drawn 120 times.
 
+## 5. In-between pictures (`PS2X_RAYMAN_INTERP=1`, with `PS2X_RAYMAN_LOGIC_HZ=25`)
+
+main.cpp `installRaymanInterp`. Where the picture's matrices come from:
+- The camera: near the end of every step, **0x1174E0** builds RenderWare's camera (pointer at 0x393134; its frame
+  holds the camera placement plus a fixed offset of ~17856 per axis; RwCameraBeginUpdate 0x18C450 then makes the
+  RwCamera view matrix). It takes them from the game's camera [[0x252278 + 0x68]], whose view matrix (row vectors:
+  rows 0-2 rotation, row 3 translation) is at +4; 0x116308 builds the frustum from the same matrix. The logic writes
+  it in 0x106680 (0x118C88). Found with `PS2X_EE_WATCH` on the three translations.
+- The objects: the display lists read the global matrices ([so + 0x24]) of the dynamic world: the main character's
+  superobject [0x252398], its parent (type 1, ~184 persos) and everything under it (~250 superobjects: persos type 2,
+  their parts type 8, made again each step from a pool).
+
+So, when 0x1174E0 is entered from the step (it is also called by 0x1109E0), the camera's view matrix and every
+object's global matrix get values interpolated between the last two steps; the true ones go back when 0x141D20 (the
+step's call after the display lists) is entered, and before a logic step. Time: N-1 at the logic step's frame, moving
+to N until the next step (one step behind the logic, as in rac-rs). Interpolation: translation linear, rotation rows
+blended and made perpendicular again (Gram-Schmidt), the camera through its placement (c = -t R^T). Pairing: persos
+by address, parts by parent + data + count of earlier siblings with the same data (the parts' order changes between
+steps: pairing by place made Rayman's limbs jump). No interpolation for a move of more than 6 units per step or a
+turn of 90 degrees or more.
+
+Results (scenario `rayman_interp`): the physics stay the console's (the same values as `rayman_physics_split`: the
+true matrices are back before the logic runs). Consecutive pictures 20 ms apart now all differ (before: alternately
+~10 and ~0.3: the camera moved only with the steps).
+
+Cost (`glade_split_hd`: Fairy Glade, 120 FPS, SSAA x4, 16:9; `PS2X_RAYMAN_PHASES`): 120.1 game FPS (check: 110+).
+The game step takes ~2.9 ms per frame instead of ~4.4 (logic now on 1 frame in 4.8: actors ~0.26 ms per frame
+instead of ~1.0); most of the rest is the drawing (0x14B348 ~2.0 ms) that every picture needs. Interpolation itself
+(~250 matrices) ~0.04 ms. Waiting for the VBlank: ~5.1 ms instead of ~3.6.
+
+Found so far:
+- The dark band behind Murfy's text is drawn only on logic frames (`rayman_interp_ref`: always there at 25 FPS;
+  `rayman_interp_off` / `rayman_interp`: only on some pictures): it flickers. It is drawn from the actors' AI
+  (0x10C0D8 / 0x106680): running the other skipped calls every frame does not bring it back. Other things the AI
+  draws each step (2D, maybe effects) will do the same.
+
 ## Next steps
 
-1. In-between pictures: on a draw-only frame, before 0x145EC0, write interpolated matrices (between the last two
-   steps) into the camera and the drawn objects, and put the true ones back before the next logic step (both when a
-   function is entered). Pairing as in section 2; skip on jumps (camera cuts, teleports).
-2. Measure the cost (logic 25 x ~2.4 ms + drawing 120 x ~2.1 ms per second, against 120 x 4.5 ms today).
-3. Check menus, cutscenes, the shop (issue 22 should be as on the console), loading, pause.
+1. 2D drawn from the AI (the text band): find the queue the AI fills each step and keep / replay it on the draw-only
+   frames.
+2. Check menus, cutscenes, the shop (issue 22 should be as on the console), loading, pause, particles, the HUD layer.
+3. Then decide with the user: make this the 120 FPS mode (a setting in the launcher), or keep option 1.
