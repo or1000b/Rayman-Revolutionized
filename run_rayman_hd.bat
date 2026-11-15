@@ -29,6 +29,11 @@ set PS2X_FILTER=bilinear
 rem Frames per second: 60 = smooth, 50 = the original PAL game. run_rayman_hd_120fps.bat runs these settings at 120.
 if not defined PS2X_FRAMERATE set PS2X_FRAMERATE=60
 
+rem HUD (text, icons, menus) drawn sharp at screen resolution and kept 4:3 in widescreen: 1 = yes, 0 = the PS2 HUD.
+set PS2X_HUD=1
+rem Collect the HUD pictures you meet into hud_dump, for upscale_hud.bat (AI upscaling): 1 = yes, 0 = no.
+set PS2X_HUD_DUMP=1
+
 rem Show the FPS counter: 1 = yes, 0 = no.
 set PS2X_SHOW_FPS=1
 

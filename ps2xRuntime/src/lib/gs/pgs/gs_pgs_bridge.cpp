@@ -3,6 +3,7 @@
 // the rest of PS2Recomp.
 
 #include "gs_pgs_bridge.h"
+#include "gs_hud.h"
 
 namespace ps2x::pgs
 {
@@ -316,7 +317,9 @@ namespace ps2x::pgs
             g_captureFile = std::fopen("out/gif_capture.bin", "wb");
             if (!requested)
                 g_captureDone = g_captureFile == nullptr;
-            g_captureFramesLeft = requested ? 2u : 1u;
+            // PS2X_PGS_CAPTURE_FRAMES=<n> (default 1): scanout frames to capture from the asked VSync (a menu at
+            // 25 FPS leaves some 60 Hz scanout frames without any drawing).
+            g_captureFramesLeft = requested ? 2u : std::max(1u, watchBound("PS2X_PGS_CAPTURE_FRAMES", 1u));
             g_capturePictures = g_captureFile ? g_captureFramesLeft + 1u : 0u;
             g_capturePictureIndex = 0u;
             std::fprintf(stderr, "[pgs-capture] %s at frame %llu, guest vsync %llu\n", g_captureFile ? "start" : "cannot open out/gif_capture.bin",
@@ -1149,6 +1152,13 @@ namespace ps2x::pgs
             }
             analyzeGif(packets, size);
             captureRecord(0u, index, size, packets);
+            if (hud::enabled())
+            {
+                // The game's 2D layer is drawn by the window at screen resolution (gs_hud.h): paraLLEl-GS gets those
+                // vertices non-drawing.
+                static std::vector<uint8_t> s_hudScratch; // under g_mutex
+                packets = hud::filterPacket(packets, size, s_hudScratch);
+            }
             g_state->gs->gif_transfer(index, packets, size);
         }
 
@@ -1156,6 +1166,8 @@ namespace ps2x::pgs
         {
             noteRegister(reg, value); // also delivers SIGNAL / FINISH / LABEL in deterministic synchronous mode
             captureRecord(1u, reg, value, nullptr);
+            if (hud::enabled())
+                hud::registerWrite(reg, value);
             g_state->gs->write_register(static_cast<ParallelGS::RegisterAddr>(reg), value);
         }
 
@@ -1240,6 +1252,8 @@ namespace ps2x::pgs
             }
             endFrameStats();
             captureFrameBoundary(g_frameNumber);
+            if (hud::enabled())
+                hud::publish(regs.pmode, regs.dispfb1, regs.dispfb2); // the displayed buffer's 2D layer
             g_state->gs->flush();
             ParallelGS::ScanoutResult result = g_state->gs->vsync(info);
             if (!result.image)
@@ -1866,7 +1880,7 @@ namespace ps2x::pgs
         g_state->frames = 0;
         g_state->scanoutMs = 0.0;
         g_state->scanoutSamples = 0;
-        return line;
+        return std::string(line) + hud::statsLine();
     }
 
     void requestCapture()

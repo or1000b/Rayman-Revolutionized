@@ -727,6 +727,14 @@ extern "C" bool ps2xTestPadAxes(int port, uint8_t axes[4])
 
 // Window thread, whenever a new picture goes to the window (RGBA, rowPixels per row). Saves the
 // requested checkpoint pictures and logs simple numbers about them for the test report.
+static std::atomic<uint64_t> g_lastShotTick{0};
+
+// ps2_runtime.cpp (PS2X_WINDOW_SHOTS): the tick of the last test_shot taken, so the window can save itself too.
+extern "C" uint64_t ps2xTestLastShotTick()
+{
+    return g_lastShotTick.load(std::memory_order_relaxed);
+}
+
 extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels)
 {
     if (g_nextShot >= g_shotTicks.size() || !rgba || width == 0 || height == 0)
@@ -734,6 +742,7 @@ extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32
     const uint64_t tick = scriptClock();
     if (tick < g_shotTicks[g_nextShot])
         return;
+    g_lastShotTick.store(tick, std::memory_order_relaxed);
     while (g_nextShot < g_shotTicks.size() && g_shotTicks[g_nextShot] <= tick)
         ++g_nextShot;
 

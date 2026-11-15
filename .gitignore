@@ -41,3 +41,8 @@ ps2xRuntime/src/lib/vu/aot/
 
 # Python bytecode (tools/*.py imported by scratch scripts)
 __pycache__/
+
+# HUD layer (docs/hud.md): the upscaler tool and the textures, all derived from the game or downloaded (never commit)
+/tools/realesrgan/
+/hud_dump/
+/hud_textures/

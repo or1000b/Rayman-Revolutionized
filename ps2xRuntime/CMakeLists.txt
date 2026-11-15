@@ -479,7 +479,7 @@ endif()
 # headers nor its compile definitions reach the generated game code. At run time PS2X_GS_RENDERER=cpu selects the
 # CPU renderer again; a PC without Vulkan falls back to it by itself.
 option(PS2X_ENABLE_PARALLEL_GS "Draw the GS on the GPU with paraLLEl-GS (Vulkan)" ON)
-add_library(ps2x_pgs_bridge STATIC src/lib/gs/pgs/gs_pgs_bridge.cpp)
+add_library(ps2x_pgs_bridge STATIC src/lib/gs/pgs/gs_pgs_bridge.cpp src/lib/gs/pgs/gs_hud.cpp)
 target_compile_features(ps2x_pgs_bridge PRIVATE cxx_std_17)
 if(PS2X_ENABLE_PARALLEL_GS AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     FetchContent_Declare(ps2x_granite

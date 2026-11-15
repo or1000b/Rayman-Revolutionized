@@ -14,6 +14,8 @@
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 #include "gs/pgs/gs_pgs_bridge.h"
+#include "gs/pgs/gs_hud.h"
+#include "rlgl.h"
 #include "ps2_gfx_thread.h"
 
 #include <iostream>
@@ -49,6 +51,7 @@ extern "C" bool ps2xTestHarnessTick(uint64_t tick);
 extern "C" void ps2xTestHarnessExiting();
 extern "C" void ps2xTestThreadStackGuarantee();
 extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels);
+extern "C" uint64_t ps2xTestLastShotTick();     // ps2_test_harness.cpp: the tick of the last test_shot (0 = none)
 void ps2xInstallIopToEeRpcHooks(PS2Runtime *runtime);       // Kernel/Syscalls/RPC.cpp
 void ps2xInstallIopCdReader(bool install);                  // Kernel/Stubs/CD.cpp
 int ps2xIopToEeRpcStatsLine(char *buffer, int size);
@@ -475,6 +478,136 @@ namespace
 // 16:9, stretch (fill the window) or pixel (the
 // frame's own pixel ratio, the old look: 640 x 512 at 1.25); PS2X_WINDOW=<width>x<height> (default 640x448);
 // PS2X_FULLSCREEN=1 (borderless at the monitor's resolution; F10 switches); PS2X_SHOW_FPS=0 hides the counter.
+// The game's 2D layer drawn by the window (gs_hud.h): the HUD of the frame on screen, its textures (a 4x one from
+// hud_textures/<key>.png when present; PS2X_HUD_DUMP=1 writes the originals to hud_dump/ for tools/hud_upscale.py).
+namespace
+{
+    ps2x::hud::Frame g_hudFrame;
+    std::unordered_map<uint64_t, Texture2D> g_hudTextures;
+
+    bool hudDumpWanted()
+    {
+        static const bool on = []
+        {
+            const char *env = std::getenv("PS2X_HUD_DUMP");
+            return env && *env && *env != '0';
+        }();
+        return on;
+    }
+
+    Texture2D hudTexture(uint64_t key)
+    {
+        const auto found = g_hudTextures.find(key);
+        if (found != g_hudTextures.end())
+            return found->second;
+        Texture2D tex{};
+        char path[96];
+        std::snprintf(path, sizeof(path), "hud_textures/%016llx.png", static_cast<unsigned long long>(key));
+        if (FileExists(path))
+            tex = LoadTexture(path);
+        if (tex.id == 0 || hudDumpWanted())
+        {
+            ps2x::hud::Texture src;
+            if (ps2x::hud::texture(key, src))
+            {
+                Image image{src.rgba.data(), static_cast<int>(src.width), static_cast<int>(src.height), 1,
+                            PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                if (tex.id == 0)
+                    tex = LoadTextureFromImage(image);
+                if (hudDumpWanted())
+                {
+                    std::error_code ec;
+                    std::filesystem::create_directories("hud_dump", ec);
+                    char dump[96];
+                    std::snprintf(dump, sizeof(dump), "hud_dump/%016llx.png", static_cast<unsigned long long>(key));
+                    if (!FileExists(dump))
+                        ExportImage(image, dump);
+                }
+            }
+        }
+        if (tex.id != 0)
+        {
+            SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+            SetTextureWrap(tex, TEXTURE_WRAP_CLAMP);
+        }
+        g_hudTextures.emplace(key, tex);
+        return tex;
+    }
+
+    // Over the picture drawn at dst: game coordinates 0..512 span dst. Wider than 4:3, the 2D keeps its 4:3 shape
+    // around the centre (full-width quads, such as fades, stay full width).
+    void drawHudOverlay(const Rectangle &dst)
+    {
+        if (g_hudFrame.batches.empty() || dst.height <= 0.0f)
+            return;
+        const float squeeze = std::min(1.0f, (4.0f / 3.0f) / (dst.width / dst.height));
+        rlDrawRenderBatchActive();
+        rlDisableBackfaceCulling();
+        for (const ps2x::hud::Batch &batch : g_hudFrame.batches)
+        {
+            unsigned int id = rlGetTextureIdDefault();
+            if (batch.texture != 0u)
+            {
+                const Texture2D t = hudTexture(batch.texture);
+                if (t.id == 0)
+                    continue;
+                id = t.id;
+            }
+            BeginBlendMode(batch.blend == ps2x::hud::BlendAdd ? BLEND_ADDITIVE : BLEND_ALPHA);
+            for (size_t first = 0; first < batch.vertices.size(); first += 3000u)
+            {
+                const size_t count = std::min<size_t>(3000u, batch.vertices.size() - first);
+                rlCheckRenderBatchLimit(static_cast<int>(count));
+                rlSetTexture(id);
+                rlBegin(RL_TRIANGLES);
+                rlSetTexture(id); // rlBegin with another mode than the last draw resets the draw's texture to the default
+                for (size_t i = first; i < first + count; ++i)
+                {
+                    const ps2x::hud::Vertex &v = batch.vertices[i];
+                    const float gx = v.x / 512.0f, gy = v.y / 512.0f;
+                    const float sx = batch.fullWidth ? dst.x + gx * dst.width
+                                                     : dst.x + dst.width * 0.5f + (gx - 0.5f) * dst.width * squeeze;
+                    rlColor4ub(v.r, v.g, v.b, v.a);
+                    rlTexCoord2f(v.u, v.v);
+                    rlVertex2f(sx, dst.y + gy * dst.height);
+                }
+                rlEnd();
+                rlSetTexture(0);
+            }
+            EndBlendMode();
+        }
+        rlDrawRenderBatchActive();
+        rlEnableBackfaceCulling();
+    }
+
+    // PS2X_WINDOW_SHOTS=1: with every test_shot, the window as drawn (picture + 2D layer) to out/window_shot_<tick>.png.
+    void windowShotIfDue()
+    {
+        static const bool on = []
+        {
+            const char *env = std::getenv("PS2X_WINDOW_SHOTS");
+            return env && *env && *env != '0';
+        }();
+        static uint64_t s_done = 0;
+        if (!on)
+            return;
+        const uint64_t tick = ps2xTestLastShotTick();
+        if (tick == 0u || tick == s_done)
+            return;
+        s_done = tick;
+        rlDrawRenderBatchActive();
+        const int w = GetRenderWidth(), h = GetRenderHeight();
+        unsigned char *pixels = rlReadScreenPixels(w, h);
+        if (!pixels)
+            return;
+        Image image{pixels, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        char path[96];
+        std::snprintf(path, sizeof(path), "out/window_shot_%llu.png", static_cast<unsigned long long>(tick));
+        ExportImage(image, path);
+        RL_FREE(pixels);
+    }
+}
+
 static int HostTextureFilter()
 {
     static const int filter = []
@@ -587,6 +720,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         ++s_uploadDebugCount;
     });
     s_lastDisplayFbp = displayFbp;
+    if (ps2x::hud::enabled() && ps2x::pgs::active())
+        ps2x::hud::latest(g_hudFrame); // the 2D layer of this scanout
     s_lastSourceFbp = sourceFbp;
     s_lastPreferred = usedPreferredDisplaySource;
     s_lastWidth = width;
@@ -3241,6 +3376,8 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        drawHudOverlay(dstRect);
+        windowShotIfDue();
         static const bool showFps = []
         {
             const char *env = std::getenv("PS2X_SHOW_FPS");
