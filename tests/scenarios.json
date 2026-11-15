@@ -245,7 +245,7 @@
     },
     {
       "name": "shop_exit",
-      "description": "The user's recording (2026-11-15 18:41, 120 FPS, SSAA x4, 16:9): load the save, walk to the ability shop by the well of whirlpools, open it, leave with Triangle twice; each time Rayman is run back into the shop (CLAUDE.md issue 22). PS2X_HUD=0: the menus show in the pictures.",
+      "description": "The user's recording (2026-11-15 18:41, 120 FPS, SSAA x4, 16:9): load the save, walk to the ability shop by the well of whirlpools, open it, leave with Triangle. Before the fix Rayman was run back into the shop each time (CLAUDE.md issue 22); with the shop zone fix (main.cpp) he stays outside, and the rest of the recording jumps in place in the gorge. PS2X_HUD=0: the menus show in the pictures.",
       "renderer": "gpu",
       "memcard": "fixtures\\mc_shop\\mc0",
       "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
@@ -253,7 +253,9 @@
       "shots": [2900, 3000, 3100, 3200, 3300, 3400, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200, 4300, 4400, 4500, 4600, 4700, 4800, 4900, 5000],
       "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "0" },
       "checks": [
-        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "log_present", "pattern": "shop trigger zone at 0x[0-9a-f]+: radius 8\\.51 -> 7\\.2", "label": "shop zone fix applied (issue 22)" },
+        { "type": "log_absent", "pattern": "\\[rayman-state\\] vsync=(8[6-9][0-9][0-9]|9[0-9]{3}|1[0-9]{4}) .*pos=205\\.", "label": "after leaving, Rayman is not run back to the shop platform (issue 22)" }
       ]
     },
     {

@@ -198,3 +198,13 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
   ~21%; game thread: the chain copies, ~4 MiB per frame, and guest code). From VSync 9060 (the Fairy Glade) every replay
   of this recording has its own EE hash at the same cycle counts, also between two runs of one build: an older
   nondeterminism there, not from these changes (to look at).
+
+## Frame-rate bugs in the game's scripts (2026-11-15)
+
+The physics steps once per frame, so a scripted move ends at a slightly different spot at another frame rate. Where a
+level was tuned to the 25 FPS spot, that can break a script. Known and fixed:
+- **Ability shop by the well of whirlpools** (CLAUDE.md issue 22): the exit run stopped inside the shop's own trigger
+  zone at 60 / 120 FPS and the shop ran Rayman back in. Fix: that one zone (found by its data) is 7.2 units instead of
+  8.51 when PS2X_FRAMERATE is set (main.cpp `raymanPointInGeoShopFix`); scenario `shop_exit`.
+- Tools to find the next one: `PS2X_RAYMAN_RATE_SWITCH` (replay the same moment at 120 / divisor FPS),
+  `PS2X_RAYMAN_AI_WATCH`, `PS2X_RAYMAN_TRACK`, and `record_for_claude.bat` for the user's recordings.

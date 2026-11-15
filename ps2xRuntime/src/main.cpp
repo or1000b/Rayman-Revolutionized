@@ -364,6 +364,67 @@ namespace
             raymanClockExactStep(rdram, clock);
     }
 
+    // ------------------------------------------------------------------
+    // The ability shop by the well of whirlpools at high frame rates (CLAUDE.md issue 22). Leaving the shop (Triangle)
+    // starts a scripted run out of the gorge; where it stops depends on the frame rate (the physics steps once per
+    // frame). Right after it, the shop's trigger (perso 0x8E76FC, condition 0xB "any of my detection zones holds the
+    // main actor", 0x207420 -> 0x1152E0 -> 0x1143C8 -> 0x210940) tests its one zone: a sphere of local radius 3.404,
+    // 8.51 units in the world (the trigger's matrix scales by 2.5), centre (198.49, 62.77, 59.52). At 25 FPS the run
+    // stops 1.3 units outside it, at 120 FPS 0.22 inside, and the shop runs Rayman back in. With the frame rate
+    // changed, the sphere gets a world radius of 7.2 units: the run's stop is outside it again at every rate, with
+    // about the original margin; walking up to the shop opens it ~1.3 units later. The sphere is found by its data
+    // (one sphere, exact radius and centre: it appears once in memory), on its first test after the level loads.
+    // 0x210940(a0 = point in the zone owner's space, a1 = geometric object): +0 vertex count, +2 element count (int16),
+    // +4 vertices (3 floats each), +8 element types (int16; 7 = spheres), +0xC elements; a sphere element: +0 spheres
+    // (12 bytes: radius, material, int16 centre vertex), +4 count (int16).
+    constexpr uint32_t kRaymanPointInGeoAddr = 0x00210940u;
+    constexpr uint32_t kRaymanShopZoneRadiusBits = 0x4059DC48u; // 3.4041
+    constexpr uint32_t kRaymanShopZoneCentreBits[3] = {0xC07B8C54u, 0xC1077E87u, 0x40B7930Cu};
+    constexpr float kRaymanShopZoneRadius = 7.2f / 2.5f;
+    PS2Runtime::RecompiledFunction g_raymanPointInGeo = nullptr;
+
+    bool raymanGuestDataPointer(uint32_t address)
+    {
+        return address >= 0x00100000u && address < 0x01FFFFF0u;
+    }
+
+    void raymanPointInGeoShopFix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t geo = getRegU32(ctx, 5);
+        if (raymanGuestDataPointer(geo) && (geo & 3u) == 0u && raymanRam32(rdram, geo) == 0x00010001u) // 1 vertex, 1 element
+        {
+            const uint32_t verts = raymanRam32(rdram, geo + 4u), types = raymanRam32(rdram, geo + 8u);
+            const uint32_t elements = raymanRam32(rdram, geo + 0xCu);
+            if (raymanGuestDataPointer(verts) && raymanGuestDataPointer(types) && raymanGuestDataPointer(elements) &&
+                (raymanRam32(rdram, types) & 0xFFFFu) == 7u && raymanRam32(rdram, verts) == kRaymanShopZoneCentreBits[0] &&
+                raymanRam32(rdram, verts + 4u) == kRaymanShopZoneCentreBits[1] &&
+                raymanRam32(rdram, verts + 8u) == kRaymanShopZoneCentreBits[2])
+            {
+                const uint32_t element = raymanRam32(rdram, elements);
+                const uint32_t sphere = raymanGuestDataPointer(element) ? raymanRam32(rdram, element) : 0u;
+                if (raymanGuestDataPointer(sphere) && (raymanRam32(rdram, element + 4u) & 0xFFFFu) == 1u &&
+                    raymanRam32(rdram, sphere) == kRaymanShopZoneRadiusBits && (raymanRam32(rdram, sphere + 8u) & 0xFFFFu) == 0u)
+                {
+                    raymanRamWriteFloat(rdram, sphere, kRaymanShopZoneRadius);
+                    std::fprintf(stderr, "[hle] Rayman: shop trigger zone at 0x%x: radius 8.51 -> 7.2 units (high frame rate, CLAUDE.md issue 22)\n", sphere);
+                }
+            }
+        }
+        g_raymanPointInGeo(rdram, ctx, runtime);
+    }
+
+    void installRaymanShopZoneFix(PS2Runtime &runtime, uint8_t *rdram)
+    {
+        if (raymanRam32(rdram, kRaymanPointInGeoAddr) != 0x27BDFF30u || !runtime.hasFunction(kRaymanPointInGeoAddr)) // addiu sp,sp,-0xd0
+        {
+            std::cerr << "[hle] Rayman: zone test 0x210940 not found, shop exit fix off (CLAUDE.md issue 22)" << std::endl;
+            return;
+        }
+        g_raymanPointInGeo = runtime.lookupFunction(kRaymanPointInGeoAddr);
+        if (!g_raymanPointInGeo || !runtime.registerFunction(kRaymanPointInGeoAddr, &raymanPointInGeoShopFix))
+            std::cerr << "[hle] Rayman: failed to install the shop exit fix" << std::endl;
+    }
+
     void installRaymanFramerate(PS2Runtime &runtime, uint8_t *rdram)
     {
         g_raymanFrameRate = ps2xVBlankRateOverrideHz();
@@ -396,7 +457,11 @@ namespace
                       << " Hz, frame cap 1 VBlank, clock unit 1/" << g_raymanUnitHz << " s, exact ms step; was "
                       << g_raymanOriginalUnit << " s)" << std::endl;
         else
+        {
             std::cerr << "[hle] Rayman: failed to install the frame rate change" << std::endl;
+            return;
+        }
+        installRaymanShopZoneFix(runtime, rdram);
     }
 
     // ------------------------------------------------------------------
