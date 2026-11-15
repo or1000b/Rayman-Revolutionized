@@ -178,6 +178,89 @@
       ]
     },
     {
+      "name": "rayman_physics_split",
+      "description": "rayman_physics at PS2X_FRAMERATE=120 with PS2X_RAYMAN_LOGIC_HZ=25 (experiment, docs/interpolation.md): the logic runs as on the console (25 steps per second, clock unit 0.02 s), the frames between only draw. Game time, jumps, walking and swimming should match the original.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7350:cross:4,7500:cross:3,7525:cross:75,7650:ldown:1000",
+      "frames": 8800,
+      "env": {
+        "PS2X_RAYMAN_TRACK": "7300,8800,1",
+        "PS2X_FRAMERATE": "120",
+        "PS2X_RAYMAN_LOGIC_HZ": "25"
+      },
+      "_note": "Ticks are 20 ms of real time at every PS2X_FRAMERATE (the harness scales guest VSyncs). Rayman stands at the same spot at 7300 in every mode.",
+      "checks": [
+        {
+          "type": "exit_code",
+          "expect": 0,
+          "label": "run ends by frame budget (no hang, no crash)"
+        },
+        {
+          "type": "track",
+          "metric": "game_ms_per_s",
+          "from": 7300,
+          "to": 8800,
+          "min": 999,
+          "max": 1001,
+          "label": "game time runs at real time (game clock ms per real second)"
+        },
+        {
+          "type": "track",
+          "metric": "jump_airtime",
+          "from": 7340,
+          "to": 7480,
+          "min": 0.86,
+          "max": 0.96,
+          "label": "standing jump: time in the air (original 0.92 s)"
+        },
+        {
+          "type": "track",
+          "metric": "jump_height",
+          "from": 7340,
+          "to": 7480,
+          "min": 2.93,
+          "max": 3.31,
+          "label": "standing jump: height (original 3.12, +-6%)"
+        },
+        {
+          "type": "track",
+          "metric": "z_speed",
+          "from": 7550,
+          "to": 7590,
+          "min": -3.32,
+          "max": -3.0,
+          "label": "helicopter: fall speed while the jump button is held (original -3.16 u/s, +-5%)"
+        },
+        {
+          "type": "track",
+          "metric": "top_speed",
+          "state": "ground",
+          "from": 7650,
+          "min": 9.0,
+          "max": 9.75,
+          "label": "walking speed with the stick held (original 9.38 u/s, +-4%)"
+        },
+        {
+          "type": "track",
+          "metric": "top_speed",
+          "state": "surface",
+          "from": 7650,
+          "min": 8.9,
+          "max": 11.4,
+          "label": "swimming speed on the surface (original 10.15 u/s, +-12%: water routes differ)"
+        }
+      ],
+      "shots": [
+        7300,
+        7520,
+        7600,
+        7700,
+        8000,
+        8400
+      ]
+    },
+    {
       "name": "swim_tutorial_60fps",
       "description": "swim_tutorial at PS2X_FRAMERATE=60: the same sequence of states, air falling 4 per second while diving, game time at real time.",
       "renderer": "gpu",

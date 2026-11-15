@@ -21,6 +21,7 @@
 #include <cmath>
 #include <thread>
 #include <array>
+#include <utility>
 
 extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 extern "C" void ps2xSetGameStatsLine(int (*fn)(const uint8_t *rdram, char *buffer, int size)); // ps2_runtime.cpp
@@ -425,12 +426,169 @@ namespace
             std::cerr << "[hle] Rayman: failed to install the shop exit fix" << std::endl;
     }
 
+    // ------------------------------------------------------------------
+    // PS2X_RAYMAN_LOGIC_HZ=25 (or 50; experiment, docs/interpolation.md): with PS2X_FRAMERATE=N the game's logic runs
+    // exactly as on the console, 25 steps per second (clock unit 0.02 s, n = 2 units per step), and the frames between
+    // only draw (N frames per second). A frame is the game step 0x100CD0 (called by the frame function 0x1007F8), then
+    // 0x1010F8 (the views, the 2D, the VBlank wait, the frame clock 0x14B9A0) and the tail 0x1028C8 (input, pause).
+    // - Logic steps are placed on the 25 Hz grid of guest VBlanks (a step whenever a new 40 ms slot begins: at 120 Hz
+    //   every 5, 5, 5, 5, 4 VBlanks). The decision for the next frame is made at its frame clock (after the VBlank
+    //   wait): the clock and the tail run only before a logic step, so that step sees the whole time since the last one
+    //   (33 or 42 ms: n = 2 either way) and the presses since then (run every frame, the input update 0x11ECC0 would
+    //   turn a press into "just pressed" in a draw-only frame and lose it).
+    // - On a draw-only frame the step still runs, but its logic calls return at once (actors and their AI, sector
+    //   change, animation, ...: calls whose result the step does not use); the display lists 0x145EC0 and the camera
+    //   calls run as usual. Frames without a step (some menus) keep the clock and the tail every frame.
+    // - Everything is done when a function is entered: a guest function can return to the scheduler in the middle (a
+    //   thread switch) and finish later, so nothing may be done "after" a call.
+    // Not yet: in-between pictures (a draw-only frame shows the last step again).
+    constexpr uint32_t kRaymanGameStepAddr = 0x00100CD0u;
+    constexpr uint32_t kRaymanGameStepEnd = 0x00100F54u;
+    constexpr uint32_t kRaymanFrameClockCallAddr = 0x0014B9A0u;
+    constexpr uint32_t kRaymanFrameTailAddr = 0x001028C8u; // input update 0x11ECC0, pause (Start), ...
+    uint32_t g_raymanLogicHz = 0u;   // 0 = off
+    bool g_raymanNextStepLogic = true;
+    uint64_t g_raymanLastLogicSlot = ~0ull;
+    bool g_raymanDrawOnly = false;   // the current frame's step only draws
+    bool g_raymanStepSinceClock = false;
+    bool g_raymanTailRuns = true;    // decided with the clock: the next step is a logic step
+    uint64_t g_raymanSteps = 0u, g_raymanDrawOnlySteps = 0u;
+    PS2Runtime::RecompiledFunction g_raymanGameStep = nullptr;
+    PS2Runtime::RecompiledFunction g_raymanFrameClockCall = nullptr;
+    PS2Runtime::RecompiledFunction g_raymanFrameTail = nullptr;
+    struct RaymanLogicCall
+    {
+        uint32_t addr = 0u;
+        PS2Runtime::RecompiledFunction original = nullptr;
+    };
+    constexpr uint32_t kRaymanLogicCallMax = 24u;
+    RaymanLogicCall g_raymanLogicCalls[kRaymanLogicCallMax];
+    uint32_t g_raymanLogicCallCount = 0u;
+
+    void raymanGameStepSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_raymanDrawOnly = !g_raymanNextStepLogic && !raymanDemoPlayback(rdram, getRegU32(ctx, 28));
+        g_raymanStepSinceClock = true;
+        ++g_raymanSteps;
+        if (g_raymanDrawOnly)
+            ++g_raymanDrawOnlySteps;
+        g_raymanGameStep(rdram, ctx, runtime);
+    }
+
+    template <uint32_t I>
+    void raymanLogicCallSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = getRegU32(ctx, 31);
+        if (g_raymanDrawOnly && ra >= kRaymanGameStepAddr && ra < kRaymanGameStepEnd)
+        {
+            ctx->pc = ra; // skipped: back to the step
+            return;
+        }
+        g_raymanLogicCalls[I].original(rdram, ctx, runtime);
+    }
+
+    template <uint32_t... I>
+    constexpr std::array<PS2Runtime::RecompiledFunction, sizeof...(I)> raymanLogicCallSplits(std::integer_sequence<uint32_t, I...>)
+    {
+        return {&raymanLogicCallSplit<I>...};
+    }
+
+    void raymanFrameClockCallSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Called after the VBlank wait: the guest VBlank now is the next frame's.
+        const uint64_t slot = ps2xGuestVsync() * g_raymanLogicHz / g_raymanFrameRate;
+        bool logicNext = true;
+        if (g_raymanStepSinceClock && !raymanDemoPlayback(rdram, getRegU32(ctx, 28)))
+            logicNext = slot != g_raymanLastLogicSlot;
+        g_raymanStepSinceClock = false;
+        g_raymanNextStepLogic = logicNext;
+        g_raymanTailRuns = logicNext;
+        if (!logicNext)
+        {
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+        g_raymanLastLogicSlot = slot;
+        static uint64_t s_clockCalls = 0u;
+        if (++s_clockCalls % 250u == 0u)
+            std::fprintf(stderr, "[hle] Rayman: logic split: %llu steps, %llu of them draw-only\n",
+                         static_cast<unsigned long long>(g_raymanSteps), static_cast<unsigned long long>(g_raymanDrawOnlySteps));
+        g_raymanFrameClockCall(rdram, ctx, runtime);
+    }
+
+    void raymanFrameTailSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const bool run = g_raymanTailRuns;
+        g_raymanTailRuns = true; // a frame whose clock did not decide (no clock call) keeps its tail
+        if (!run)
+        {
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+        g_raymanFrameTail(rdram, ctx, runtime);
+    }
+
+    uint32_t raymanLogicSplitHz()
+    {
+        const char *env = std::getenv("PS2X_RAYMAN_LOGIC_HZ");
+        const long hz = env ? std::strtol(env, nullptr, 10) : 0;
+        return (hz == 25 || hz == 50) ? static_cast<uint32_t>(hz) : 0u; // multiples of the clock unit 0.02 s
+    }
+
+    bool installRaymanLogicSplit(PS2Runtime &runtime, uint8_t *rdram, uint32_t logicHz)
+    {
+        if (raymanRam32(rdram, kRaymanGameStepAddr) != 0x27BDFF70u || // addiu sp,sp,-0x90
+            raymanRam32(rdram, kRaymanFrameTailAddr) != 0x27BDFFE0u ||  // addiu sp,sp,-0x20
+            !runtime.hasFunction(kRaymanGameStepAddr) || !runtime.hasFunction(kRaymanFrameClockCallAddr) ||
+            !runtime.hasFunction(kRaymanFrameTailAddr))
+        {
+            std::cerr << "[hle] Rayman: PS2X_RAYMAN_LOGIC_HZ: game step not found" << std::endl;
+            return false;
+        }
+        g_raymanLogicHz = logicHz;
+        g_raymanGameStep = runtime.lookupFunction(kRaymanGameStepAddr);
+        g_raymanFrameClockCall = runtime.lookupFunction(kRaymanFrameClockCallAddr);
+        g_raymanFrameTail = runtime.lookupFunction(kRaymanFrameTailAddr);
+        runtime.registerFunction(kRaymanGameStepAddr, &raymanGameStepSplit);
+        runtime.registerFunction(kRaymanFrameClockCallAddr, &raymanFrameClockCallSplit);
+        runtime.registerFunction(kRaymanFrameTailAddr, &raymanFrameTailSplit);
+        // The step's logic calls (the step does not use their results): 0x20C518, 0x15BD30, 0x14AC40, 0x101828 (sector
+        // change), 0x112270, 0x1497A0, 0x10C0D8 / 0x106680 (the actors and their AI), 0x11A2D0 (f12 = n: animation),
+        // 0x147968, 0x154700, 0x14C2B8, 0x147C30, 0x11B348 (a0 = game ms), and after the display lists 0x141D20,
+        // 0x13EA68. PS2X_RAYMAN_LOGIC_CALLS="addr,..." replaces the list (experiments).
+        const char *listEnv = std::getenv("PS2X_RAYMAN_LOGIC_CALLS");
+        const std::string list = listEnv ? std::string(listEnv)
+                                         : std::string("20c518,15bd30,14ac40,101828,112270,1497a0,10c0d8,106680,11a2d0,147968,"
+                                                       "154700,14c2b8,147c30,11b348,141d20,13ea68");
+        static constexpr auto kSplits = raymanLogicCallSplits(std::make_integer_sequence<uint32_t, kRaymanLogicCallMax>{});
+        const char *p = list.c_str();
+        while (*p && g_raymanLogicCallCount < kRaymanLogicCallMax)
+        {
+            char *end = nullptr;
+            const uint32_t func = static_cast<uint32_t>(std::strtoul(p, &end, 16));
+            p = (*end == ',' || end == p) ? end + 1 : end; // skip the comma (or a character that is not a number)
+            if (func == 0u || !runtime.hasFunction(func))
+                continue;
+            RaymanLogicCall &call = g_raymanLogicCalls[g_raymanLogicCallCount];
+            call.addr = func;
+            call.original = runtime.lookupFunction(func);
+            if (call.original && runtime.registerFunction(func, kSplits[g_raymanLogicCallCount]))
+                ++g_raymanLogicCallCount;
+        }
+        std::cerr << "[hle] Rayman: logic " << g_raymanLogicHz << " steps per second as on the console (clock unit 0.02 s), "
+                  << g_raymanFrameRate << " frames per second drawn; " << g_raymanLogicCallCount
+                  << " logic calls skipped on draw-only frames (PS2X_RAYMAN_LOGIC_HZ, experiment)" << std::endl;
+        return true;
+    }
+
     void installRaymanFramerate(PS2Runtime &runtime, uint8_t *rdram)
     {
         g_raymanFrameRate = ps2xVBlankRateOverrideHz();
         if (g_raymanFrameRate == 0u)
             return;
-        g_raymanUnitHz = g_raymanFrameRate;
+        // PS2X_RAYMAN_LOGIC_HZ: the logic keeps the console's clock unit (0.02 s); only the drawing runs at N.
+        const uint32_t logicHz = raymanLogicSplitHz();
+        g_raymanUnitHz = logicHz ? 50u : g_raymanFrameRate;
         if (const char *unitHz = std::getenv("PS2X_RAYMAN_CLOCK_UNIT_HZ")) // experiments: separate unit and frame rate
             if (const long hz = std::strtol(unitHz, nullptr, 10); hz >= 10 && hz <= 1000)
                 g_raymanUnitHz = static_cast<uint32_t>(hz);
@@ -460,6 +618,14 @@ namespace
         {
             std::cerr << "[hle] Rayman: failed to install the frame rate change" << std::endl;
             return;
+        }
+        // With the logic as on the console the shop exit is as on the console too: no zone fix.
+        if (logicHz && installRaymanLogicSplit(runtime, rdram, logicHz))
+            return;
+        if (logicHz) // the split could not be installed: every frame is a step again, so the unit follows the rate
+        {
+            g_raymanUnitHz = g_raymanFrameRate;
+            raymanRamWriteFloat(rdram, kRaymanClockUnitAddr, 1.0f / static_cast<float>(g_raymanUnitHz));
         }
         installRaymanShopZoneFix(runtime, rdram);
     }
@@ -950,6 +1116,157 @@ namespace
         }
     }
 
+    // PS2X_RAYMAN_PHASES=1 (research: can drawing run apart from the game step? docs/interpolation.md): host time per
+    // part of a game frame, as `[phase]` lines every 240 frames (average microseconds per frame). The frame function
+    // 0x1007F8 runs the game step 0x100CD0 (sector change, actors and their AI, collision, camera...), then 0x1010F8
+    // (draws the views the step queued, the 2D, waits for the next VBlank, the frame clock), then jumps to 0x1028C8.
+    // Timed from one part's start to the next part's start, because a part can end in a guest thread switch (the C++
+    // call then returns before the guest function ends, so timing a call from outside misses its work). A part starts
+    // when a listed function is entered with its return address in the frame function (level 0), in 0x1010F8 (level 1),
+    // in the step 0x100CD0 (level 2), in 0x145EC0 (3) or in 0x1474D0 (4); a start ends the current parts of its level
+    // and the levels below it. The last level 1 part (0x1176A0) holds the wait for the next VBlank.
+    // PS2X_RAYMAN_PHASES="addr,addr,..." lists other functions.
+    struct RaymanPhase
+    {
+        uint32_t addr = 0u;
+        PS2Runtime::RecompiledFunction original = nullptr;
+        uint64_t ns[5] = {0u, 0u, 0u, 0u, 0u};
+        uint64_t starts[5] = {0u, 0u, 0u, 0u, 0u};
+        uint64_t switched = 0u; // calls that returned with a guest thread switch pending
+    };
+    constexpr uint32_t kRaymanPhaseMax = 64u;
+    RaymanPhase g_raymanPhases[kRaymanPhaseMax];
+    uint32_t g_raymanPhaseCount = 0u;
+    constexpr int kRaymanPhaseLevels = 5;
+    int g_raymanPhaseCurrent[kRaymanPhaseLevels] = {-1, -1, -1, -1, -1};
+    std::chrono::steady_clock::time_point g_raymanPhaseSince[kRaymanPhaseLevels]{};
+    uint64_t g_raymanPhaseFrames = 0u;
+
+    int raymanPhaseLevel(uint32_t ra)
+    {
+        if ((ra >= 0x001007F8u && ra < 0x00100848u) || ra == 0x00100130u) // 0x1028C8 is a tail jump: ra = 0x1007F8's caller
+            return 0;
+        if (ra >= 0x001010F8u && ra < 0x00101260u)
+            return 1;
+        if (ra >= 0x00100CD0u && ra < 0x00100F54u)
+            return 2;
+        if (ra >= 0x00145EC0u && ra < 0x00145F80u) // inside the step: 0x145EC0 (display lists)
+            return 3;
+        if (ra >= 0x001474D0u && ra < 0x001475D8u) // inside 0x145EC0: 0x1474D0 (writes and sends the lists)
+            return 4;
+        return -1;
+    }
+
+    void raymanPhaseReport()
+    {
+        const double frames = static_cast<double>(std::max<uint64_t>(1u, g_raymanPhaseFrames));
+        static const char *const kNames[kRaymanPhaseLevels] = {"frame", "0x1010f8 (draw, wait)", "0x100cd0 (game step)", "0x145ec0", "0x1474d0"};
+        std::string out;
+        for (int level = 0; level < kRaymanPhaseLevels; ++level)
+        {
+            double total = 0.0;
+            std::string parts;
+            for (uint32_t i = 0; i < g_raymanPhaseCount; ++i)
+            {
+                RaymanPhase &p = g_raymanPhases[i];
+                if (!p.starts[level])
+                    continue;
+                total += p.ns[level];
+                char part[64];
+                std::snprintf(part, sizeof(part), " %x %.0f", p.addr, p.ns[level] / 1000.0 / frames);
+                parts += part;
+                if (p.starts[level] != g_raymanPhaseFrames) // started more or less than once per frame
+                    parts += "(x" + std::to_string(p.starts[level]) + ")";
+                if (p.switched)
+                    parts += "(switch " + std::to_string(p.switched) + ")";
+            }
+            char head[96];
+            std::snprintf(head, sizeof(head), "%s %s %.0f us:", level ? " |" : "", kNames[level], total / 1000.0 / frames);
+            out += head + parts;
+        }
+        std::fprintf(stderr, "[phase] vsync %llu, %llu frames:%s\n", static_cast<unsigned long long>(ps2xGuestVsync()),
+                     static_cast<unsigned long long>(g_raymanPhaseFrames), out.c_str());
+        for (uint32_t i = 0; i < g_raymanPhaseCount; ++i)
+            for (int level = 0; level < kRaymanPhaseLevels; ++level)
+                g_raymanPhases[i].ns[level] = g_raymanPhases[i].starts[level] = 0u;
+        for (uint32_t i = 0; i < g_raymanPhaseCount; ++i)
+            g_raymanPhases[i].switched = 0u;
+        g_raymanPhaseFrames = 0u;
+    }
+
+    template <uint32_t I>
+    void raymanPhaseTrampoline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const int level = raymanPhaseLevel(getRegU32(ctx, 31));
+        if (level >= 0)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            for (int l = kRaymanPhaseLevels - 1; l >= level; --l)
+            {
+                if (g_raymanPhaseCurrent[l] >= 0)
+                    g_raymanPhases[g_raymanPhaseCurrent[l]].ns[l] +=
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_raymanPhaseSince[l]).count());
+                g_raymanPhaseCurrent[l] = -1;
+            }
+            if (level == 0 && g_raymanPhases[I].addr == 0x00100CD0u && ++g_raymanPhaseFrames == 240u)
+                raymanPhaseReport();
+            g_raymanPhaseCurrent[level] = static_cast<int>(I);
+            g_raymanPhaseSince[level] = now;
+            ++g_raymanPhases[I].starts[level];
+        }
+        g_raymanPhases[I].original(rdram, ctx, runtime);
+        if (level >= 0 && ps2xGuestYieldPending())
+            ++g_raymanPhases[I].switched;
+    }
+
+    template <uint32_t... I>
+    constexpr std::array<PS2Runtime::RecompiledFunction, sizeof...(I)> raymanPhaseTrampolines(std::integer_sequence<uint32_t, I...>)
+    {
+        return {&raymanPhaseTrampoline<I>...};
+    }
+
+    void installRaymanPhases(PS2Runtime &runtime)
+    {
+        const char *spec = std::getenv("PS2X_RAYMAN_PHASES");
+        if (!spec || !*spec || std::strcmp(spec, "0") == 0)
+            return;
+        const std::string list = std::strcmp(spec, "1") == 0
+                                     ? std::string(
+                                           // level 0: the frame function's calls
+                                           "100cd0,1010f8,1028c8,"
+                                           // level 1: 0x1010F8's calls in order (0x152928 draws the queued views)
+                                           "1537b0,152928,155d18,14e098,1557b8,117658,1109e0,1547a8,1174c0,1176a0,14b9a0,"
+                                           // level 2: the game step's calls in order
+                                           "20c518,103af0,15bf30,15bd30,112e38,14ac40,101828,112270,1497a0,10c0d8,106680,14b900,"
+                                           "14b910,11a2d0,147968,154700,14c2b8,147c30,116ed0,1174a0,11b348,1174e0,1062a8,108150,"
+                                           "100bd0,145ec0,141d20,13ea68,1082a8,1d54f0,"
+                                           // level 3: 0x145EC0's calls; level 4: 0x1474D0's calls
+                                           "118e60,118fe8,146750,116308,1474d0,14b100,1467b8,14b110,147128,14b130,1473d8,14b150,"
+                                           "14b348,119280")
+                                     : std::string(spec);
+        static constexpr auto kTrampolines = raymanPhaseTrampolines(std::make_integer_sequence<uint32_t, kRaymanPhaseMax>{});
+        const char *p = list.c_str();
+        while (*p && g_raymanPhaseCount < kRaymanPhaseMax)
+        {
+            char *end = nullptr;
+            const uint32_t func = static_cast<uint32_t>(std::strtoul(p, &end, 16));
+            p = (*end == ',' || end == p) ? end + 1 : end; // skip the comma (or a character that is not a number)
+            if (func == 0u || !runtime.hasFunction(func))
+                continue;
+            bool dup = false;
+            for (uint32_t i = 0; i < g_raymanPhaseCount; ++i)
+                dup = dup || g_raymanPhases[i].addr == func;
+            if (dup)
+                continue;
+            RaymanPhase &phase = g_raymanPhases[g_raymanPhaseCount];
+            phase.addr = func;
+            phase.original = runtime.lookupFunction(func);
+            if (phase.original && runtime.registerFunction(func, kTrampolines[g_raymanPhaseCount]))
+                ++g_raymanPhaseCount;
+        }
+        std::cerr << "[hle] Rayman: timing " << g_raymanPhaseCount << " frame parts (PS2X_RAYMAN_PHASES)" << std::endl;
+    }
+
     void installRaymanProbe(PS2Runtime &runtime)
     {
         const char *spec = std::getenv("PS2X_RAYMAN_PROBE");
@@ -1392,6 +1709,7 @@ namespace
         }
 
         installRaymanProbe(runtime);
+        installRaymanPhases(runtime);
 
         uint32_t entranceWord = 0u;
         std::memcpy(&entranceWord, rdram + kRaymanEntranceByteAddr, sizeof(entranceWord));
