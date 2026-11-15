@@ -116,17 +116,28 @@ instead of ~1.0); most of the rest is the drawing (0x14B348 ~2.0 ms) that every 
 (~250 matrices) ~0.04 ms. Waiting for the VBlank: ~5.1 ms instead of ~3.6.
 
 Flicker (things drawn only on logic frames):
-- The dark band behind Murfy's text showed only on logic frames (`rayman_interp_ref`: always there at 25 FPS;
-  `rayman_interp_off` / `rayman_interp`: only on some pictures). Found with `PS2X_RAYMAN_SPLIT_DUMP=<vsync>` (EE RAM
-  at 0x1174E0 on a logic frame and on the draw-only frame after it) and `PS2X_EE_WATCH`: a list the logic fills each
-  step (0x147C30 adds entries through 0x141A20) and 0x141D20 draws and empties: count at gp-0x71A0 (0x393250), up to
-  20 entries of 0xCC bytes at 0x3311D8 (a 0xA0-byte matrix block and more). Now 0x141D20 runs every frame and the
-  draw-only frames draw the last logic step's list again (saved / put back when 0x141D20 is entered).
-- Check: with `rayman_interp_off` (no interpolation) two pictures of the same step must be identical. Before:
-  0.15-0.65 apart (the band); now 0.00.
+- Shadows: each frame the display lists add a draw request (0x1473D8 -> 0x10C9F0) to a list at 0x354200 (count,
+  up to 20 requests of 0xD4 bytes; the AI can add more); in the next step 0x147C30 tests their visibility, turns
+  them into entries of a draw list (count at gp-0x71A0 = 0x393250, entries of 0xCC bytes at 0x3311D8) and empties
+  the requests; 0x141D20 (after the display lists) computes each entry's geometry (collision queries) and draws it.
+  With 0x147C30 / 0x141D20 skipped on draw-only frames, every shadow showed only on logic frames. Now 0x147C30 and
+  0x141D20 run on every frame, with the calls before 0x147C30 they need (0x147968, 0x154700, 0x14C2B8: without them
+  0x147C30 crashed the game thread in RenderWare's camera update), and a draw-only frame gets the logic frame's
+  requests back (saved / put back when 0x147C30 is entered).
+- Wrong first fix (commit 3c4e73d): saving the draw list itself and drawing it again with the geometry from the logic
+  frame. The geometry buffers are temporary: the draw-only frames drew stale geometry (the dark area it put in the
+  measured box was that, not Murfy's text box), and on the user's hub recording the Vulkan device was lost / the game
+  hung at the level change (scenario `hub_split_off`).
+- A gap without steps (loading, a menu loop) now forgets the saved requests and the interpolation snapshots (their
+  objects may be gone); the next step is a logic step. The frame clock follows the 25 Hz grid also in frames without
+  a step (loading screens, some menus): with the unit 0.02 s an update every 120 Hz frame counted 20 ms per 8.3 ms.
+- Still flickers: the dark box behind Murfy's text (`rayman_interp_ref`: always there; split: only on logic
+  frames). It is not in these lists (one entry per frame, the shadow); the AI draws it another way: to find.
+- Check: with no interpolation two pictures of the same step must be identical: `hub_split_off` (the user's hub
+  recording, level change included): 0.00 (0.01 twice); `rayman_interp_off`: identical except the text box.
 
 ## Next steps
 
-1. More flicker checks in busier places (the hub, effects), the same way.
+1. Murfy's text box; more flicker checks (effects, other levels).
 2. Check menus, cutscenes, the shop (issue 22 should be as on the console), loading, pause, particles, the HUD layer.
 3. Then decide with the user: make this the 120 FPS mode (a setting in the launcher), or keep option 1.

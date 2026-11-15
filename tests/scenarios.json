@@ -677,6 +677,84 @@
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
       ]
+    },
+    {
+      "name": "hub_split_off",
+      "description": "Flicker check for the in-between pictures (docs/interpolation.md): the user's hub recording (tests/fixtures/hub_split_off.input = a copy of hub_run_120.input; the run drifts from the recording, the logic runs at 25) with PS2X_RAYMAN_LOGIC_HZ=25 and no interpolation, HUD layer off: two pictures of the same logic step must be identical, so a small non-zero difference between consecutive shots is something drawn only on logic frames.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_shop\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
+      "frames": 5000,
+      "shots": [
+        1500,
+        1501,
+        1502,
+        1503,
+        1504,
+        1505,
+        1506,
+        1507,
+        1508,
+        1509,
+        1510,
+        1511,
+        1512,
+        2500,
+        2501,
+        2502,
+        2503,
+        2504,
+        2505,
+        2506,
+        2507,
+        2508,
+        2509,
+        2510,
+        2511,
+        2512,
+        3500,
+        3501,
+        3502,
+        3503,
+        3504,
+        3505,
+        3506,
+        3507,
+        3508,
+        3509,
+        3510,
+        3511,
+        3512,
+        4500,
+        4501,
+        4502,
+        4503,
+        4504,
+        4505,
+        4506,
+        4507,
+        4508,
+        4509,
+        4510,
+        4511,
+        4512
+      ],
+      "env": {
+        "PS2X_FRAMERATE": "120",
+        "PS2X_GS_SSAA": "4",
+        "PS2X_WIDESCREEN": "16:9",
+        "PS2X_GFX_THREAD": "1",
+        "PS2X_HUD": "0",
+        "PS2X_TEST_INPUT_PORTS": "2",
+        "PS2X_RAYMAN_LOGIC_HZ": "25"
+      },
+      "checks": [
+        {
+          "type": "exit_code",
+          "expect": 0,
+          "label": "run ends by frame budget (no hang, no crash)"
+        }
+      ]
     }
   ]
 }

@@ -440,7 +440,8 @@ namespace
     //   turn a press into "just pressed" in a draw-only frame and lose it).
     // - On a draw-only frame the step still runs, but its logic calls return at once (actors and their AI, sector
     //   change, animation, ...: calls whose result the step does not use); the display lists 0x145EC0 and the camera
-    //   calls run as usual. Frames without a step (some menus) keep the clock and the tail every frame.
+    //   calls run as usual. Frames without a step (loading, some menus) keep the tail every frame; the clock follows
+    //   the 25 Hz grid there too.
     // - Everything is done when a function is entered: a guest function can return to the scheduler in the middle (a
     //   thread switch) and finish later, so nothing may be done "after" a call.
     // Not yet: in-between pictures (a draw-only frame shows the last step again).
@@ -468,12 +469,29 @@ namespace
     uint32_t g_raymanLogicCallCount = 0u;
 
     void raymanInterpRestore(uint8_t *rdram); // PS2X_RAYMAN_INTERP, below
+    void raymanInterpForget();                 // PS2X_RAYMAN_INTERP, below
+    bool g_raymanRequestsValid = false; // the AI's draw requests kept for the draw-only frames (0x147C30, below)
+    uint64_t g_raymanLastStepVsync = 0u;
 
     void raymanGameStepSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // A gap without steps (loading a level, a menu loop): what the draw-only frames reuse (the logic's list, the
+        // objects and matrices to interpolate) may belong to objects freed since. Forget it; the next step is logic.
+        const uint64_t vsync = ps2xGuestVsync();
+        const bool gap = vsync - g_raymanLastStepVsync > 3u;
+        g_raymanLastStepVsync = vsync;
+        if (gap)
+        {
+            g_raymanRequestsValid = false;
+            raymanInterpForget();
+            g_raymanNextStepLogic = true;
+        }
         g_raymanDrawOnly = !g_raymanNextStepLogic && !raymanDemoPlayback(rdram, getRegU32(ctx, 28));
         if (!g_raymanDrawOnly)
-            raymanInterpRestore(rdram); // the logic starts from the true matrices
+        {
+            raymanInterpRestore(rdram);    // the logic starts from the true matrices
+            g_raymanRequestsValid = false; // saved again when this step's requests are consumed
+        }
         g_raymanStepSinceClock = true;
         ++g_raymanSteps;
         if (g_raymanDrawOnly)
@@ -501,10 +519,12 @@ namespace
 
     void raymanFrameClockCallSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // Called after the VBlank wait: the guest VBlank now is the next frame's.
+        // Called after the VBlank wait: the guest VBlank now is the next frame's. The clock moves only when a new 40 ms
+        // slot begins, also in frames without a game step (loading, some menus): with the clock unit 0.02 s, a clock
+        // update every 120 Hz frame would count 20 ms per 8.3 ms (game time 2.4 times too fast there).
         const uint64_t slot = ps2xGuestVsync() * g_raymanLogicHz / g_raymanFrameRate;
         bool logicNext = true;
-        if (g_raymanStepSinceClock && !raymanDemoPlayback(rdram, getRegU32(ctx, 28)))
+        if (!raymanDemoPlayback(rdram, getRegU32(ctx, 28)))
             logicNext = slot != g_raymanLastLogicSlot;
         g_raymanStepSinceClock = false;
         g_raymanNextStepLogic = logicNext;
@@ -534,36 +554,46 @@ namespace
         g_raymanFrameTail(rdram, ctx, runtime);
     }
 
-    // A list the logic fills each step and 0x141D20 (the step's call after the display lists) draws and empties:
-    // count at gp-0x71A0 (0x393250), up to 20 entries of 0xCC bytes at 0x3311D8 (0x147C30 adds them through 0x141A20:
-    // a 0xA0-byte matrix block and more). The draw-only frames draw the last logic step's list again: saved when
-    // 0x141D20 is entered on a logic frame, put back when it is entered on a draw-only frame (without it, what the list
-    // draws showed only on logic frames: it flickered).
-    constexpr uint32_t kRaymanStepListDrawAddr = 0x00141D20u;
-    constexpr uint32_t kRaymanStepListCountAddr = 0x00393250u;
-    constexpr uint32_t kRaymanStepListAddr = 0x003311D8u;
-    constexpr uint32_t kRaymanStepListBytes = 20u * 0xCCu;
-    PS2Runtime::RecompiledFunction g_raymanStepListDraw = nullptr;
-    uint8_t g_raymanStepListSaved[kRaymanStepListBytes] = {};
-    uint32_t g_raymanStepListSavedCount = 0u;
+    // Things the AI asks to have drawn each step (shadows, the dark band behind Murfy's text, ...): a request list at
+    // 0x354200 (count, then up to 20 requests of 0xD4 bytes; the AI adds them while the actors run). 0x147C30 (in the
+    // step, after the actors) tests each request's visibility and turns it into an entry of a draw list (count at
+    // gp-0x71A0, entries of 0xCC bytes at 0x3311D8, through 0x141A20), then empties the requests (and the counters at
+    // +0x1094 / +0x10EC); 0x141D20 (after the display lists) computes each entry's geometry (collision queries) and
+    // draws it. On a draw-only frame the AI does not run, so there were no requests: what they draw showed only on
+    // logic frames (it flickered). Now the requests are saved when 0x147C30 is entered on a logic frame and put back
+    // when it is entered on a draw-only frame, and 0x147C30 and 0x141D20 run on every frame: a draw-only frame draws
+    // them as any frame would, from the last step's requests. (Replaying the draw list itself, with the geometry
+    // computed on the logic frame, sent stale geometry: Vulkan device lost.)
+    constexpr uint32_t kRaymanRequestsAddr = 0x00147C30u; // the function that consumes the requests
+    constexpr uint32_t kRaymanRequestListAddr = 0x00354200u;
+    constexpr uint32_t kRaymanRequestListBytes = 4u + 20u * 0xD4u; // count + up to 20 requests
+    PS2Runtime::RecompiledFunction g_raymanRequests = nullptr;
+    uint8_t g_raymanRequestsSaved[kRaymanRequestListBytes] = {};
 
-    void raymanStepListDrawSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void raymanRequestsSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static const bool s_restore = []() {
+            const char *e = std::getenv("PS2X_RAYMAN_SPLIT_REQUESTS"); // "0": no restore (experiments)
+            return !(e && std::strcmp(e, "0") == 0);
+        }();
         const uint32_t ra = getRegU32(ctx, 31);
-        if (ra >= kRaymanGameStepAddr && ra < kRaymanGameStepEnd)
+        if (s_restore && ra >= kRaymanGameStepAddr && ra < kRaymanGameStepEnd)
         {
+            const uint32_t count = raymanRam32(rdram, kRaymanRequestListAddr);
             if (!g_raymanDrawOnly)
             {
-                g_raymanStepListSavedCount = std::min(raymanRam32(rdram, kRaymanStepListCountAddr), 20u);
-                std::memcpy(g_raymanStepListSaved, rdram + kRaymanStepListAddr, kRaymanStepListBytes);
+                g_raymanRequestsValid = count <= 20u;
+                if (g_raymanRequestsValid) // the count and the requests in use
+                    std::memcpy(g_raymanRequestsSaved, rdram + kRaymanRequestListAddr, 4u + count * 0xD4u);
             }
-            else
+            else if (g_raymanRequestsValid) // replaces this frame's own requests: the saved ones include their kind
             {
-                raymanRamWrite32(rdram, kRaymanStepListCountAddr, g_raymanStepListSavedCount);
-                std::memcpy(rdram + kRaymanStepListAddr, g_raymanStepListSaved, kRaymanStepListBytes);
+                uint32_t saved = 0u;
+                std::memcpy(&saved, g_raymanRequestsSaved, sizeof(saved));
+                std::memcpy(rdram + kRaymanRequestListAddr, g_raymanRequestsSaved, 4u + saved * 0xD4u);
             }
         }
-        g_raymanStepListDraw(rdram, ctx, runtime);
+        g_raymanRequests(rdram, ctx, runtime);
     }
 
     uint32_t raymanLogicSplitHz()
@@ -590,19 +620,21 @@ namespace
         runtime.registerFunction(kRaymanGameStepAddr, &raymanGameStepSplit);
         runtime.registerFunction(kRaymanFrameClockCallAddr, &raymanFrameClockCallSplit);
         runtime.registerFunction(kRaymanFrameTailAddr, &raymanFrameTailSplit);
-        if (runtime.hasFunction(kRaymanStepListDrawAddr))
+        if (runtime.hasFunction(kRaymanRequestsAddr))
         {
-            g_raymanStepListDraw = runtime.lookupFunction(kRaymanStepListDrawAddr);
-            runtime.registerFunction(kRaymanStepListDrawAddr, &raymanStepListDrawSplit);
+            g_raymanRequests = runtime.lookupFunction(kRaymanRequestsAddr);
+            runtime.registerFunction(kRaymanRequestsAddr, &raymanRequestsSplit);
         }
         // The step's logic calls (the step does not use their results): 0x20C518, 0x15BD30, 0x14AC40, 0x101828 (sector
         // change), 0x112270, 0x1497A0, 0x10C0D8 / 0x106680 (the actors and their AI), 0x11A2D0 (f12 = n: animation),
-        // 0x147968, 0x154700, 0x14C2B8, 0x147C30, 0x11B348 (a0 = game ms), and after the display lists 0x13EA68.
-        // PS2X_RAYMAN_LOGIC_CALLS="addr,..." replaces the list (experiments). 0x141D20 draws every frame (below).
+        // 0x11B348 (a0 = game ms), and after the display lists 0x13EA68. PS2X_RAYMAN_LOGIC_CALLS="addr,..." replaces
+        // the list (experiments). The AI's draw requests (0x147C30, 0x141D20, above) and the calls before them that
+        // they need (0x147968, 0x154700, 0x14C2B8: without them 0x147C30 on a draw-only frame crashed the game thread
+        // in RenderWare's camera update) run on every frame.
         const char *listEnv = std::getenv("PS2X_RAYMAN_LOGIC_CALLS");
         const std::string list = listEnv ? std::string(listEnv)
-                                         : std::string("20c518,15bd30,14ac40,101828,112270,1497a0,10c0d8,106680,11a2d0,147968,"
-                                                       "154700,14c2b8,147c30,11b348,13ea68");
+                                         : std::string("20c518,15bd30,14ac40,101828,112270,1497a0,10c0d8,106680,11a2d0,11b348,"
+                                                       "13ea68");
         static constexpr auto kSplits = raymanLogicCallSplits(std::make_integer_sequence<uint32_t, kRaymanLogicCallMax>{});
         const char *p = list.c_str();
         while (*p && g_raymanLogicCallCount < kRaymanLogicCallMax)
@@ -782,6 +814,17 @@ namespace
                 std::memcpy(rdram + e.matrix, e.m, sizeof(e.m));
         if (g_raymanViewCur.address)
             std::memcpy(rdram + g_raymanViewCur.address, g_raymanViewCur.m, sizeof(g_raymanViewCur.m));
+    }
+
+    // Drop the snapshots without writing anything back (the objects may be gone).
+    void raymanInterpForget()
+    {
+        g_raymanInterpWritten = false;
+        g_raymanInterpPrev.clear();
+        g_raymanInterpCur.clear();
+        g_raymanInterpPrevIndex.clear();
+        g_raymanViewPrev.address = 0u;
+        g_raymanViewCur.address = 0u;
     }
 
     void raymanViewSnapshot(const uint8_t *rdram, RaymanView &out)
