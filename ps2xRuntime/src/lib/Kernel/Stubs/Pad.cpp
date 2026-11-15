@@ -9,7 +9,7 @@ extern "C" uint16_t ps2xTestPadButtons(int port); // ps2_test_harness.cpp (scrip
 extern "C" bool ps2xTestPadAxes(int port, uint8_t axes[4]); // same: scripted analog sticks (rx, ry, lx, ly)
 extern "C" bool ps2xTestMode();                  // ps2_test_harness.cpp: unattended run, ignore real input
 extern "C" bool ps2xHostGamepadRead(uint16_t *buttons, uint8_t axes[4]); // ps2_pad.cpp: Xbox / PlayStation pad
-extern "C" void ps2xTestRecordPad(int port, uint16_t buttons, const uint8_t axes[4]); // ps2_test_harness.cpp
+extern "C" void ps2xTestRecordPad(int port, uint16_t *buttons, uint8_t axes[4]); // ps2_test_harness.cpp
 // --- Rayman debug: log the first calls of each libpad entry point to stderr ---
 namespace
 {
@@ -331,8 +331,13 @@ namespace ps2_stubs
                 }
                 // PS2X_RECORD_INPUT (run_tests -Record): the pad as the game gets it (the real pad, and a script if
                 // one runs too: recording a scripted run checks the recorder).
-                const uint8_t recordAxes[4] = {state.rx, state.ry, state.lx, state.ly};
-                ps2xTestRecordPad(port, state.buttons, recordAxes);
+                // The recorder holds the pad for the whole VSync and rounds the sticks: the game gets what is recorded.
+                uint8_t recordAxes[4] = {state.rx, state.ry, state.lx, state.ly};
+                ps2xTestRecordPad(port, &state.buttons, recordAxes);
+                state.rx = recordAxes[0];
+                state.ry = recordAxes[1];
+                state.lx = recordAxes[2];
+                state.ly = recordAxes[3];
             }
 
             fillPadStatus(outData, state, portState);

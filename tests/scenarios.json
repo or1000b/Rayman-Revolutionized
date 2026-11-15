@@ -245,13 +245,13 @@
     },
     {
       "name": "shop_exit",
-      "description": "The user's save of 2026-11-15 (near the ability shop under the well of whirlpools, CLAUDE.md issue 22): load it, look around.",
+      "description": "The user's save of 2026-11-15 (near the ability shop under the well of whirlpools, CLAUDE.md issue 22) at run_rayman_hd_120fps.bat settings: load it, go into the shop, try to leave (record_for_claude.bat shop_exit).",
       "renderer": "gpu",
       "memcard": "fixtures\\mc_shop\\mc0",
       "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
       "frames": 6500,
-      "shots": [2500, 2700, 2800, 2950, 4000, 5000, 6400],
-      "env": { "PS2X_FRAMERATE": "60" },
+      "shots": [2000, 2150, 2300, 2450, 2600, 2750, 2900, 3050, 3200, 3350, 3500, 3650, 3800, 3950, 4100, 4250, 4400, 4550, 4700, 4850, 5000, 5150, 5300, 5450, 5600, 5750, 5900, 6050, 6200, 6350],
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "1" },
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
       ]
@@ -263,7 +263,7 @@
       "memcard": "fixtures\\mc_shop\\mc0",
       "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
       "frames": 20000,
-      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1" },
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "1" },
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
       ]

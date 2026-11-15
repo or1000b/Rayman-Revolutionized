@@ -9,6 +9,10 @@
     run_tests.bat -Record -Only <name>  play the scenario yourself (its memory card, env, deterministic, real pad, no
                                         frame budget); the pad goes to tests\fixtures\<name>.input, which the
                                         scenario replays from then on (VSync clock) instead of its "input"
+    run_tests.bat -Record -RecordScript -Only <name>
+                                        the recorder's self-check: record the scenario's scripted "input" (no
+                                        player, minimized, its frame budget), then run_tests -Only <name> replays
+                                        the recording and its [det] lines must match out\tests\<name>_record\run.log
   Scenarios and checks: tests\scenarios.json. Report: out\test_report.txt. Exit code 0 = no FAIL.
   Written for Windows PowerShell 5.1 (no PowerShell 7 syntax).
 #>
@@ -17,7 +21,8 @@ param(
     [string]$Only = '',
     [switch]$UpdateGolden,
     [switch]$NoKickHash,
-    [switch]$Record
+    [switch]$Record,
+    [switch]$RecordScript
 )
 
 $ErrorActionPreference = 'Stop'
@@ -153,15 +158,31 @@ function Invoke-GameRun($sc, $log, $shotDir) {
         Remove-Item Env:PS2X_TEST_INPUT -ErrorAction SilentlyContinue
         $env:PS2X_TEST_INPUT_FILE = $recording
         $env:PS2X_TEST_INPUT_CLOCK = 'vsync'
-        Write-Host "  input: the recording $recording"
+        # The run lasts at least the recording (its ticks are VSyncs; the frame budget counts PAL fields, x 50 / rate).
+        $lastVsync = 0
+        foreach ($item in ((Get-Content -Raw $recording) -split '[,\r\n]+')) {
+            $parts = $item.Split(':')
+            if ($parts.Count -ge 2) {
+                $end = [int64]$parts[0] + $(if ($parts.Count -ge 3) { [int64]$parts[2] } else { 8 })
+                if ($end -gt $lastVsync) { $lastVsync = $end }
+            }
+        }
+        $rate = 50
+        if ($sc.PSObject.Properties['env'] -and $sc.env.PSObject.Properties['PS2X_FRAMERATE']) { $rate = [int]$sc.env.PS2X_FRAMERATE }
+        $frames = [int64][math]::Ceiling($lastVsync * 50 / $rate) + 250
+        if ($frames -gt [int64]$sc.frames) { $env:PS2X_TEST_FRAMES = [string]$frames }
+        Write-Host "  input: the recording $recording (to VSync $lastVsync, frame budget $env:PS2X_TEST_FRAMES)"
     }
     if ($Record) {
         # The player drives: real pad and keyboard (no test mode), no frame budget, no watchdog; the pad is recorded.
+        # -RecordScript: the scenario's script drives instead (the recorder's self-check).
         $env:PS2X_TEST_MODE = '0'
-        Remove-Item Env:PS2X_TEST_INPUT -ErrorAction SilentlyContinue
-        $env:PS2X_TEST_FRAMES = '0'
-        $env:PS2X_WATCHDOG_SEC = '0'
         $env:PS2X_RECORD_INPUT = $recording
+        if (-not $RecordScript) {
+            Remove-Item Env:PS2X_TEST_INPUT -ErrorAction SilentlyContinue
+            $env:PS2X_TEST_FRAMES = '0'
+            $env:PS2X_WATCHDOG_SEC = '0'
+        }
     }
     # [vu1-hash] every 600 VSyncs: hash of every byte VU1 sent to the GS (check type vu1_hash).
     $env:PS2X_VU1_KICK_HASH = '1'
@@ -205,13 +226,23 @@ function Invoke-GameRun($sc, $log, $shotDir) {
             $extraEnv += $p.Name
         }
     }
+    if ($Record -and -not $RecordScript) {
+        # The window like run_rayman_hd.bat (full screen, F10 toggles; smooth scaling; FPS counter). Window settings
+        # only: what the game does comes from the scenario's env, the same in the recording and the replays.
+        foreach ($kv in @(@('PS2X_WINDOW', '1280x720'), @('PS2X_FULLSCREEN', '1'), @('PS2X_FILTER', 'bilinear'), @('PS2X_SHOW_FPS', '1'))) {
+            if (-not (Test-Path "Env:$($kv[0])")) {
+                Set-Item -Path "Env:$($kv[0])" -Value $kv[1]
+                $extraEnv += $kv[0]
+            }
+        }
+    }
 
     # The game paces itself to ~60 frames per second; allow 3x plus start-up before giving up.
-    $timeoutSec = [int]($sc.frames / 60 * 3) + 120
-    if ($Record) { $timeoutSec = 6 * 3600 }
+    $timeoutSec = [int]([int64]$env:PS2X_TEST_FRAMES / 60 * 3) + 120
+    if ($Record -and -not $RecordScript) { $timeoutSec = 6 * 3600 }
     $started = Get-Date
     $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"`"$Exe`" `"$Elf`" > `"$log`" 2>&1`"" `
-        -WorkingDirectory $Root -WindowStyle $(if ($Record) { 'Normal' } else { 'Minimized' }) -PassThru
+        -WorkingDirectory $Root -WindowStyle $(if ($Record -and -not $RecordScript) { 'Normal' } else { 'Minimized' }) -PassThru
     $finished = $proc.WaitForExit($timeoutSec * 1000)
     if (-not $finished) {
         & taskkill.exe /T /F /PID $proc.Id | Out-Null

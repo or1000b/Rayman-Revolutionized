@@ -148,6 +148,15 @@ namespace
         uint8_t axis[4] = {0x80, 0x80, 0x80, 0x80};
         uint64_t axisSince[4] = {};
         bool finished = false;
+        // The pad the game gets is held for a whole VSync (the game reads it several times per VSync): a change
+        // between two reads of one VSync waits for the next, so the recording (VSync clock) is what the game read.
+        bool latched = false;
+        uint64_t latchTick = 0;
+        uint16_t latchButtons = 0xFFFFu;
+        uint8_t latchAxes[4] = {0x80, 0x80, 0x80, 0x80};
+        uint64_t reads = 0;
+        uint64_t vsyncsRead = 0;
+        uint64_t heldChanges = 0;
     };
     Recorder g_recorder;
 
@@ -789,6 +798,10 @@ extern "C" void ps2xTestHarnessExiting()
                 std::fclose(f);
                 std::fprintf(stderr, "[record] %zu pad events written to %s (last VSync %llu)\n", g_recorder.items,
                              g_recorder.path.c_str(), static_cast<unsigned long long>(tick));
+                std::fprintf(stderr, "[record] %llu pad reads in %llu VSyncs; %llu changes waited for the next VSync\n",
+                             static_cast<unsigned long long>(g_recorder.reads),
+                             static_cast<unsigned long long>(g_recorder.vsyncsRead),
+                             static_cast<unsigned long long>(g_recorder.heldChanges));
             }
             else
                 std::fprintf(stderr, "[record] cannot write %s\n", g_recorder.path.c_str());
@@ -796,10 +809,11 @@ extern "C" void ps2xTestHarnessExiting()
     }
 }
 
-// Pad.cpp (scePadRead, the real pad, before scripted input): with PS2X_RECORD_INPUT, what the game reads. buttons is
-// libpad's active-low word, axes rx, ry, lx, ly. Sticks are kept in steps of 4 (0x80 within 8 = centre) so a resting
-// stick does not fill the file.
-extern "C" void ps2xTestRecordPad(int port, uint16_t buttons, const uint8_t axes[4])
+// Pad.cpp (scePadRead, after the real pad and scripted input): with PS2X_RECORD_INPUT, records what the game reads
+// and changes it to what the replay will give. buttons is libpad's active-low word, axes rx, ry, lx, ly. Sticks are
+// kept in steps of 4 (0x80 within 8 = centre) so a resting stick does not fill the file, and the pad is held for the
+// whole VSync (Recorder::latched).
+extern "C" void ps2xTestRecordPad(int port, uint16_t *buttonsInOut, uint8_t axes[4])
 {
     if (g_recorder.path.empty() || port != 0)
         return;
@@ -807,6 +821,30 @@ extern "C" void ps2xTestRecordPad(int port, uint16_t buttons, const uint8_t axes
     if (g_recorder.finished)
         return;
     const uint64_t tick = g_guestVsync.load(std::memory_order_relaxed);
+    ++g_recorder.reads;
+    for (int i = 0; i < 4; ++i)
+    {
+        int v = axes[i];
+        if (v >= 0x78 && v <= 0x88)
+            v = 0x80;
+        else
+            v = std::min(0xFF, ((v + 2) / 4) * 4);
+        axes[i] = static_cast<uint8_t>(v);
+    }
+    if (g_recorder.latched && tick == g_recorder.latchTick)
+    {
+        if (*buttonsInOut != g_recorder.latchButtons || std::memcmp(axes, g_recorder.latchAxes, 4u) != 0)
+            ++g_recorder.heldChanges;
+        *buttonsInOut = g_recorder.latchButtons;
+        std::memcpy(axes, g_recorder.latchAxes, 4u);
+        return;
+    }
+    g_recorder.latched = true;
+    g_recorder.latchTick = tick;
+    g_recorder.latchButtons = *buttonsInOut;
+    std::memcpy(g_recorder.latchAxes, axes, 4u);
+    ++g_recorder.vsyncsRead;
+    const uint16_t buttons = *buttonsInOut;
     static const char *const names[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
                                           "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square"};
     for (int i = 0; i < 16; ++i)
@@ -823,11 +861,7 @@ extern "C" void ps2xTestRecordPad(int port, uint16_t buttons, const uint8_t axes
     static const char *const axisNames[4] = {"rx", "ry", "lx", "ly"};
     for (int i = 0; i < 4; ++i)
     {
-        int v = axes[i];
-        if (v >= 0x78 && v <= 0x88)
-            v = 0x80;
-        else
-            v = std::min(0xFF, ((v + 2) / 4) * 4);
+        const int v = axes[i];
         if (v == g_recorder.axis[i])
             continue;
         if (g_recorder.axis[i] != 0x80u)
