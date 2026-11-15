@@ -534,6 +534,38 @@ namespace
         g_raymanFrameTail(rdram, ctx, runtime);
     }
 
+    // A list the logic fills each step and 0x141D20 (the step's call after the display lists) draws and empties:
+    // count at gp-0x71A0 (0x393250), up to 20 entries of 0xCC bytes at 0x3311D8 (0x147C30 adds them through 0x141A20:
+    // a 0xA0-byte matrix block and more). The draw-only frames draw the last logic step's list again: saved when
+    // 0x141D20 is entered on a logic frame, put back when it is entered on a draw-only frame (without it, what the list
+    // draws showed only on logic frames: it flickered).
+    constexpr uint32_t kRaymanStepListDrawAddr = 0x00141D20u;
+    constexpr uint32_t kRaymanStepListCountAddr = 0x00393250u;
+    constexpr uint32_t kRaymanStepListAddr = 0x003311D8u;
+    constexpr uint32_t kRaymanStepListBytes = 20u * 0xCCu;
+    PS2Runtime::RecompiledFunction g_raymanStepListDraw = nullptr;
+    uint8_t g_raymanStepListSaved[kRaymanStepListBytes] = {};
+    uint32_t g_raymanStepListSavedCount = 0u;
+
+    void raymanStepListDrawSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = getRegU32(ctx, 31);
+        if (ra >= kRaymanGameStepAddr && ra < kRaymanGameStepEnd)
+        {
+            if (!g_raymanDrawOnly)
+            {
+                g_raymanStepListSavedCount = std::min(raymanRam32(rdram, kRaymanStepListCountAddr), 20u);
+                std::memcpy(g_raymanStepListSaved, rdram + kRaymanStepListAddr, kRaymanStepListBytes);
+            }
+            else
+            {
+                raymanRamWrite32(rdram, kRaymanStepListCountAddr, g_raymanStepListSavedCount);
+                std::memcpy(rdram + kRaymanStepListAddr, g_raymanStepListSaved, kRaymanStepListBytes);
+            }
+        }
+        g_raymanStepListDraw(rdram, ctx, runtime);
+    }
+
     uint32_t raymanLogicSplitHz()
     {
         const char *env = std::getenv("PS2X_RAYMAN_LOGIC_HZ");
@@ -558,14 +590,19 @@ namespace
         runtime.registerFunction(kRaymanGameStepAddr, &raymanGameStepSplit);
         runtime.registerFunction(kRaymanFrameClockCallAddr, &raymanFrameClockCallSplit);
         runtime.registerFunction(kRaymanFrameTailAddr, &raymanFrameTailSplit);
+        if (runtime.hasFunction(kRaymanStepListDrawAddr))
+        {
+            g_raymanStepListDraw = runtime.lookupFunction(kRaymanStepListDrawAddr);
+            runtime.registerFunction(kRaymanStepListDrawAddr, &raymanStepListDrawSplit);
+        }
         // The step's logic calls (the step does not use their results): 0x20C518, 0x15BD30, 0x14AC40, 0x101828 (sector
         // change), 0x112270, 0x1497A0, 0x10C0D8 / 0x106680 (the actors and their AI), 0x11A2D0 (f12 = n: animation),
-        // 0x147968, 0x154700, 0x14C2B8, 0x147C30, 0x11B348 (a0 = game ms), and after the display lists 0x141D20,
-        // 0x13EA68. PS2X_RAYMAN_LOGIC_CALLS="addr,..." replaces the list (experiments).
+        // 0x147968, 0x154700, 0x14C2B8, 0x147C30, 0x11B348 (a0 = game ms), and after the display lists 0x13EA68.
+        // PS2X_RAYMAN_LOGIC_CALLS="addr,..." replaces the list (experiments). 0x141D20 draws every frame (below).
         const char *listEnv = std::getenv("PS2X_RAYMAN_LOGIC_CALLS");
         const std::string list = listEnv ? std::string(listEnv)
                                          : std::string("20c518,15bd30,14ac40,101828,112270,1497a0,10c0d8,106680,11a2d0,147968,"
-                                                       "154700,14c2b8,147c30,11b348,141d20,13ea68");
+                                                       "154700,14c2b8,147c30,11b348,13ea68");
         static constexpr auto kSplits = raymanLogicCallSplits(std::make_integer_sequence<uint32_t, kRaymanLogicCallMax>{});
         const char *p = list.c_str();
         while (*p && g_raymanLogicCallCount < kRaymanLogicCallMax)
@@ -793,6 +830,25 @@ namespace
         }
         const uint64_t vsync = ps2xGuestVsync();
         raymanInterpRestore(rdram);
+        // PS2X_RAYMAN_SPLIT_DUMP=<vsync> (research): EE RAM here (before the camera and the display lists) on the
+        // first logic frame from that VSync and on the draw-only frame after it, to out/split_logic_<v>.bin /
+        // out/split_draw_<v>.bin. What the logic filled and the drawing emptied in between shows as the difference.
+        static const uint64_t s_dumpFrom = []() {
+            const char *e = std::getenv("PS2X_RAYMAN_SPLIT_DUMP");
+            return e ? std::strtoull(e, nullptr, 10) : 0ull;
+        }();
+        static int s_dumpState = 0;
+        if (s_dumpFrom && vsync >= s_dumpFrom && s_dumpState < 2 && (s_dumpState == 0) != g_raymanDrawOnly)
+        {
+            const std::string path = std::string(s_dumpState == 0 ? "out/split_logic_" : "out/split_draw_") + std::to_string(vsync) + ".bin";
+            if (FILE *f = std::fopen(path.c_str(), "wb"))
+            {
+                std::fwrite(rdram, 1u, PS2_RAM_SIZE, f);
+                std::fclose(f);
+                std::fprintf(stderr, "[hle] Rayman: split dump %s\n", path.c_str());
+            }
+            ++s_dumpState;
+        }
         if (!g_raymanDrawOnly) // a logic step: N-1 = the last step, N = now
         {
             std::swap(g_raymanInterpPrev, g_raymanInterpCur);

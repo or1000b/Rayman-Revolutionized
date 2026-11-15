@@ -115,15 +115,18 @@ The game step takes ~2.9 ms per frame instead of ~4.4 (logic now on 1 frame in 4
 instead of ~1.0); most of the rest is the drawing (0x14B348 ~2.0 ms) that every picture needs. Interpolation itself
 (~250 matrices) ~0.04 ms. Waiting for the VBlank: ~5.1 ms instead of ~3.6.
 
-Found so far:
-- The dark band behind Murfy's text is drawn only on logic frames (`rayman_interp_ref`: always there at 25 FPS;
-  `rayman_interp_off` / `rayman_interp`: only on some pictures): it flickers. It is drawn from the actors' AI
-  (0x10C0D8 / 0x106680): running the other skipped calls every frame does not bring it back. Other things the AI
-  draws each step (2D, maybe effects) will do the same.
+Flicker (things drawn only on logic frames):
+- The dark band behind Murfy's text showed only on logic frames (`rayman_interp_ref`: always there at 25 FPS;
+  `rayman_interp_off` / `rayman_interp`: only on some pictures). Found with `PS2X_RAYMAN_SPLIT_DUMP=<vsync>` (EE RAM
+  at 0x1174E0 on a logic frame and on the draw-only frame after it) and `PS2X_EE_WATCH`: a list the logic fills each
+  step (0x147C30 adds entries through 0x141A20) and 0x141D20 draws and empties: count at gp-0x71A0 (0x393250), up to
+  20 entries of 0xCC bytes at 0x3311D8 (a 0xA0-byte matrix block and more). Now 0x141D20 runs every frame and the
+  draw-only frames draw the last logic step's list again (saved / put back when 0x141D20 is entered).
+- Check: with `rayman_interp_off` (no interpolation) two pictures of the same step must be identical. Before:
+  0.15-0.65 apart (the band); now 0.00.
 
 ## Next steps
 
-1. 2D drawn from the AI (the text band): find the queue the AI fills each step and keep / replay it on the draw-only
-   frames.
+1. More flicker checks in busier places (the hub, effects), the same way.
 2. Check menus, cutscenes, the shop (issue 22 should be as on the console), loading, pause, particles, the HUD layer.
 3. Then decide with the user: make this the 120 FPS mode (a setting in the launcher), or keep option 1.
