@@ -222,3 +222,10 @@ extern "C" int ps2xGfxStatsLine(char *out, int size)
     roomWaitsBefore = roomWaits;
     return n;
 }
+
+// Names the calling thread for the native profiler (PS2X_NATIVE_PROF_THREAD): for code that cannot include
+// ThreadNaming.h next to the Windows headers (the GS thread in gs_pgs_bridge.cpp).
+extern "C" void ps2xNameCurrentThread(const char *name)
+{
+    ThreadNaming::SetCurrentThreadName(name ? name : "");
+}

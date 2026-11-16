@@ -41,6 +41,7 @@ namespace ps2x::pgs
 #include <thread>
 
 extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
+extern "C" void ps2xNameCurrentThread(const char *name); // ps2_gfx_thread.inc (PS2X_NATIVE_PROF_THREAD=GsThread)
 
 namespace ps2x::pgs
 {
@@ -1547,6 +1548,7 @@ namespace ps2x::pgs
 
         void workerLoop()
         {
+            ps2xNameCurrentThread("GsThread");
             Batch work;
             for (;;)
             {
