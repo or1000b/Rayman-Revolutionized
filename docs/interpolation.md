@@ -97,14 +97,23 @@ main.cpp `installRaymanInterp`. Where the picture's matrices come from:
   superobject [0x252398], its parent (type 1, ~184 persos) and everything under it (~250 superobjects: persos type 2,
   their parts type 8, made again each step from a pool).
 
-So, when 0x1174E0 is entered from the step (it is also called by 0x1109E0), the camera's view matrix and every
-object's global matrix get values interpolated between the last two steps; the true ones go back when 0x141D20 (the
-step's call after the display lists) is entered, and before a logic step. Time: N-1 at the logic step's frame, moving
-to N until the next step (one step behind the logic, as in rac-rs). Interpolation: translation linear, rotation rows
-blended and made perpendicular again (Gram-Schmidt), the camera through its placement (c = -t R^T). Pairing: persos
-by address, parts by parent + data + count of earlier siblings with the same data (the parts' order changes between
-steps: pairing by place made Rayman's limbs jump). No interpolation for a move of more than 6 units per step or a
-turn of 90 degrees or more.
+So, when 0x1174E0 is entered from the step (it is also called by 0x1109E0), every object's global matrix gets a value
+interpolated between the last two steps, and when RwCameraBeginUpdate (0x18C450) is entered from 0x1174E0, so does
+RenderWare's camera frame (its modelling matrix, just set from the game camera by 0x14FE90). Time: N-1 at the logic
+step's frame, moving to N until the next step (one step behind the logic, as in rac-rs). Interpolation: translation
+linear, rotation rows blended and made perpendicular again (Gram-Schmidt). Pairing: persos by address, parts by
+parent + data + count of earlier siblings with the same data (the parts' order changes between steps: pairing by
+place made Rayman's limbs jump). Only types 2 and 8. No interpolation for a move of more than 6 units per step, a turn
+of 90 degrees or more, or a size change of more than 25%.
+- Snapshots hold each step's FINAL matrices, taken on the first draw-only frame after the logic step: some matrices
+  are only finished while the step's frame draws (0x14AF88 updates a part's global matrix lazily, when its stamp at
+  +0x28 differs from the counter gp-0x7120, which 0x14AC40 advances once per step). Writes are undone (at 0x141D20,
+  before a logic step) only where the memory still holds the value written. The first version snapshot the matrices
+  before the drawing and put them all back after it: lazily finished matrices were overwritten with stale ones and
+  Murfy vanished on the draw-only frames (only his sparkles stayed: the "bright flash" at Rayman's shots).
+- The first camera version interpolated the game camera's view matrix ([[0x252278 + 0x68]] + 4): the game uses that
+  camera for more than the picture, and Murfy vanished on the draw-only frames too. RenderWare's camera frame only
+  changes the picture (`PS2X_RAYMAN_INTERP_PARTS`: 1 objects, 2 game camera, 4 RenderWare camera; default 5).
 
 Results (scenario `rayman_interp`): the physics stay the console's (the same values as `rayman_physics_split`: the
 true matrices are back before the logic runs). Consecutive pictures 20 ms apart now all differ (before: alternately
@@ -131,13 +140,20 @@ Flicker (things drawn only on logic frames):
 - A gap without steps (loading, a menu loop) now forgets the saved requests and the interpolation snapshots (their
   objects may be gone); the next step is a logic step. The frame clock follows the 25 Hz grid also in frames without
   a step (loading screens, some menus): with the unit 0.02 s an update every 120 Hz frame counted 20 ms per 8.3 ms.
-- Still flickers: the dark box behind Murfy's text (`rayman_interp_ref`: always there; split: only on logic
-  frames). It is not in these lists (one entry per frame, the shadow); the AI draws it another way: to find.
+- 2D drawn only by the logic (the dark box behind Murfy's text, parts of the HUD): the HUD layer (gs_hud, on in
+  normal play) holds it. At each game step main.cpp sends a frame mark (`ps2xHudFrameMark`, gs_frontend.cpp: a write
+  to register 0x7F, not a GS register, through the graphics thread like the game's GS writes, so it reaches the GS
+  thread in order); frames without a step send "logic" at their frame clock. A draw-only frame's 2D is not published:
+  the window keeps showing the last logic frame's 2D (it changes 25 times a second, as on the console). The mark must
+  stay valid until the next one (a frame's first drawing can go to an off-screen buffer: consumed there, the mark got
+  lost and no 2D showed at all). Checked with window shots (`PS2X_HUD=1 PS2X_WINDOW_SHOTS=1`, scenario
+  `shoot_split`): the box shows on every picture. With the HUD layer off (test mode) the GS picture still shows the
+  box only on logic frames.
 - Check: with no interpolation two pictures of the same step must be identical: `hub_split_off` (the user's hub
   recording, level change included): 0.00 (0.01 twice); `rayman_interp_off`: identical except the text box.
 
 ## Next steps
 
-1. Murfy's text box; more flicker checks (effects, other levels).
+1. More flicker checks (effects, other levels); the user's impression.
 2. Check menus, cutscenes, the shop (issue 22 should be as on the console), loading, pause, particles, the HUD layer.
 3. Then decide with the user: make this the 120 FPS mode (a setting in the launcher), or keep option 1.

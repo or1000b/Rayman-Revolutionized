@@ -1916,3 +1916,16 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
         m_hasPreferredDisplaySource = true;
     }
 }
+
+// main.cpp (PS2X_RAYMAN_LOGIC_HZ): whether the frame the game starts drawing now has game logic, for the HUD layer
+// (gs_hud.h markFrame). Sent like the game's GS register writes (through the graphics thread when it is on, then the
+// GS thread), so it reaches the HUD layer in stream order; the register address 0x7F is the bridge's mark, not a GS
+// register.
+extern "C" void ps2xHudFrameMark(int drawOnly)
+{
+    const uint64_t value = drawOnly ? 1u : 0u;
+    if (ps2x::gfx::shouldPost())
+        ps2x::gfx::post([value] { ps2x::pgs::writeRegister(0x7Fu, value); }, 16u, nullptr);
+    else
+        ps2x::pgs::writeRegister(0x7Fu, value);
+}

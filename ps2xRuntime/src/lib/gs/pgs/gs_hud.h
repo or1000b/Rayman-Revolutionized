@@ -47,6 +47,7 @@ namespace ps2x::hud
     struct Frame
     {
         std::vector<Batch> batches;
+        bool drawOnly = false; // drawn by a frame without game logic (PS2X_RAYMAN_LOGIC_HZ): see markFrame
     };
 
     struct Texture
@@ -64,6 +65,11 @@ namespace ps2x::hud
     void registerWrite(uint32_t reg, uint64_t value);
     // At each scanout (GS thread): the HUD of the displayed buffer becomes the one latest() returns.
     void publish(uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2);
+    // GS thread, in stream order: the frame the game starts drawing now has no game logic (drawOnly) or has it. With
+    // the logic at the console's rate (main.cpp PS2X_RAYMAN_LOGIC_HZ) some 2D is drawn only by the logic (the box
+    // behind Murfy's text, parts of the HUD): a draw-only frame's 2D is not published, the last logic frame's 2D stays
+    // (the 2D then changes 25 times a second, as on the console). Frames without a mark count as logic frames.
+    void markFrame(bool drawOnly);
 
     // Window thread: the HUD of the last scanout, and a texture by key.
     void latest(Frame &out);

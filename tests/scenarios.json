@@ -118,6 +118,142 @@
       ]
     },
     {
+      "name": "shoot_split",
+      "description": "shoot_minisaurus at PS2X_FRAMERATE=120 with the logic at 25 and in-between pictures (PS2X_RAYMAN_LOGIC_HZ=25, PS2X_RAYMAN_INTERP=1; docs/interpolation.md): shots on consecutive ticks while the energy balls fly and the HUD shows, to find what the draw-only frames lose.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7400:square:5,7520:square:5,7640:square:5",
+      "frames": 7700,
+      "shots": [
+        7404,
+        7405,
+        7406,
+        7407,
+        7408,
+        7409,
+        7410,
+        7411,
+        7412,
+        7413,
+        7414,
+        7415,
+        7416,
+        7417,
+        7418,
+        7419,
+        7524,
+        7525,
+        7526,
+        7527,
+        7528,
+        7529,
+        7530,
+        7531
+      ],
+      "_note": "Fixture = the user's save (Minisaurus Plain beach, where Rayman has the energy ball). Square at 7400: the ball is at his hand at 7420 (about 365, 212) and flies away (about 351, 162 at 7432). The region checks compare a small box around the ball, so a missing ball shows up as a large difference.",
+      "checks": [
+        {
+          "type": "exit_code",
+          "expect": 0,
+          "label": "run ends by frame budget (no hang, no crash)"
+        }
+      ],
+      "env": {
+        "PS2X_FRAMERATE": "120",
+        "PS2X_RAYMAN_LOGIC_HZ": "25",
+        "PS2X_RAYMAN_INTERP": "1"
+      }
+    },
+    {
+      "name": "shoot_split_off",
+      "description": "shoot_split without the in-between pictures (PS2X_RAYMAN_LOGIC_HZ=25 only; docs/interpolation.md).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7400:square:5,7520:square:5,7640:square:5",
+      "frames": 7700,
+      "shots": [
+        7404,
+        7405,
+        7406,
+        7407,
+        7408,
+        7409,
+        7410,
+        7411,
+        7412,
+        7413,
+        7414,
+        7415,
+        7416,
+        7417,
+        7418,
+        7419,
+        7524,
+        7525,
+        7526,
+        7527,
+        7528,
+        7529,
+        7530,
+        7531
+      ],
+      "_note": "Fixture = the user's save (Minisaurus Plain beach, where Rayman has the energy ball). Square at 7400: the ball is at his hand at 7420 (about 365, 212) and flies away (about 351, 162 at 7432). The region checks compare a small box around the ball, so a missing ball shows up as a large difference.",
+      "checks": [
+        {
+          "type": "exit_code",
+          "expect": 0,
+          "label": "run ends by frame budget (no hang, no crash)"
+        }
+      ],
+      "env": {
+        "PS2X_FRAMERATE": "120",
+        "PS2X_RAYMAN_LOGIC_HZ": "25"
+      }
+    },
+    {
+      "name": "shoot_split_ref",
+      "description": "shoot_split's input and shots at the original 25 FPS: the reference pictures (HUD, energy balls) for the in-between pictures (docs/interpolation.md).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_swim\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4700:cross:5,4850:cross:5,5000:cross:5,5150:cross:5,5300:cross:5,5450:cross:5,5600:cross:5,5750:cross:5,5900:cross:5,6050:cross:5,6200:cross:5,6350:cross:5,6500:cross:5,6650:cross:5,6800:cross:5,6950:cross:5,7100:cross:5,7250:cross:5,7400:square:5,7520:square:5,7640:square:5",
+      "frames": 7700,
+      "shots": [
+        7404,
+        7405,
+        7406,
+        7407,
+        7408,
+        7409,
+        7410,
+        7411,
+        7412,
+        7413,
+        7414,
+        7415,
+        7416,
+        7417,
+        7418,
+        7419,
+        7524,
+        7525,
+        7526,
+        7527,
+        7528,
+        7529,
+        7530,
+        7531
+      ],
+      "_note": "Fixture = the user's save (Minisaurus Plain beach, where Rayman has the energy ball). Square at 7400: the ball is at his hand at 7420 (about 365, 212) and flies away (about 351, 162 at 7432). The region checks compare a small box around the ball, so a missing ball shows up as a large difference.",
+      "checks": [
+        {
+          "type": "exit_code",
+          "expect": 0,
+          "label": "run ends by frame budget (no hang, no crash)"
+        }
+      ],
+      "env": {}
+    },
+    {
       "name": "rayman_physics",
       "description": "Load the user's save (Minisaurus Plain beach), skip Murfy's dialogue, then a standing jump, a jump with the helicopter, and 20 s of the stick held: walking on the beach, then swimming on the surface. [rayman-track] every 20 ms for the frame rate comparison (PS2X_FRAMERATE).",
       "renderer": "gpu",

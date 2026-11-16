@@ -60,7 +60,8 @@ namespace ps2x::hud
         std::mutex g_pubMutex;
         Frame g_published;
 
-        uint64_t g_packets = 0, g_frames = 0, g_undecodable = 0, g_lateDraws = 0;
+        uint64_t g_packets = 0, g_frames = 0, g_undecodable = 0, g_lateDraws = 0, g_held = 0;
+        bool g_markDrawOnly = false; // the last markFrame (GS thread): the drawing since then belongs to that frame
 
         // The vertex queue of the primitive being built (GS thread).
         struct QVertex
@@ -366,6 +367,7 @@ namespace ps2x::hud
                 if (flip)
                 {
                     f.batches.clear();
+                    f.drawOnly = g_markDrawOnly; // a new frame: it takes the mark sent before its drawing
                     return;
                 }
             }
@@ -770,6 +772,7 @@ namespace ps2x::hud
         const bool fullWidth = hud.x0 <= 1.0f && hud.x1 >= 511.0f;
         noteDraw(hud.fbp, true);
         Frame &frame = g_targets[hud.fbp];
+        frame.drawOnly = g_markDrawOnly; // the 2D of the frame marked last (markFrame)
         for (Batch &b : hud.batches)
         {
             b.fullWidth = fullWidth;
@@ -861,9 +864,19 @@ namespace ps2x::hud
                              v.u, v.v, v.r, v.g, v.b, v.a);
             }
         }
+        if (copy.drawOnly) // no game logic in that frame: keep the last logic frame's 2D (markFrame)
+        {
+            ++g_held;
+            return;
+        }
         std::lock_guard<std::mutex> lock(g_pubMutex);
         g_published = std::move(copy);
         ++g_frames;
+    }
+
+    void markFrame(bool drawOnly)
+    {
+        g_markDrawOnly = drawOnly;
     }
 
     void latest(Frame &out)
@@ -891,10 +904,11 @@ namespace ps2x::hud
             std::lock_guard<std::mutex> lock(g_texMutex);
             textures = g_textures.size();
         }
-        char line[160];
-        std::snprintf(line, sizeof(line), " | hud packets=%llu frames=%llu textures=%zu kept=%llu late=%llu",
+        char line[192];
+        std::snprintf(line, sizeof(line), " | hud packets=%llu frames=%llu textures=%zu kept=%llu late=%llu held=%llu",
                       static_cast<unsigned long long>(g_packets), static_cast<unsigned long long>(g_frames), textures,
-                      static_cast<unsigned long long>(g_undecodable), static_cast<unsigned long long>(g_lateDraws));
+                      static_cast<unsigned long long>(g_undecodable), static_cast<unsigned long long>(g_lateDraws),
+                      static_cast<unsigned long long>(g_held));
         return line;
     }
 }

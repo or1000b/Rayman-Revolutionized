@@ -1136,6 +1136,13 @@ namespace ps2x::pgs
 
     namespace
     {
+        // A register address no GS register uses (they end at 0x63): carries the HUD layer's frame mark through the
+        // same ordered path as the game's GS writes (ps2xHudFrameMark, gs_hud.h markFrame).
+        constexpr uint32_t kHudFrameMarkReg = 0x7Fu;
+    }
+
+    namespace
+    {
         // ------------------------------------------------------------------ the work itself (under g_mutex)
 
         // Complete GIF packets of one path to paraLLEl-GS (with the bring-up walk, a running capture, experiments).
@@ -1164,6 +1171,11 @@ namespace ps2x::pgs
 
         void writeRegisterNow(uint32_t reg, uint64_t value)
         {
+            if (reg == kHudFrameMarkReg) // not a GS register: the HUD layer's frame mark (ps2xHudFrameMark)
+            {
+                hud::markFrame(value != 0u);
+                return;
+            }
             noteRegister(reg, value); // also delivers SIGNAL / FINISH / LABEL in deterministic synchronous mode
             captureRecord(1u, reg, value, nullptr);
             if (hud::enabled())
