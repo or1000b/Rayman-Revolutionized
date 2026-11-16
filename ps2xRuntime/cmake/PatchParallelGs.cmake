@@ -29,9 +29,11 @@ ps2x_patch_source("${ps2x_parallel_gs_SOURCE_DIR}/gs/gs_util.cpp"
 
 # check_flush_stats submits the pending work every 4096 primitives ("normal 3D games seem to be between 4k and 40k
 # primitives per frame"); Rayman draws ~90k in busy places, so ~20 submissions a frame, each with a frame context
-# advance in Granite. PS2X_PGS_FLUSH_PRIMS sets that count (default 4096, the original), to measure fewer submissions.
+# advance and a driver submit on the GS thread. PS2X_PGS_FLUSH_PRIMS sets that count; default 16384 (2026-11-16, the
+# bridge in the Minisaurus Plain, regular 120: 4096 -> 115-117 FPS, 16384 / 32768 -> ~118, 65536 -> 104-117: the GPU
+# starts too late). Pictures identical.
 ps2x_patch_source("${ps2x_parallel_gs_SOURCE_DIR}/gs/gs_renderer.cpp"
     [==[static constexpr uint32_t MinimumPrimitivesForFlush = 4096;]==]
-    [==[static uint32_t ps2x_flush_prims() { const char *v = getenv("PS2X_PGS_FLUSH_PRIMS"); const unsigned long n = v ? strtoul(v, nullptr, 0) : 0ul; return n >= 256ul && n <= (1ul << 20) ? uint32_t(n) : 4096u; } /* PS2RECOMP-PATCH flush-prims */
+    [==[static uint32_t ps2x_flush_prims() { const char *v = getenv("PS2X_PGS_FLUSH_PRIMS"); const unsigned long n = v ? strtoul(v, nullptr, 0) : 0ul; return n >= 256ul && n <= (1ul << 20) ? uint32_t(n) : 16384u; } /* PS2RECOMP-PATCH flush-prims */
 static const uint32_t MinimumPrimitivesForFlush = ps2x_flush_prims();]==]
     "PS2RECOMP-PATCH flush-prims")

@@ -290,10 +290,17 @@ replaced `shop_exit.input`; the shop recording is back from its kept copy). Stan
 - **VU1 runs cut at 65536 cycles** (CLAUDE.md issue 19): one VU1 run a frame at the bridge was longer than the
   runtime's budget; the native code bailed, the interpreter redid it (~17% of the graphics thread), the rest of the
   program was lost and a wall next to the camera was missing. The budget is now 4194304 (`PS2X_VU1_BUDGET`).
-- Bridge, regular mode: ~100 -> 115-117 FPS; both the graphics and the GS thread are at 100% there now.
-  `PS2X_PGS_FLUSH_PRIMS=16384` (fewer, bigger submissions) gave ~118. Tried and dropped: a ring of reused scanout
-  images in paraLLEl-GS's vsync (the allocations in the profile are Granite freeing each frame context's memory, not
-  those images); `PS2X_GS_QUEUE_MB=32` (no waits left to absorb once the frame contexts were raised; the setting stays).
+- **Fewer submissions**: `PS2X_PGS_FLUSH_PRIMS` (paraLLEl-GS submit threshold, our patch in PatchParallelGs.cmake)
+  default 16384 instead of 4096: 4096 -> 115-117 FPS at the bridge, 16384 / 32768 -> ~118-119, 65536 -> 104-117 (the
+  GPU starts too late). Pictures and VU1 hashes identical. (A patch's new text only reaches an already patched source
+  after `git -C out/game/_deps/ps2x_parallel_gs-src checkout -- <file>`: the patch skips files that hold its marker.)
+- Bridge, regular mode: **~100 -> ~119 FPS**. The GS thread is the limit there now (100%; paraLLEl-GS's per-triangle
+  work ~50%, the driver ~18%, our HUD layer ~5%); the graphics thread waits for it ~8% of the time. Shop and Fairy
+  Glade stay at 120 (shop: GS thread ~77%, graphics ~76%).
+- Tried and dropped: a ring of reused scanout images in paraLLEl-GS's vsync (the allocations in the profile are
+  Granite freeing each frame context's memory, not those images); `/arch:AVX2` for paraLLEl-GS (bridge 113-117 FPS
+  instead of 118-119); `PS2X_GS_QUEUE_MB=32` (no waits left to absorb once the frame contexts were raised; the
+  setting stays).
 
 ## Frame-rate bugs in the game's scripts (2026-11-15)
 
