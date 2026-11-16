@@ -16,6 +16,8 @@
       "input": "600:start:10",
       "frames": 1500,
       "shots": [590, 1400],
+      "env": { "PS2X_PGS_GIF_STATS": "1" },
+      "_note": "PS2X_PGS_GIF_STATS: the GS bridge's register walk, which the [pgs-gif] anomaly check needs (off by default since 2026-11-16).",
       "checks": [
         { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
         { "type": "vu1_hash", "golden": "boot_to_language_menu.vu1hash", "label": "VU1 sent the GS the same bytes as the reference (hash every 600 VSyncs)" },

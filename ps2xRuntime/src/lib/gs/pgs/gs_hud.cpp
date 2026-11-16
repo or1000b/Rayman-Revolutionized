@@ -46,6 +46,12 @@ namespace ps2x::hud
         uint32_t g_clut[256] = {};
         bool g_clutValid = false;
         uint32_t g_clutId = 0;
+        // The last CLUT load decoded (tex0Written). Busy scenes reload the same CLUT ~136,000 times a second; rebuilding
+        // the table each time was ~11% of the GS thread, and the new id made the decoded-texture memo miss (2026-11-16).
+        struct ClutLoad
+        {
+            uint32_t uploadId = 0, cbp = 0, psm = 0, csa = 0;
+        } g_lastClut;
 
         // Decode inputs -> texture key, and the decoded textures (read by the window thread).
         std::unordered_map<uint64_t, uint64_t> g_texMemo;
@@ -198,10 +204,16 @@ namespace ps2x::hud
             const uint32_t csa = static_cast<uint32_t>((v >> 56) & 0x1Fu);
             if (psm != 0x13u && psm != 0x14u)
                 return; // not an indexed texture: the CLUT is not used
+            const auto it = g_uploads.find(cbp);
+            const bool decodable = it != g_uploads.end() && cpsm == 0u && csm == 0u && it->second.psm == 0x00u;
+            const ClutLoad load{decodable ? it->second.id : 0u, cbp, psm, psm == 0x14u ? csa : 0u};
+            if (decodable && g_clutValid && load.uploadId == g_lastClut.uploadId && load.cbp == g_lastClut.cbp &&
+                load.psm == g_lastClut.psm && load.csa == g_lastClut.csa)
+                return; // the same CLUT as the last load: the table and its id stay as they are
             ++g_clutId;
             g_clutValid = false;
-            const auto it = g_uploads.find(cbp);
-            if (it == g_uploads.end() || cpsm != 0u || csm != 0u || it->second.psm != 0x00u)
+            g_lastClut = ClutLoad{};
+            if (!decodable)
                 return;
             const Upload &u = it->second;
             if (psm == 0x13u)
@@ -223,6 +235,7 @@ namespace ps2x::hud
                     g_clut[(csa * 16u + i) & 255u] = clutEntry(u, i & 7u, i >> 3);
             }
             g_clutValid = true;
+            g_lastClut = load;
         }
 
         // The current TEX0 as a decoded texture's key (0 = cannot decode it).

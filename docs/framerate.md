@@ -250,6 +250,23 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
   - A RAM store is now ~9 inline instructions and no call; the test function grew 3064 -> 3172 instructions.
   - `shop_walk_split` at the busy spot: **89 -> ~112 FPS (+26%)**. Now the graphics thread is the limit (100% busy, the
     game waits for room in its queue ~2500 times per 2 s) with the GS thread at 95%.
+- **Graphics and GS threads** (same day; `PS2X_NATIVE_PROF_THREAD=GfxThread` / `GsThread`, the GS thread now has a
+  name; `PS2X_NATIVE_PROF_CHAIN` for the heap and lock callers):
+  - GS thread: ~30% was our own code. The bring-up walk over every packet's registers and vertices (`analyzeGif`,
+    `noteVertex`, `coverFrom`, ~17%) now runs only with `PS2X_PGS_GIF_STATS=1`, the synchronous bridge (it delivers
+    SIGNAL / FINISH / LABEL there) or one of its bug-hunt variables; the `gifstats` counts are 0 without it (packets
+    and the `gif=` bytes are still counted). `boot_to_language_menu` sets it for its `[pgs-gif] anomaly` check. The
+    HUD layer rebuilt its 256-entry CLUT table at every CLUT load (~136,000 a second there, `hud::tex0Written` ~11%)
+    and gave each load a new id, so the decoded-texture memo missed too: an identical reload (same upload, CBP, PSM,
+    CSA) now changes nothing. GS thread 95% -> 72%.
+  - Graphics thread: the GIF arbiter allocated a vector per packet and freed it after the drain (~5% in malloc /
+    free); drained buffers now go to a per-thread pool (`ps2_gif_arbiter.cpp`; its header is protected). `kickQword`
+    wrapped every XGKICK qword's address with `%` (a division); `vu1aot::wrapData` masks (VU data memory is a power
+    of two). Rebuilding the VU programs takes ~24 minutes.
+  - `shop_walk_split` busy spot: ~112 -> ~113 (GS fixes; the graphics thread still at 100%) -> **~118** (graphics
+    thread fixes). Still the limit there: the graphics thread (VU1 programs ~50%: `prog_6af8ebd05633`,
+    `prog_4ead7b35a3a6`; VIF unpack ~6%; three locks per packet on the way to the GS ~5%). docs/vu1_aot.md: a real
+    gain in the programs needs the VF registers in SSE locals across a block.
 
 ## Frame-rate bugs in the game's scripts (2026-11-15)
 

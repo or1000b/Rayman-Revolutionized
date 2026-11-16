@@ -100,11 +100,18 @@ namespace vu1aot
 
     // ---------------------------------------------------------------- XGKICK
 
+    // An address in data memory, wrapped. VU data memory is a power of two (16 / 4 KiB): a mask instead of the
+    // division of `%` (kickQword ran it per qword of every XGKICK: ~5% of the graphics thread, 2026-11-16).
+    inline uint32_t wrapData(const Ctx &c, uint32_t address)
+    {
+        return (c.dataSize & (c.dataSize - 1u)) == 0u ? (address & (c.dataSize - 1u)) : (address % c.dataSize);
+    }
+
     VU1AOT_INLINE void kickStart(Ctx &c, uint32_t qwordAddress)
     {
         c.kick = {};
         c.kick.active = true;
-        c.kick.source = (qwordAddress * 16u) % c.dataSize;
+        c.kick.source = wrapData(c, qwordAddress * 16u);
         c.kick.credit = 1u; // XGKICK's issue cycle counts toward PATH1 (startXgkick)
     }
 
@@ -116,12 +123,12 @@ namespace vu1aot
         if (k.copied > 0x10000u - 16u)
             return false;
         const uint32_t qwordOffset = k.copied;
-        const uint32_t firstSource = (k.source + k.copied) % c.dataSize;
+        const uint32_t firstSource = wrapData(c, k.source + k.copied);
         if (firstSource + 16u <= c.dataSize)
             std::memcpy(c.kickBuf + k.copied, c.data + firstSource, 16u);
         else
             for (uint32_t i = 0; i < 16u; ++i)
-                c.kickBuf[k.copied + i] = c.data[(k.source + k.copied + i) % c.dataSize];
+                c.kickBuf[k.copied + i] = c.data[wrapData(c, k.source + k.copied + i)];
         k.copied += 16u;
         if (k.tagEnd == 0u)
         {

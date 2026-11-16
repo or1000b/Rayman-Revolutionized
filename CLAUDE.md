@@ -93,10 +93,11 @@
 
 ## Diagnostics already built in
 - `[threads]` line every 120 ticks in `out\run.log`: per-thread state, gameFps, DMA/GIF counts, GS or pgs stats, spu2 stats, `iopcd reads/sectors/host/fail`, and `iop->ee posted/done/pending`. The pgs part includes PMODE/SMODE2/DISPFB/DISPLAY.
+  - Speed (2026-11-16, docs/framerate.md "Where 120 still drops"): `gsthread ... busy=N%` and `gfx busy=N% full=M` (share of real time the GS / graphics thread worked; 100% = the limit). `PS2X_FPS_LOG=<ms>` adds `[fps]` lines. The `gifstats` counts (kicks, prims, tex0, clut, uploads) are 0 unless `PS2X_PGS_GIF_STATS=1` (the bring-up walk cost ~17% of the GS thread). Profile a thread with `PS2X_NATIVE_PROF=<from,to> PS2X_NATIVE_PROF_THREAD=GameThread|GfxThread|GsThread`, and use `run_tests -NoKickHash` for speed numbers (the VU1 kick hash costs ~10% of the graphics thread).
 - `[prof] last 10s`: time split VU1/GS/IOP/idle plus the hottest EE functions.
 - First bad indirect branch: a `[guest-branch:missing-target]` line, a `[guest-branch:regs]` line, and a dump of the whole 32 MiB of EE RAM to `out\crash_ee_ram.bin`.
   - Analysis tip: walk the stack in the dump and match saved registers to function prologues.
-- `out\pgs_frame.bmp`: a GPU frame about every 5 s. Look at it instead of asking the user to describe the screen.
+- `out\pgs_frame.bmp`: a GPU frame about every 5 s (written by the window thread). Look at it instead of asking the user to describe the screen.
 - F11 in game: one frame of GS commands to `out\gscapture.bin`.
 - `[rayman-ai] NULL behaviour tree ...`: logged by the 0x1DF7F0 guard.
 - **Hang watchdog** (`ps2_test_harness.cpp`, always on, `PS2X_WATCHDOG_SEC`, default 15): when the window thread draws no frame for that long, every thread's native stack is written to the log as `[watchdog]` lines (function names + file:line from the PDB). Read the `GameThread` and main-thread stacks first.

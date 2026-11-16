@@ -870,8 +870,29 @@ namespace ps2x::pgs
             }
         }
 
+        // PS2X_PGS_GIF_STATS=1: the bring-up walk over every GIF packet's registers and vertices (the register shadow,
+        // the kicks / prims / tex0 / clut / uploads counts of the gifstats line, the [pgs-gif] anomaly, cover, upload
+        // and big primitive reports). It was ~17% of the GS thread in busy scenes (2026-11-16), so without the variable
+        // it runs only with the synchronous bridge (PS2X_GS_THREAD=0: deterministic SIGNAL / FINISH / LABEL delivery
+        // reads the registers there) or when one of its bug-hunt options is set. Packets and qwords are always counted.
+        bool gifWalkWanted()
+        {
+            static const bool asked = []
+            {
+                if (const char *value = std::getenv("PS2X_PGS_GIF_STATS"); value && *value)
+                    return std::atoi(value) != 0;
+                for (const char *name : {"PS2X_PGS_TRACE", "PS2X_PGS_COVER_FROM", "PS2X_PGS_BIGPRIM", "PS2X_PGS_WATCH_LO",
+                                         "PS2X_PGS_WATCH_HI"})
+                    if (std::getenv(name))
+                        return true;
+                return false;
+            }();
+            return asked || !g_threaded;
+        }
+
         void analyzeGif(const uint8_t *data, size_t bytes)
         {
+            const bool walk = gifWalkWanted();
             size_t offset = 0u;
             while (bytes - offset >= 16u)
             {
@@ -883,6 +904,11 @@ namespace ps2x::pgs
                     break;
                 ++g_frameStats.packets;
                 g_frameStats.qwords += packetBytes / 16u;
+                if (!walk)
+                {
+                    offset += packetBytes;
+                    continue;
+                }
                 const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
                 const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
                 uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
