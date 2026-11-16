@@ -262,7 +262,7 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
   - Graphics thread: the GIF arbiter allocated a vector per packet and freed it after the drain (~5% in malloc /
     free); drained buffers now go to a per-thread pool (`ps2_gif_arbiter.cpp`; its header is protected). `kickQword`
     wrapped every XGKICK qword's address with `%` (a division); `vu1aot::wrapData` masks (VU data memory is a power
-    of two). Rebuilding the VU programs takes ~24 minutes.
+    of two). Rebuilding the VU programs took ~24 minutes then (~13 after the generator work below).
   - `shop_walk_split` busy spot: ~112 -> ~113 (GS fixes; the graphics thread still at 100%) -> **~118** (graphics
     thread fixes). Still the limit there: the graphics thread (VU1 programs ~50%: `prog_6af8ebd05633`,
     `prog_4ead7b35a3a6`; VIF unpack ~6%; three locks per packet on the way to the GS ~5%). docs/vu1_aot.md: a real

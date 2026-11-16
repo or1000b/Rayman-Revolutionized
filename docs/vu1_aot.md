@@ -283,3 +283,5 @@ code per image: from the profiled entries, following branches and the profiled J
 - Busy spot (`-NoKickHash`, 120 FPS both modes): graphics thread 92-94% -> 75-77% busy; the GS thread (~80-85%) is
   now the busiest of the three.
 - Diff mode (the same 5 scenarios): 7.95 million VU1 and 3.87 million VU0 runs compared, 0 differences.
+- Full run_tests (native, with the kick hash): Overall PASS, every VU1 hash, picture and `[det]` fingerprint as
+  before; `glade_split_hd` / `shop_walk_split` hold 120.0 even with the kick hash on (was 110 with it).
