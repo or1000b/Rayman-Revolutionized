@@ -12,6 +12,26 @@
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
+#include <atomic>
+#include <chrono>
+
+// Time the EE (game) thread slept in the scheduler waiting for the next VBlank / timer deadline: idle time. The
+// `[threads]` line turns it into `game busy=N%` (ps2_runtime.cpp), next to the GS and graphics threads' busy shares.
+static std::atomic<uint64_t> g_eeIdleNs{0};
+extern "C" uint64_t ps2xGameIdleNs() { return g_eeIdleNs.load(std::memory_order_relaxed); }
+namespace
+{
+    struct EeIdleScope
+    {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~EeIdleScope()
+        {
+            g_eeIdleNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start).count()),
+                                 std::memory_order_relaxed);
+        }
+    };
+}
 
 // Scheduler-level dispatches (thread, invocation depth, pc/ra/sp/v0/a1), oldest first: shows thread switches and
 // interrupt handlers between two points of a guest function. Used by game bug hunts (main.cpp).
@@ -2128,9 +2148,12 @@ void EeScheduler::processDueDeadlines()
                 if (std::chrono::steady_clock::now() < best->hostDeadline)
                 {
                     const auto pace = best->hostDeadline;
-                    m_eventCv.wait_until(lock, pace, [this]()
-                                         { return !m_events.empty() ||
-                                                  m_stopRequested.load(std::memory_order_acquire); });
+                    {
+                        EeIdleScope idle;
+                        m_eventCv.wait_until(lock, pace, [this]()
+                                             { return !m_events.empty() ||
+                                                      m_stopRequested.load(std::memory_order_acquire); });
+                    }
                     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                     {
                         updateNextDeadline();
@@ -2182,9 +2205,12 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
-                m_eventCv.wait_until(lock, pacingDeadline, [this]()
-                                     { return !m_events.empty() ||
-                                              m_stopRequested.load(std::memory_order_acquire); });
+                {
+                    EeIdleScope idle;
+                    m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                         { return !m_events.empty() ||
+                                                  m_stopRequested.load(std::memory_order_acquire); });
+                }
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
@@ -2478,9 +2504,13 @@ void EeScheduler::waitForEvent()
         }
     }
 
-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
-                                               { return !m_events.empty() ||
-                                                        m_stopRequested.load(std::memory_order_acquire); });
+    bool signaled;
+    {
+        EeIdleScope idle;
+        signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+                                        { return !m_events.empty() ||
+                                                 m_stopRequested.load(std::memory_order_acquire); });
+    }
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

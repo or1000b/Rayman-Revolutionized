@@ -42,6 +42,7 @@ extern "C" void ps2xRequestGsCapture();         // gs_cpu_backend.cpp
 extern "C" void ps2xRequestVu1Capture();        // ps2_vu1_core.cpp: F11, every VU1 run of the next VSyncs
 extern "C" void ps2xRequestEeDump();            // ps2_test_harness.cpp: F11, EE RAM at the next VSync
 extern "C" int ps2xGfxStatsLine(char *out, int size); // ps2_gfx_thread.inc: graphics thread busy %
+extern "C" uint64_t ps2xGameIdleNs(); // EeScheduler.cpp: time the game thread slept waiting for VBlank
 extern "C" uint64_t ps2xGuestDisplayFlips();       // EeScheduler.cpp: display flips counted at guest VBlanks
 extern "C" uint32_t ps2xVBlankRateOverrideHz();    // EeScheduler.cpp: PS2X_FRAMERATE (0 = unset)
 extern "C" int ps2xGsStatsLine(char *buffer, int size);
@@ -3355,6 +3356,22 @@ void PS2Runtime::run()
                 char gfxStats[96];
                 if (ps2xGfxStatsLine(gfxStats, static_cast<int>(sizeof(gfxStats))) > 0)
                     threadLine << " | " << gfxStats;
+                {
+                    // The game thread's busy share since the last line: real time minus its sleep waiting for the
+                    // next VBlank (2026-11-17: dips where neither the GS nor the graphics thread was at 100%).
+                    static uint64_t s_lastIdleNs = ps2xGameIdleNs();
+                    static auto s_lastLine = std::chrono::steady_clock::now();
+                    const uint64_t idleNs = ps2xGameIdleNs();
+                    const auto lineNow = std::chrono::steady_clock::now();
+                    const double spanNs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(lineNow - s_lastLine).count());
+                    if (spanNs > 0.0)
+                    {
+                        const double busy = 100.0 * (1.0 - static_cast<double>(idleNs - s_lastIdleNs) / spanNs);
+                        threadLine << " | game busy=" << static_cast<int>(std::clamp(busy, 0.0, 100.0) + 0.5) << "%";
+                    }
+                    s_lastIdleNs = idleNs;
+                    s_lastLine = lineNow;
+                }
                 char soundStats[320];
                 if (ps2xSpu2StatsLine(soundStats, static_cast<int>(sizeof(soundStats))) > 0)
                     threadLine << " | " << soundStats;
