@@ -20,6 +20,11 @@ cycle the interpreter makes them (flags in issue order, then Q, then P). What th
 XGKICK while the previous packet is still transferring, a JR target the profile never saw, the cycle budget) makes
 the native run give up ("bail"): the dispatcher undoes it and the interpreter runs the whole program.
 
+Cycles are counted in a local (`cyc`) only. The XGKICK transfer is brought up to the current cycle where its
+progress can matter (kickSync: before a store into data memory, at an XGKICK, at the end of the run), and the cycle
+budget is checked exactly at the run's last pair (the count only grows, so that check covers every earlier one) and
+loosely at every taken branch (loops; a bail there only means the interpreter redoes the run).
+
 By default the programs are flag-free: no MAC / status flags (the FMAC family on SSE, ops::fmacNf), valid only
 when no instruction of the code image reads them (the interpreter's macStatusUnread; Rayman's VU1 code never does).
 The dispatcher runs them only then (Program::flagsFree). --with-flags generates code for both cases instead.
@@ -229,6 +234,24 @@ def is_branch(p):
     return lower_class(p) in ('b', 'jr', 'bcond')
 
 
+def stores_data(p):
+    """Whether the lower instruction writes VU data memory (SQ ISW SQI SQD ISWR: every storeQword of lowerPlain)."""
+    if p.ibit:
+        return False
+    lo = p.lower
+    op = lo >> 25 & 0x7f
+    if op in (0x01, 0x05):
+        return True
+    if op == 0x40 and (lo & 0x3f) >= 0x3c:
+        return ((lo & 3) | ((lo >> 4) & 0x7c)) in (0x35, 0x37, 0x3f)
+    return False
+
+
+def loop_check(pc):
+    """The budget check of a taken branch: bounds loops (cycle counts only grow; the exact check is at the end)."""
+    return 'if (cyc >= budget) { c.bail = BailBudget; c.bailPc = 0x%x; return false; }' % pc
+
+
 # ---------------------------------------------------------------- timing state
 
 class State:
@@ -406,15 +429,19 @@ class Gen:
             self.emit(ind + 'if (%s) { c.bail = BailUnsupported; c.bailPc = 0x%x; return false; }' % (cond, pc))
         st = st.copy()
         s = 0 if kicked else stall_for(st, p)
-        if not kicked:
-            # Budget: the interpreter stops at the loop top (cycle >= budget) or when the stall reaches it.
+        if not kicked and ctl[0] == 'e':
+            # Budget: the interpreter stops at the loop top (cycle >= budget) or when the stall reaches it. The cycle
+            # count only grows, so this check of the run's last pair (the E-bit's slot) covers every earlier pair's:
+            # a run that gets here passed them all. Taken branches check loosely (loop_check), to end long loops.
             self.emit(ind + 'if (cyc + %d >= budget) { c.bail = BailBudget; c.bailPc = 0x%x; return false; }' % (s, pc))
         commits = []
         for _ in range(s):
             commits += tick(st)
         self.emit_commits(commits, ind)
         if s:
-            self.emit(ind + 'if (!advanceLocal(c, cyc, %d)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % (s, pc))
+            self.emit(ind + 'cyc += %d;' % s)
+        if not kicked and (lc == 'xgkick' or stores_data(p)):
+            self.emit(ind + 'if (!kickSync(c, cyc, kc)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % pc)
         if lc == 'xgkick' and not kicked:
             # XGKICK waits until the previous packet has gone (calculatePairReadyCycle: cycle + 1 while PATH1 is
             # busy, re-checked every cycle). The wait is data-dependent: count it, then continue in the block made
@@ -425,6 +452,7 @@ class Gen:
             self.emit(ind + 'uint32_t ex = 0;')
             self.emit(ind + 'while (c.kick.active) { if (cyc + 1 >= budget) { c.bail = BailBudget; c.bailPc = 0x%x; return false; }'
                       ' if (!advanceLocal(c, cyc, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; } ++ex; }' % (pc, pc))
+            self.emit(ind + 'kc = cyc;')
             self.emit(ind + 'switch (ex) {')
             sim = st.copy()
             landed = []  # commits of the extra cycles so far, in time order (each case jumps away: no fall-through)
@@ -497,7 +525,7 @@ class Gen:
             self.emit(ind + '{ uint32_t lat; efu(c, 0x%08xu, c.pendingP[%d], lat); }' % (lo, slot))
         elif lc == 'xgkick':
             vis = lo >> 11 & 0xf
-            self.emit(ind + 'kickStart(c, static_cast<uint32_t>(static_cast<uint16_t>(s.vi[%d])));' % vis)
+            self.emit(ind + 'kickStart(c, static_cast<uint32_t>(static_cast<uint16_t>(s.vi[%d]))); kc = cyc;' % vis)
         elif lc == 'fsset':
             imm12 = (((lo >> 21) & 1) << 11) | (lo & 0x7ff)
             slot = free_slot(used, 8)
@@ -597,13 +625,14 @@ class Gen:
         # advanceOneCycle.
         commits = tick(st)
         self.emit_commits(commits, ind)
-        self.emit(ind + 'if (!advanceLocal(c, cyc, 1)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % pc)
+        self.emit(ind + 'cyc += 1;')
 
         # Where the run goes next.
         if ctl[0] == 'e':
             self.gen_end(ind, pc + 8, st)
             return
         if nested:
+            self.emit(ind + loop_check(pc))
             # A branch in the delay slot of a taken branch (the interpreter's inTakenDelaySlot, PCSX2 takedelaybranch;
             # Rayman's VU0 collision: 0x0718 IBEQ with B 0x0438 in its delay slot): the first branch's target pair
             # runs as this branch's delay slot, then this branch's target. This branch not taken: the first target
@@ -629,16 +658,18 @@ class Gen:
                 self.bails['BailJrTarget(default)'] += 1
             return
         if ctl[0] == 'b':
+            self.emit(ind + loop_check(pc))
             self.emit(ind + 's.branchTarget = 0x%xu;' % ctl[1])
             self.emit(ind + 'goto %s;' % self.node(ctl[1], st, ('',)))
             return
         if ctl[0] == 'bc':
             t = self.node(ctl[1], st, ('',))
             f = self.node(ctl[2], st, ('',))
-            self.emit(ind + 'if (br) { s.branchTarget = 0x%xu; goto %s; } else goto %s;' % (ctl[1], t, f))
+            self.emit(ind + 'if (br) { %s s.branchTarget = 0x%xu; goto %s; } else goto %s;' % (loop_check(pc), ctl[1], t, f))
             return
         if ctl[0] == 'jr':
             targets = sorted(self.jr.get(ctl[1], ()))
+            self.emit(ind + loop_check(pc))
             self.emit(ind + 's.branchTarget = jt;')
             self.emit(ind + 'switch (jt) {')
             for t in targets:
@@ -671,6 +702,7 @@ class Gen:
         sim = st.copy()
         for _ in range(rem_live):
             self.emit_commits(tick(sim), ind)
+        self.emit(ind + 'if (!kickSync(c, cyc, kc)) { c.bail = BailKickError; c.bailPc = 0x%x; return false; }' % next_pc)
         if self.nf:
             self.emit(ind + '{ const uint32_t fl = %du;' % rem_dead)
         else:
@@ -804,7 +836,8 @@ def main():
                   '    VU1State &s = c.s;', '    uint64_t cyc = c.cycles; // cycles of this run, in a register; stored when returning',
                   '    const uint64_t budget = c.budget;', '    FlagResult fr;', '    bool clipQ = false;', '    uint32_t clipV = 0;',
                   '    int32_t bk = 0;', '    bool br = false;', '    uint32_t jt = 0;',
-                  '    (void)clipQ; (void)clipV; (void)bk; (void)br; (void)jt;', '    switch (entry)', '    {']
+                  '    uint64_t kc = cyc; // the cycle the XGKICK transfer was brought to (kickSync); none runs at entry',
+                  '    (void)clipQ; (void)clipV; (void)bk; (void)br; (void)jt; (void)kc;', '    switch (entry)', '    {']
         for e, n in sorted(starts.items()):
             lines.append('    case 0x%x: goto %s;' % (e, n))
         lines += ['    default: return false;', '    }']

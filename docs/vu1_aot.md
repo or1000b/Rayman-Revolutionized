@@ -238,3 +238,28 @@ code per image: from the profiled entries, following branches and the profiled J
 - Where VU1 time goes now (glade_explore at 60 FPS, game thread): 4ead7b35a3a6 14.5%, 6af8ebd05633 3.6%, the VU0
   collision e09ad6f75847 2.8%, kickQword 2%, lowerPlain 1.5%; idle 34%. The rest is the work of each pair (VF
   registers live in Ctx memory); a real gain needs registers kept in SSE locals across a block.
+
+## Speed at 120 FPS: checks only where they matter (2026-11-16)
+
+- At the busy spot by the ability shop (scenario `shop_walk_split`, 120 FPS with in-between pictures) the graphics
+  thread was the limit (100% busy, ~118 FPS). Its profile (`PS2X_NATIVE_PROF_THREAD=GfxThread`): the generated
+  programs ~57% (6af8ebd05633 25%, 4ead7b35a3a6 20%, c110bb6d5b85 7%), kickQword 5%. The program time was spread
+  over all their code (hottest address 0.3-0.6%; the by-line table put 18% on one line of 4ead7b35a3a6, which is
+  MSVC's line info in a huge function, not real): the cost was the work around every pair. The compiled code had per
+  pair a budget compare, a load of `c.kick.active` and `cyc` spilled to the stack.
+- Now cycles are counted in the local `cyc` only, and the XGKICK transfer is brought up to the current cycle
+  (`kickSync`, vu1aot.h) only where its progress can matter: before a store into data memory (SQ ISW SQI SQD ISWR),
+  at an XGKICK and at the end of the run. Nothing between two such points writes data memory or looks at the transfer,
+  so the same qwords are copied from the same memory. Inside a GIF tag's data the qwords go in one copy (`kickRun`).
+- The cycle budget is checked exactly at the run's last pair (the E-bit slot): the count only grows, so that check
+  covers every earlier pair's (a run that gets there passed them all). Taken branches check loosely
+  (`cyc >= budget`) so loops end; a bail there only means the interpreter redoes the run.
+- Program 6af8ebd05633: 22000 -> 13250 instructions; the generated sources are half the size, and the VU build takes
+  13 min instead of ~24.
+- Diff mode (shoot_minisaurus, swim_tutorial, glade_explore, shop_walk_split, intro_to_first_level): 7.95 million VU1
+  and 3.87 million VU0 runs compared, 0 differences (the intro's 5 budget bails as before). The two 120 FPS
+  scenarios end by the time limit in diff mode (every run twice); their `[det]` fingerprints were identical as far as
+  they ran.
+- Busy spot (`-NoKickHash`): smooth ~118 -> ~120 FPS (the cap), plain 120 ~116 -> ~120; graphics thread 100% ->
+  92-94% busy, the game thread no longer waits for it (room waits ~2600 per second -> 0). The GS thread (~86%) is
+  next.

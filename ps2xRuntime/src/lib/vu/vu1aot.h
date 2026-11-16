@@ -12,6 +12,7 @@
 #include "runtime/ps2_vu1.h"
 #include "ps2_vu1_detail.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -187,6 +188,48 @@ namespace vu1aot
                 return false;
         }
         return true;
+    }
+
+    // PATH1 qwords while the credit lasts (one per 2 credits). Inside a GIF tag's data every qword but the tag's last
+    // goes in one copy: kickQword would only copy them (no tag to read, no end to handle; tagEnd <= 64 KiB, so no
+    // overflow check can fail there). The tag, the last qword and a source that wraps go one by one.
+    inline bool kickRun(Ctx &c)
+    {
+        Kick &k = c.kick;
+        while (k.active && k.credit >= 2u)
+        {
+            if (k.tagEnd != 0u && k.tagEnd - k.copied > 32u)
+            {
+                const uint32_t source = wrapData(c, k.source + k.copied);
+                uint32_t n = std::min(k.credit / 2u, (k.tagEnd - k.copied) / 16u - 1u);
+                n = std::min(n, (c.dataSize - source) / 16u);
+                if (n != 0u)
+                {
+                    std::memcpy(c.kickBuf + k.copied, c.data + source, n * 16u);
+                    k.copied += n * 16u;
+                    k.credit -= n * 2u;
+                    continue;
+                }
+            }
+            k.credit -= 2u;
+            if (!kickQword(c))
+                return false;
+        }
+        return true;
+    }
+
+    // The generated code counts cycles in a local only (`cyc`) and brings the XGKICK transfer up to that cycle where
+    // its progress can matter: before a store into data memory, at an XGKICK and at the end of the run (`kc`: the
+    // cycle it was brought to last). The same qwords from the same memory as advancing it every cycle (advance):
+    // nothing between two such points writes data memory or looks at the transfer.
+    VU1AOT_INLINE bool kickSync(Ctx &c, uint64_t cyc, uint64_t &kc)
+    {
+        const uint64_t n = cyc - kc;
+        kc = cyc;
+        if (!c.kick.active)
+            return true;
+        c.kick.credit += static_cast<uint32_t>(n);
+        return c.kick.credit < 2u || kickRun(c);
     }
 
     // ---------------------------------------------------------------- commits (commitReadyPipelines)
