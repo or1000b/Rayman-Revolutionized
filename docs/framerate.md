@@ -234,6 +234,22 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
   `isSpecialAddress`, `sub_0022E7B8` all point at +0x2628xx-0x2629xx), `dispatchGuestBranch` ~7% plus a neighbour
   shown as `reportMissingFunction` ~3.5%, locks ~4%, heap ~3%, vector copies ~4%. A 120 there needs about a quarter
   less game thread time per frame.
+- **Memory helpers inlined** (2026-11-16, the user allowed the protected headers: `ps2_runtime_macros.h`,
+  `ps2_runtime.h`, `runtime/ps2_address.h`; one full rebuild, 10 minutes). The disassembly showed every guest load /
+  store as two calls (`PS2Runtime::isSpecialAddress`, then `Ps2FastRead32` & co.), even single-instruction helpers like
+  `Ps2ExtractEpi32` out of line, and `READ*` as `[&]` lambdas: capturing rdram / ctx / runtime by reference takes their
+  address, so the whole generated function kept `ctx` in memory and reloaded it before almost every instruction. MSVC
+  did not inline them even in a 930-line function compiled alone (`/O2 /Ob2`), so now:
+  - `PS2_FORCE_INLINE` (`__forceinline`) on the address check, the RAM accesses, the lane helpers and
+    `Ps2SetGprLow64`; `READ*` call force-inlined functions that take the pointers by value;
+  - the address check starts with one test that covers main RAM through all its views (`addr < 0xC0000000 &&
+    (addr & 0x1FFFFFFF) < 32 MiB`: kuseg, the uncached 0x20000000 / 0x30000000 mirrors, kseg0 / kseg1; every special
+    range is at 32 MiB or above in the low 29 bits), the rest of the check is out of line
+    (`Ps2IsSpecialAddressOutsideRam`), as is the byte-wise wrap of an access that runs past the end of RAM
+    (`Ps2FastReadWrapped` / `Ps2FastWriteWrapped`; aligned accesses never do).
+  - A RAM store is now ~9 inline instructions and no call; the test function grew 3064 -> 3172 instructions.
+  - `shop_walk_split` at the busy spot: **89 -> ~112 FPS (+26%)**. Now the graphics thread is the limit (100% busy, the
+    game waits for room in its queue ~2500 times per 2 s) with the GS thread at 95%.
 
 ## Frame-rate bugs in the game's scripts (2026-11-15)
 

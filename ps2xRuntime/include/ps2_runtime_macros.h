@@ -14,7 +14,7 @@
 
 #include "ps2_runtime.h"
 
-static inline int32_t Ps2ExtractEpi32(__m128i v, int index)
+static PS2_FORCE_INLINE int32_t Ps2ExtractEpi32(__m128i v, int index)
 {
     switch (index & 3)
     {
@@ -29,7 +29,7 @@ static inline int32_t Ps2ExtractEpi32(__m128i v, int index)
     }
 }
 
-static inline int64_t Ps2ExtractEpi64(__m128i v, int index)
+static PS2_FORCE_INLINE int64_t Ps2ExtractEpi64(__m128i v, int index)
 {
     if ((index & 1) == 0)
     {
@@ -41,17 +41,17 @@ static inline int64_t Ps2ExtractEpi64(__m128i v, int index)
     }
 }
 
-static inline uint32_t ps2_clz32(uint32_t x)
+static PS2_FORCE_INLINE uint32_t ps2_clz32(uint32_t x)
 {
     return static_cast<uint32_t>(std::countl_zero(x));
 }
 
-static inline uint64_t Ps2HiLoToU64(uint64_t hi, uint64_t lo)
+static PS2_FORCE_INLINE uint64_t Ps2HiLoToU64(uint64_t hi, uint64_t lo)
 {
     return ((hi & 0xFFFFFFFFull) << 32) | (lo & 0xFFFFFFFFull);
 }
 
-static inline uint64_t Ps2SignExt32ToU64(uint32_t v)
+static PS2_FORCE_INLINE uint64_t Ps2SignExt32ToU64(uint32_t v)
 {
     return (uint64_t)(int64_t)(int32_t)v;
 }
@@ -381,164 +381,78 @@ inline __m128 ps2_vmul(__m128 a, __m128 b)
 // Fast path: Direct RDRAM access (masked).
 // Slow path: Full runtime->Load/Store
 
-static inline bool Ps2FastRangeIsContiguous(uint32_t offset, uint32_t bytes)
+static PS2_FORCE_INLINE bool Ps2FastRangeIsContiguous(uint32_t offset, uint32_t bytes)
 {
     return offset <= (PS2_RAM_SIZE - bytes);
 }
 
-static inline uint8_t Ps2FastRead8(const uint8_t *rdram, uint32_t addr)
+// The rare access that runs past the end of RAM wraps byte by byte (out of line: it would only grow every access).
+template <typename T>
+PS2_NOINLINE T Ps2FastReadWrapped(const uint8_t *rdram, uint32_t offset)
+{
+    alignas(16) uint8_t wrapped[sizeof(T)];
+    for (uint32_t i = 0; i < sizeof(T); ++i)
+    {
+        wrapped[i] = rdram[(offset + i) & PS2_RAM_MASK];
+    }
+    T value;
+    std::memcpy(&value, wrapped, sizeof(T));
+    return value;
+}
+
+template <typename T>
+PS2_NOINLINE void Ps2FastWriteWrapped(uint8_t *rdram, uint32_t offset, T value)
+{
+    alignas(16) uint8_t wrapped[sizeof(T)];
+    std::memcpy(wrapped, &value, sizeof(T));
+    for (uint32_t i = 0; i < sizeof(T); ++i)
+    {
+        rdram[(offset + i) & PS2_RAM_MASK] = wrapped[i];
+    }
+}
+
+template <typename T>
+static PS2_FORCE_INLINE T Ps2FastReadT(const uint8_t *rdram, uint32_t addr)
+{
+    const uint32_t offset = addr & PS2_RAM_MASK;
+    if (!Ps2FastRangeIsContiguous(offset, sizeof(T))) [[unlikely]]
+        return Ps2FastReadWrapped<T>(rdram, offset);
+    T value;
+    std::memcpy(&value, rdram + offset, sizeof(T));
+    return value;
+}
+
+template <typename T>
+static PS2_FORCE_INLINE void Ps2FastWriteT(uint8_t *rdram, uint32_t addr, T value)
+{
+    const uint32_t offset = addr & PS2_RAM_MASK;
+    if (!Ps2FastRangeIsContiguous(offset, sizeof(T))) [[unlikely]]
+    {
+        Ps2FastWriteWrapped<T>(rdram, offset, value);
+        return;
+    }
+    std::memcpy(rdram + offset, &value, sizeof(T));
+}
+
+static PS2_FORCE_INLINE uint8_t Ps2FastRead8(const uint8_t *rdram, uint32_t addr)
 {
     return rdram[addr & PS2_RAM_MASK];
 }
 
-static inline uint16_t Ps2FastRead16(const uint8_t *rdram, uint32_t addr)
-{
-    const uint32_t offset = addr & PS2_RAM_MASK;
-    if (!Ps2FastRangeIsContiguous(offset, sizeof(uint16_t)))
-    {
-        uint8_t wrapped[sizeof(uint16_t)];
-        for (uint32_t i = 0; i < sizeof(uint16_t); ++i)
-        {
-            wrapped[i] = rdram[(offset + i) & PS2_RAM_MASK];
-        }
-        uint16_t value;
-        std::memcpy(&value, wrapped, sizeof(value));
-        return value;
-    }
+static PS2_FORCE_INLINE uint16_t Ps2FastRead16(const uint8_t *rdram, uint32_t addr) { return Ps2FastReadT<uint16_t>(rdram, addr); }
+static PS2_FORCE_INLINE uint32_t Ps2FastRead32(const uint8_t *rdram, uint32_t addr) { return Ps2FastReadT<uint32_t>(rdram, addr); }
+static PS2_FORCE_INLINE uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr) { return Ps2FastReadT<uint64_t>(rdram, addr); }
+static PS2_FORCE_INLINE __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr) { return Ps2FastReadT<__m128i>(rdram, addr); }
 
-    uint16_t value;
-    std::memcpy(&value, rdram + offset, sizeof(value));
-    return value;
-}
-
-static inline uint32_t Ps2FastRead32(const uint8_t *rdram, uint32_t addr)
-{
-    const uint32_t offset = addr & PS2_RAM_MASK;
-    if (!Ps2FastRangeIsContiguous(offset, sizeof(uint32_t)))
-    {
-        uint8_t wrapped[sizeof(uint32_t)];
-        for (uint32_t i = 0; i < sizeof(uint32_t); ++i)
-        {
-            wrapped[i] = rdram[(offset + i) & PS2_RAM_MASK];
-        }
-        uint32_t value;
-        std::memcpy(&value, wrapped, sizeof(value));
-        return value;
-    }
-
-    uint32_t value;
-    std::memcpy(&value, rdram + offset, sizeof(value));
-    return value;
-}
-
-static inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
-{
-    const uint32_t offset = addr & PS2_RAM_MASK;
-    if (!Ps2FastRangeIsContiguous(offset, sizeof(uint64_t)))
-    {
-        uint8_t wrapped[sizeof(uint64_t)];
-        for (uint32_t i = 0; i < sizeof(uint64_t); ++i)
-        {
-            wrapped[i] = rdram[(offset + i) & PS2_RAM_MASK];
-        }
-        uint64_t value;
-        std::memcpy(&value, wrapped, sizeof(value));
-        return value;
-    }
-
-    uint64_t value;
-    std::memcpy(&value, rdram + offset, sizeof(value));
-    return value;
-}
-
-static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
-{
-    const uint32_t offset = addr & PS2_RAM_MASK;
-    if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
-    {
-        alignas(16) uint8_t wrapped[sizeof(__m128i)];
-        for (uint32_t i = 0; i < sizeof(__m128i); ++i)
-        {
-            wrapped[i] = rdram[(offset + i) & PS2_RAM_MASK];
-        }
-        __m128i value;
-        std::memcpy(&value, wrapped, sizeof(value));
-        return value;
-    }
-
-    __m128i value;
-    std::memcpy(&value, rdram + offset, sizeof(value));
-    return value;
-}
-
-static inline void Ps2FastWrite8(uint8_t *rdram, uint32_t addr, uint8_t value)
+static PS2_FORCE_INLINE void Ps2FastWrite8(uint8_t *rdram, uint32_t addr, uint8_t value)
 {
     rdram[addr & PS2_RAM_MASK] = value;
 }
 
-static inline void Ps2FastWrite16(uint8_t *rdram, uint32_t addr, uint16_t value)
-{
-    const uint32_t offset = addr & PS2_RAM_MASK;
-    if (!Ps2FastRangeIsContiguous(offset, sizeof(uint16_t)))
-    {
-        uint8_t wrapped[sizeof(uint16_t)];
-        std::memcpy(wrapped, &value, sizeof(value));
-        for (uint32_t i = 0; i < sizeof(uint16_t); ++i)
-        {
-            rdram[(offset + i) & PS2_RAM_MASK] = wrapped[i];
-        }
-        return;
-    }
-    std::memcpy(rdram + offset, &value, sizeof(value));
-}
-
-static inline void Ps2FastWrite32(uint8_t *rdram, uint32_t addr, uint32_t value)
-{
-    const uint32_t offset = addr & PS2_RAM_MASK;
-    if (!Ps2FastRangeIsContiguous(offset, sizeof(uint32_t)))
-    {
-        uint8_t wrapped[sizeof(uint32_t)];
-        std::memcpy(wrapped, &value, sizeof(value));
-        for (uint32_t i = 0; i < sizeof(uint32_t); ++i)
-        {
-            rdram[(offset + i) & PS2_RAM_MASK] = wrapped[i];
-        }
-        return;
-    }
-    std::memcpy(rdram + offset, &value, sizeof(value));
-}
-
-static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
-{
-    const uint32_t offset = addr & PS2_RAM_MASK;
-    if (!Ps2FastRangeIsContiguous(offset, sizeof(uint64_t)))
-    {
-        uint8_t wrapped[sizeof(uint64_t)];
-        std::memcpy(wrapped, &value, sizeof(value));
-        for (uint32_t i = 0; i < sizeof(uint64_t); ++i)
-        {
-            rdram[(offset + i) & PS2_RAM_MASK] = wrapped[i];
-        }
-        return;
-    }
-    std::memcpy(rdram + offset, &value, sizeof(value));
-}
-
-static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
-{
-    const uint32_t offset = addr & PS2_RAM_MASK;
-    if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
-    {
-        alignas(16) uint8_t wrapped[sizeof(__m128i)];
-        std::memcpy(wrapped, &value, sizeof(value));
-        for (uint32_t i = 0; i < sizeof(__m128i); ++i)
-        {
-            rdram[(offset + i) & PS2_RAM_MASK] = wrapped[i];
-        }
-        return;
-    }
-    std::memcpy(rdram + offset, &value, sizeof(value));
-}
+static PS2_FORCE_INLINE void Ps2FastWrite16(uint8_t *rdram, uint32_t addr, uint16_t value) { Ps2FastWriteT<uint16_t>(rdram, addr, value); }
+static PS2_FORCE_INLINE void Ps2FastWrite32(uint8_t *rdram, uint32_t addr, uint32_t value) { Ps2FastWriteT<uint32_t>(rdram, addr, value); }
+static PS2_FORCE_INLINE void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value) { Ps2FastWriteT<uint64_t>(rdram, addr, value); }
+static PS2_FORCE_INLINE void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value) { Ps2FastWriteT<__m128i>(rdram, addr, value); }
 
 #define FAST_READ8(addr) Ps2FastRead8(rdram, (uint32_t)(addr))
 #define FAST_READ16(addr) Ps2FastRead16(rdram, (uint32_t)(addr))
@@ -552,41 +466,52 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 #define FAST_WRITE64(addr, val) Ps2FastWrite64(rdram, (uint32_t)(addr), (uint64_t)(val))
 #define FAST_WRITE128(addr, val) Ps2FastWrite128(rdram, (uint32_t)(addr), (val))
 
-#define READ8(addr) ([&]() -> uint8_t {                       \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load8(rdram, ctx, _addr)                   \
-        : FAST_READ8(_addr); }())
+static PS2_FORCE_INLINE uint8_t Ps2Read8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr)
+{
+    if (PS2Runtime::isSpecialAddress(addr)) [[unlikely]]
+        return runtime->Load8(rdram, ctx, addr);
+    return Ps2FastRead8(rdram, addr);
+}
 
-#define READ16(addr) ([&]() -> uint16_t {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load16(rdram, ctx, _addr)                  \
-        : FAST_READ16(_addr); }())
+static PS2_FORCE_INLINE uint16_t Ps2Read16(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr)
+{
+    if (PS2Runtime::isSpecialAddress(addr)) [[unlikely]]
+        return runtime->Load16(rdram, ctx, addr);
+    return Ps2FastRead16(rdram, addr);
+}
 
-#define READ32(addr) ([&]() -> uint32_t {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load32(rdram, ctx, _addr)                  \
-        : FAST_READ32(_addr); }())
+static PS2_FORCE_INLINE uint32_t Ps2Read32(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr)
+{
+    if (PS2Runtime::isSpecialAddress(addr)) [[unlikely]]
+        return runtime->Load32(rdram, ctx, addr);
+    return Ps2FastRead32(rdram, addr);
+}
 
-#define READ64(addr) ([&]() -> uint64_t {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load64(rdram, ctx, _addr)                  \
-        : FAST_READ64(_addr); }())
+static PS2_FORCE_INLINE uint64_t Ps2Read64(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr)
+{
+    if (PS2Runtime::isSpecialAddress(addr)) [[unlikely]]
+        return runtime->Load64(rdram, ctx, addr);
+    return Ps2FastRead64(rdram, addr);
+}
 
-#define READ128(addr) ([&]() -> __m128i {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load128(rdram, ctx, _addr)                 \
-        : FAST_READ128(_addr); }())
+static PS2_FORCE_INLINE __m128i Ps2Read128(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t addr)
+{
+    if (PS2Runtime::isSpecialAddress(addr)) [[unlikely]]
+        return runtime->Load128(rdram, ctx, addr);
+    return Ps2FastRead128(rdram, addr);
+}
+
+#define READ8(addr) Ps2Read8(rdram, ctx, runtime, (uint32_t)(addr))
+#define READ16(addr) Ps2Read16(rdram, ctx, runtime, (uint32_t)(addr))
+#define READ32(addr) Ps2Read32(rdram, ctx, runtime, (uint32_t)(addr))
+#define READ64(addr) Ps2Read64(rdram, ctx, runtime, (uint32_t)(addr))
+#define READ128(addr) Ps2Read128(rdram, ctx, runtime, (uint32_t)(addr))
 
 #define WRITE8(addr, val)                                                            \
     do                                                                               \
     {                                                                                \
         uint32_t _addr = (addr);                                                     \
-        if (PS2Runtime::isSpecialAddress(_addr))                                     \
+        if (PS2Runtime::isSpecialAddress(_addr)) [[unlikely]]\
             runtime->Store8(rdram, ctx, _addr, (val));                               \
         else                                                                         \
         {                                                                            \
@@ -599,7 +524,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (PS2Runtime::isSpecialAddress(_addr))                                       \
+        if (PS2Runtime::isSpecialAddress(_addr)) [[unlikely]]\
             runtime->Store16(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -612,7 +537,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (PS2Runtime::isSpecialAddress(_addr))                                       \
+        if (PS2Runtime::isSpecialAddress(_addr)) [[unlikely]]\
             runtime->Store32(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -625,7 +550,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     do                                                                                 \
     {                                                                                  \
         uint32_t _addr = (addr);                                                       \
-        if (PS2Runtime::isSpecialAddress(_addr))                                       \
+        if (PS2Runtime::isSpecialAddress(_addr)) [[unlikely]]\
             runtime->Store64(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
@@ -639,7 +564,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
     {                                                                                \
         uint32_t _addr = (addr);                                                     \
         __m128i _value = (val);                                                      \
-        if (PS2Runtime::isSpecialAddress(_addr))                                     \
+        if (PS2Runtime::isSpecialAddress(_addr)) [[unlikely]]\
             runtime->Store128(rdram, ctx, _addr, _value);                            \
         else                                                                         \
         {                                                                            \
@@ -969,7 +894,7 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 #define GPR_S64(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0LL : PS2_EXTRACT_EPI64_0(ctx_ptr->r[reg_idx]))
 #define GPR_VEC(ctx_ptr, reg_idx) ((reg_idx == 0) ? _mm_setzero_si128() : ctx_ptr->r[reg_idx])
 
-static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
+static PS2_FORCE_INLINE void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
 {
     if (reg != 0)
     {
