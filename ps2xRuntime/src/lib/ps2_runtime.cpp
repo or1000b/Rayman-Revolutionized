@@ -41,6 +41,7 @@ void ps2xDebugDumpSemaphoreHistory(int id); // EeScheduler.cpp (Rayman bring-up)
 extern "C" void ps2xRequestGsCapture();         // gs_cpu_backend.cpp
 extern "C" void ps2xRequestVu1Capture();        // ps2_vu1_core.cpp: F11, every VU1 run of the next VSyncs
 extern "C" void ps2xRequestEeDump();            // ps2_test_harness.cpp: F11, EE RAM at the next VSync
+extern "C" int ps2xGfxStatsLine(char *out, int size); // ps2_gfx_thread.inc: graphics thread busy %
 extern "C" uint64_t ps2xGuestDisplayFlips();       // EeScheduler.cpp: display flips counted at guest VBlanks
 extern "C" uint32_t ps2xVBlankRateOverrideHz();    // EeScheduler.cpp: PS2X_FRAMERATE (0 = unset)
 extern "C" int ps2xGsStatsLine(char *buffer, int size);
@@ -3267,6 +3268,41 @@ void PS2Runtime::run()
             }
         }
         {
+            // PS2X_FPS_LOG=<ms> (speed research): every <ms> of real time, an `[fps]` line with the guest VSync, the
+            // game FPS in that window and the longest wait between two game frames seen by the window loop.
+            static const int fpsLogMs = []
+            {
+                const char *env = std::getenv("PS2X_FPS_LOG");
+                return env ? std::max(0, std::atoi(env)) : 0;
+            }();
+            if (fpsLogMs > 0)
+            {
+                static auto logStart = std::chrono::steady_clock::now();
+                static auto lastFlipAt = logStart;
+                static uint64_t logFlips = ps2xGuestDisplayFlips();
+                static uint64_t lastFlips = logFlips;
+                static double worstMs = 0.0;
+                const auto now = std::chrono::steady_clock::now();
+                const uint64_t flips = ps2xGuestDisplayFlips();
+                if (flips != lastFlips)
+                {
+                    worstMs = std::max(worstMs, std::chrono::duration<double, std::milli>(now - lastFlipAt).count());
+                    lastFlipAt = now;
+                    lastFlips = flips;
+                }
+                const double windowMs = std::chrono::duration<double, std::milli>(now - logStart).count();
+                if (windowMs >= fpsLogMs)
+                {
+                    std::fprintf(stderr, "[fps] vsync=%llu fps=%.1f worst_ms=%.1f\n",
+                                 static_cast<unsigned long long>(ps2xGuestVsync()),
+                                 static_cast<double>(flips - logFlips) * 1000.0 / windowMs, worstMs);
+                    logStart = now;
+                    logFlips = flips;
+                    worstMs = 0.0;
+                }
+            }
+        }
+        {
             tick++;
             if (ps2xTestHarnessTick(tick))
             {
@@ -3298,6 +3334,9 @@ void PS2Runtime::run()
                     threadLine << " | " << ps2x::pgs::statsLine();
                 else if (ps2xGsStatsLine(gsStats, static_cast<int>(sizeof(gsStats))) > 0)
                     threadLine << " | " << gsStats;
+                char gfxStats[96];
+                if (ps2xGfxStatsLine(gfxStats, static_cast<int>(sizeof(gfxStats))) > 0)
+                    threadLine << " | " << gfxStats;
                 char soundStats[320];
                 if (ps2xSpu2StatsLine(soundStats, static_cast<int>(sizeof(soundStats))) > 0)
                     threadLine << " | " << soundStats;

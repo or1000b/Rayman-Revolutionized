@@ -787,6 +787,115 @@
       ]
     },
     {
+      "name": "glade_walk_split",
+      "description": "The user's check (2026-11-16) at run_rayman_hd_120fps_smooth.bat settings: in the Fairy Glade, stand, walk 3 s, jump 3 times, shoot 5 times; does the game stay at 120 FPS? (The user saw 120 standing still and drops when Rayman walks.)",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_glade\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4750:lup:150,5000:cross:5,5075:cross:5,5150:cross:5,5250:square:5,5300:square:5,5350:square:5,5400:square:5,5450:square:5",
+      "frames": 5700,
+      "shots": [4700, 4900, 5100, 5300, 5500],
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "1", "PS2X_FPS_LOG": "250", "PS2X_RAYMAN_LOGIC_HZ": "25", "PS2X_RAYMAN_INTERP": "1" },
+      "_note": "Script ticks are 20 ms: 4500-4750 stand, 4750-4900 walk forward along the log (3 s), jumps at 5000/5075/5150, shots at 5250-5450, stand to 5700. [fps] lines every 250 ms (guest vsync = tick * 120 / 50).",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "fps", "after_tick": 4500, "min": 110, "label": "120 FPS while Rayman walks, jumps and shoots (average game FPS)" }
+      ]
+    },
+    {
+      "name": "glade_walk_120",
+      "description": "glade_walk_split at run_rayman_hd_120fps.bat settings (logic every frame).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_glade\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4750:lup:150,5000:cross:5,5075:cross:5,5150:cross:5,5250:square:5,5300:square:5,5350:square:5,5400:square:5,5450:square:5",
+      "frames": 5700,
+      "shots": [4700, 4900, 5100, 5300, 5500],
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "1", "PS2X_FPS_LOG": "250" },
+      "_note": "Script ticks are 20 ms: 4500-4750 stand, 4750-4900 walk forward along the log (3 s), jumps at 5000/5075/5150, shots at 5250-5450, stand to 5700. [fps] lines every 250 ms (guest vsync = tick * 120 / 50).",
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "fps", "after_tick": 4500, "min": 110, "label": "120 FPS while Rayman walks, jumps and shoots (average game FPS)" }
+      ]
+    },
+    {
+      "name": "hub_split_fps",
+      "description": "Speed in the smooth mode (run_rayman_hd_120fps_smooth.bat settings) on the user's hub recording (tests/fixtures/hub_split_fps.input = a local copy of hub_run_120.input; the run drifts from the recording because the logic runs at 25): where the user saw 77-113 FPS while walking (2026-11-15 23:58 log). [fps] lines every 250 ms.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_shop\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
+      "frames": 5000,
+      "shots": [2500, 3000, 3500, 4000, 4500],
+      "env": { "PS2X_FRAMERATE": "120", "PS2X_GS_SSAA": "4", "PS2X_WIDESCREEN": "16:9", "PS2X_GFX_THREAD": "1", "PS2X_HUD": "1", "PS2X_TEST_INPUT_PORTS": "2", "PS2X_RAYMAN_LOGIC_HZ": "25", "PS2X_RAYMAN_INTERP": "1", "PS2X_FPS_LOG": "250" },
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" }
+      ]
+    },
+    {
+      "name": "shop_walk_split",
+      "description": "The user's check (2026-11-16) where their log showed the drops (the save by the ability shop, run_rayman_hd_120fps_smooth.bat settings): stand, walk, jump 3 times, shoot 5 times, walk in three more directions; FPS every 250 ms.",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_shop\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4250:ldown:150,4450:cross:5,4525:cross:5,4600:cross:5,4700:square:5,4750:square:5,4800:square:5,4850:square:5,4900:square:5,4950:lup:150,5150:lleft:150,5350:lright:150",
+      "frames": 5650,
+      "shots": [
+        4200,
+        4400,
+        4800,
+        5100,
+        5300,
+        5500
+      ],
+      "env": {
+        "PS2X_FRAMERATE": "120",
+        "PS2X_GS_SSAA": "4",
+        "PS2X_WIDESCREEN": "16:9",
+        "PS2X_GFX_THREAD": "1",
+        "PS2X_HUD": "1",
+        "PS2X_FPS_LOG": "250",
+        "PS2X_RAYMAN_LOGIC_HZ": "25",
+        "PS2X_RAYMAN_INTERP": "1"
+      },
+      "_note": "Script ticks are 20 ms: Rayman stands at the save point by the shop until 4250, walks (ldown) 3 s, jumps at 4450/4525/4600, shoots at 4700-4900, walks up 4950-5100, left 5150-5300, right 5350-5500. [fps] lines every 250 ms (guest vsync = tick * 120 / 50).",
+      "checks": [
+        {
+          "type": "exit_code",
+          "expect": 0,
+          "label": "run ends by frame budget (no hang, no crash)"
+        }
+      ]
+    },
+    {
+      "name": "shop_walk_120",
+      "description": "shop_walk_split at run_rayman_hd_120fps.bat settings (logic every frame).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_shop\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10,4250:ldown:150,4450:cross:5,4525:cross:5,4600:cross:5,4700:square:5,4750:square:5,4800:square:5,4850:square:5,4900:square:5,4950:lup:150,5150:lleft:150,5350:lright:150",
+      "frames": 5650,
+      "shots": [
+        4200,
+        4400,
+        4800,
+        5100,
+        5300,
+        5500
+      ],
+      "env": {
+        "PS2X_FRAMERATE": "120",
+        "PS2X_GS_SSAA": "4",
+        "PS2X_WIDESCREEN": "16:9",
+        "PS2X_GFX_THREAD": "1",
+        "PS2X_HUD": "1",
+        "PS2X_FPS_LOG": "250"
+      },
+      "_note": "Script ticks are 20 ms: Rayman stands at the save point by the shop until 4250, walks (ldown) 3 s, jumps at 4450/4525/4600, shoots at 4700-4900, walks up 4950-5100, left 5150-5300, right 5350-5500. [fps] lines every 250 ms (guest vsync = tick * 120 / 50).",
+      "checks": [
+        {
+          "type": "exit_code",
+          "expect": 0,
+          "label": "run ends by frame budget (no hang, no crash)"
+        }
+      ]
+    },
+    {
       "name": "shop_exit",
       "description": "The user's recording (2026-11-15 18:41, 120 FPS, SSAA x4, 16:9): load the save, walk to the ability shop by the well of whirlpools, open it, leave with Triangle. Before the fix Rayman was run back into the shop each time (CLAUDE.md issue 22); with the shop zone fix (main.cpp) he stays outside, and the rest of the recording jumps in place in the gorge. PS2X_HUD=0: the menus show in the pictures.",
       "renderer": "gpu",

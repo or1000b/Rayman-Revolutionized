@@ -1,6 +1,7 @@
 // The graphics thread: implementation, included by ps2_memory.cpp only (see ps2_gfx_thread.h).
 #include "ps2_gfx_thread.h"
 #include "ThreadNaming.h"
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,7 @@ namespace ps2x::gfx
         // Counters for the [gfx] line at the end: how often the game had to wait for the worker.
         std::atomic<uint64_t> g_syncWaits{0}, g_roomWaits{0};
         uint64_t g_bytesPosted = 0, g_maxQueued = 0; // under g_mutex
+        std::atomic<uint64_t> g_busyNs{0};           // time the worker spent on tasks (ps2xGfxStatsLine: busy %)
 
         void workerLoop()
         {
@@ -63,6 +65,7 @@ namespace ps2x::gfx
                     g_queue.pop_front();
                     std::memcpy(g_shadow, task.display, sizeof(g_shadow));
                 }
+                const auto busyFrom = std::chrono::steady_clock::now();
                 try
                 {
                     task.run();
@@ -71,6 +74,9 @@ namespace ps2x::gfx
                 {
                     std::fprintf(stderr, "[gfx] task failed: %s\n", e.what());
                 }
+                g_busyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - busyFrom).count()),
+                                   std::memory_order_relaxed);
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
                     ++g_done;
@@ -195,4 +201,24 @@ namespace ps2x::gfx
                      static_cast<unsigned long long>(kMaxQueuedBytes >> 20),
                      static_cast<unsigned long long>(g_maxQueued >> 10));
     }
+}
+
+// For the [threads] line (ps2_runtime.cpp): the worker's share of real time since the last call (busy, 100% = it is the
+// limit) and how often the game waited for room in its queue in that time.
+extern "C" int ps2xGfxStatsLine(char *out, int size)
+{
+    using namespace ps2x::gfx;
+    if (g_state.load() != 1 || !out || size <= 0)
+        return 0;
+    static auto since = std::chrono::steady_clock::now();
+    static uint64_t roomWaitsBefore = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const double windowNs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - since).count());
+    const int busy = windowNs > 0.0 ? static_cast<int>(g_busyNs.exchange(0u) * 100.0 / windowNs + 0.5) : 0;
+    const uint64_t roomWaits = g_roomWaits.load();
+    since = now;
+    const int n = std::snprintf(out, static_cast<size_t>(size), "gfx busy=%d%% full=%llu", busy,
+                                static_cast<unsigned long long>(roomWaits - roomWaitsBefore));
+    roomWaitsBefore = roomWaits;
+    return n;
 }

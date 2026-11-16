@@ -199,6 +199,42 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
   of this recording has its own EE hash at the same cycle counts, also between two runs of one build: an older
   nondeterminism there, not from these changes (to look at).
 
+## Where 120 still drops (2026-11-16)
+
+- The user: "standing still it holds 120, when Rayman walks the FPS drops" (smooth mode, their log of 2026-11-15
+  23:58: 120 at the save point, 77-113 walking around the area by the ability shop). The drop follows the view, not the
+  walking: standing in a busy spot is just as slow, and those log lines had twice the primitives per frame (~90k).
+- Tools: `PS2X_FPS_LOG=<ms>` (`[fps]` lines: guest vsync, game FPS in that window, longest wait between two game
+  frames as the window loop saw it; test runs draw the window at 60, so 16.7 ms there is normal); `busy=` in the
+  `gsthread` stats and `gfx busy=N% full=M` in the `[threads]` line (share of real time the GS thread / graphics thread
+  spent working since the last line, and the game's waits for room in the graphics queue). Scenarios (all `-NoKickHash`
+  for speed): `glade_walk_split` / `glade_walk_120` (Fairy Glade save: stand, walk 3 s, jump 3x, shoot 5x),
+  `shop_walk_split` / `shop_walk_120` (the shop save, same moves; it loads Rayman in a busy spot that is the measuring
+  window, 3900-4370; the walk then takes him through a portal), `hub_split_fps` (local fixture, a copy of
+  `hub_run_120.input`; the recording drifts at logic 25, so only its first part is the user's path).
+- Measured (game FPS, test mode):
+
+  | place | smooth (logic 25) | plain 120 |
+  |---|---|---|
+  | Fairy Glade log (glade_walk_*): stand, walk, jump, shoot | 120 all the time | 120 all the time |
+  | shop save spot (shop_walk_*), before | 86 (GS thread 91%, graphics 78%) | 74 (GS 83%, graphics 67%) |
+  | same, asynchronous scanout | 89 (GS 78%, graphics 80%, game thread idle 7-9%) | 75 (game thread idle 9%) |
+
+- **Asynchronous scanout** (`gs_pgs_bridge.cpp` `PendingReadback`; `PS2X_GS_ASYNC_SCANOUT=0` = the old way): the GS
+  thread waited for the fence of every picture's readback (the GPU drawing the whole frame, 3.5 ms a frame there), so
+  the CPU side of the next frame and the GPU side of this one ran one after the other. Now it records the copy and goes
+  on; the window thread, which waits for that picture anyway, waits for the fence and copies the pixels (the next
+  request comes from that thread after the copy, so one readback buffer is enough). The GS thread's scanout share went
+  from 2-3.5 ms to ~0.5 ms a frame. `out/pgs_frame.bmp` is now written by the window thread every 5 s (it was every 300
+  frames on the GS thread: a 5 MiB file every 2.5 s at 120).
+- What limits it now: the game thread. `PS2X_RAYMAN_PHASES` at the spot (smooth): frame 11.0 ms, the game step 9.8 ms,
+  of which `0x14B348` (sends the display lists) is 6.7 ms by the phase clock, but that clock also counts the guest's
+  time slices that end inside it; the native profile shows the time spread over guest code and runtime overhead: the
+  memory helpers ~21% (out-of-line copies of `ps2_runtime_macros.h` code: the nprof names `operator delete`,
+  `isSpecialAddress`, `sub_0022E7B8` all point at +0x2628xx-0x2629xx), `dispatchGuestBranch` ~7% plus a neighbour
+  shown as `reportMissingFunction` ~3.5%, locks ~4%, heap ~3%, vector copies ~4%. A 120 there needs about a quarter
+  less game thread time per frame.
+
 ## Frame-rate bugs in the game's scripts (2026-11-15)
 
 The physics steps once per frame, so a scripted move ends at a slightly different spot at another frame rate. Where a

@@ -108,6 +108,50 @@ namespace ps2x::pgs
 
         State *g_state = nullptr;
 
+        // A scanout picture still on its way back from the GPU (PS2X_GS_ASYNC_SCANOUT, on by default with the GS
+        // thread): the GS thread records the copy into the readback buffer and goes on with the next frame; the
+        // window thread, which waits for that picture anyway, waits for the fence and copies the pixels. Before, the
+        // GS thread itself waited (3-4 ms a frame in busy places: the GPU drawing the whole frame), so the CPU work
+        // of the next frame and the GPU work of this one ran one after the other (2026-11-16: GS thread 91% busy at
+        // 86 FPS where the shop save loads, smooth mode).
+        struct PendingReadback
+        {
+            Vulkan::Device *device = nullptr;
+            Vulkan::Fence fence;
+            Vulkan::BufferHandle buffer;
+            uint32_t width = 0;
+            uint32_t height = 0;
+        };
+
+        bool asyncScanoutWanted()
+        {
+            static const bool wanted = []
+            {
+                const char *env = std::getenv("PS2X_GS_ASYNC_SCANOUT");
+                return !(env && std::strcmp(env, "0") == 0);
+            }();
+            return wanted;
+        }
+
+        // Copies a finished readback into rgba (opaque alpha, as the window expects). Any thread.
+        bool finishReadback(PendingReadback &pending, std::vector<uint8_t> &rgba)
+        {
+            if (!pending.device || !pending.fence || !pending.buffer)
+                return false;
+            pending.fence->wait();
+            const size_t size = static_cast<size_t>(pending.width) * pending.height * 4u;
+            const auto *pixels = static_cast<const uint8_t *>(
+                pending.device->map_host_buffer(*pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT));
+            if (!pixels)
+                return false;
+            rgba.resize(size);
+            std::memcpy(rgba.data(), pixels, size);
+            pending.device->unmap_host_buffer(*pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
+            for (size_t i = 3; i < rgba.size(); i += 4)
+                rgba[i] = 0xFFu;
+            return true;
+        }
+
         // paraLLEl-GS / Granite are single-threaded: whoever calls into them (the GS thread; without it the EE
         // thread streaming GIF data and the window thread scanning out) holds this lock (recursive: scanout calls
         // flush etc.).
@@ -1199,7 +1243,8 @@ namespace ps2x::pgs
             return bytes;
         }
 
-        bool scanoutNow(const PrivRegs &regs, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
+        bool scanoutNow(const PrivRegs &regs, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
+                        PendingReadback *async = nullptr)
         {
             width = height = 0u;
             const auto begin = std::chrono::steady_clock::now();
@@ -1295,19 +1340,27 @@ namespace ps2x::pgs
                          VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
             Vulkan::Fence fence;
             device.submit(cmd, &fence);
-            fence->wait();
 
-            const auto *pixels = static_cast<const uint8_t *>(device.map_host_buffer(*g_state->readback, Vulkan::MEMORY_ACCESS_READ_BIT));
-            if (!pixels)
-                return false;
-            rgba.resize(static_cast<size_t>(size));
-            std::memcpy(rgba.data(), pixels, static_cast<size_t>(size));
-            device.unmap_host_buffer(*g_state->readback, Vulkan::MEMORY_ACCESS_READ_BIT);
-            for (size_t i = 3; i < rgba.size(); i += 4)
-                rgba[i] = 0xFFu;
-
+            PendingReadback readback;
+            readback.device = &device;
+            readback.fence = fence;
+            readback.buffer = g_state->readback;
+            readback.width = w;
+            readback.height = h;
             width = w;
             height = h;
+            g_state->lastWidth = w;
+            g_state->lastHeight = h;
+            ++g_state->frames;
+            if (async && g_capturePictures == 0u)
+            {
+                *async = std::move(readback); // the window thread waits and copies (finishReadback)
+                g_state->scanoutMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+                ++g_state->scanoutSamples;
+                return true;
+            }
+            if (!finishReadback(readback, rgba))
+                return false;
             static uint64_t s_dumpCounter = 0u;
             if ((s_dumpCounter++ % 300u) == 30u)
                 dumpFrameBmp(rgba, w, h);
@@ -1318,9 +1371,6 @@ namespace ps2x::pgs
                 std::snprintf(path, sizeof(path), "out/gif_capture_frame%u.bmp", g_capturePictureIndex++);
                 dumpFrameBmp(rgba, w, h, path);
             }
-            g_state->lastWidth = w;
-            g_state->lastHeight = h;
-            ++g_state->frames;
             g_state->scanoutMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
             ++g_state->scanoutSamples;
             return true;
@@ -1368,6 +1418,7 @@ namespace ps2x::pgs
         size_t g_pendingBytes = 0;         // GIF bytes queued or being processed
         bool g_workerIdle = false, g_workerStop = false;
         uint64_t g_roomWaits = 0, g_drains = 0;
+        std::atomic<uint64_t> g_workerBusyNs{0}; // time the GS thread spent working (statsLine: busy %)
         std::atomic<uint64_t> g_scanoutTimeouts{0};
         std::thread g_worker;
 
@@ -1378,6 +1429,7 @@ namespace ps2x::pgs
         uint32_t g_scanWidth = 0, g_scanHeight = 0;
         bool g_scanOk = false;
         uint64_t g_scanRequested = 0, g_scanDone = 0;
+        PendingReadback g_scanPending; // async scanout: the picture still on the GPU (finished by the window thread)
 
         // Producer side (game thread): the GIF reassembly buffers and the byte count.
         std::mutex g_producerMutex;
@@ -1476,10 +1528,12 @@ namespace ps2x::pgs
         {
             static std::vector<uint8_t> s_pixels;
             uint32_t w = 0u, h = 0u;
-            const bool ok = scanoutNow(regs, s_pixels, w, h);
+            PendingReadback pending;
+            const bool ok = scanoutNow(regs, s_pixels, w, h, asyncScanoutWanted() ? &pending : nullptr);
             {
                 std::lock_guard<std::mutex> lock(g_scanMutex);
-                if (ok)
+                g_scanPending = std::move(pending); // empty when the pixels came back already
+                if (ok && !g_scanPending.fence)
                 {
                     std::swap(g_scanPixels, s_pixels);
                     g_scanWidth = w;
@@ -1508,6 +1562,7 @@ namespace ps2x::pgs
                         return; // stopped, nothing left
                     std::swap(work, g_filling);
                 }
+                const auto busyFrom = std::chrono::steady_clock::now();
                 {
                     std::lock_guard<std::recursive_mutex> lock(g_mutex);
                     bindThread();
@@ -1524,6 +1579,9 @@ namespace ps2x::pgs
                         }
                     }
                 }
+                g_workerBusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - busyFrom).count()),
+                                         std::memory_order_relaxed);
                 {
                     std::lock_guard<std::mutex> lock(g_queueMutex);
                     g_done += work.commands.size();
@@ -1708,6 +1766,10 @@ namespace ps2x::pgs
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         if (!g_state)
             return;
+        {
+            std::lock_guard<std::mutex> scan(g_scanMutex);
+            g_scanPending = PendingReadback{};
+        }
         if (g_state->device)
             g_state->device->wait_idle();
         g_state->readback.reset();
@@ -1847,10 +1909,30 @@ namespace ps2x::pgs
         }
         if (!g_scanOk)
             return false;
+        g_scanOk = false; // handed over
+        if (g_scanPending.fence)
+        {
+            // The next scanout request comes from this thread after this copy, so the GS thread does not touch the
+            // readback buffer meanwhile.
+            PendingReadback pending = std::move(g_scanPending);
+            g_scanPending = PendingReadback{};
+            lock.unlock();
+            if (!finishReadback(pending, rgba))
+                return false;
+            width = pending.width;
+            height = pending.height;
+            static auto s_lastDump = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_lastDump >= std::chrono::seconds(5))
+            {
+                s_lastDump = now;
+                dumpFrameBmp(rgba, width, height); // out/pgs_frame.bmp about every 5 s (CLAUDE.md)
+            }
+            return true;
+        }
         std::swap(rgba, g_scanPixels);
         width = g_scanWidth;
         height = g_scanHeight;
-        g_scanOk = false; // handed over
         return true;
     }
 
@@ -1871,10 +1953,16 @@ namespace ps2x::pgs
             pending = g_pendingBytes;
             g_roomWaits = g_drains = 0;
         }
+        // Share of real time since the last stats line that the GS thread spent working (100% = it is the limit).
+        static auto busySince = std::chrono::steady_clock::now();
+        const auto busyNow = std::chrono::steady_clock::now();
+        const double busyWindowNs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(busyNow - busySince).count());
+        const int busyPercent = busyWindowNs > 0.0 ? static_cast<int>(g_workerBusyNs.exchange(0u) * 100.0 / busyWindowNs + 0.5) : 0;
+        busySince = busyNow;
         std::snprintf(line, sizeof(line),
                       "pgs: %s frames=%llu gif=%lluK scanout=%ux%u %.2fms pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx"
                       " | gifstats kicks=%llu prims=%llu tex0=%llu clut=%llu uploads=%llu copies=%llu maxPrim=%ux%u big=%llu badTex=%llu badXfer=%llu"
-                      " | gsthread %s queued=%zuK full=%llu drains=%llu late_scanouts=%llu",
+                      " | gsthread %s queued=%zuK full=%llu drains=%llu late_scanouts=%llu busy=%d%%",
                       g_state->gpuName.c_str(), static_cast<unsigned long long>(g_state->frames),
                       static_cast<unsigned long long>(g_gifBytes.exchange(0u, std::memory_order_relaxed) / 1024u), g_state->lastWidth,
                       g_state->lastHeight, avg,
@@ -1887,7 +1975,7 @@ namespace ps2x::pgs
                       g_windowStats.maxPrimW, g_windowStats.maxPrimH, (unsigned long long)g_windowStats.bigPrims,
                       (unsigned long long)g_windowStats.badTex, (unsigned long long)g_windowStats.badTransfers,
                       g_threaded ? "on" : "off", pending / 1024u, (unsigned long long)roomWaits, (unsigned long long)drains,
-                      (unsigned long long)timeouts);
+                      (unsigned long long)timeouts, busyPercent);
         g_windowStats = GifStats{};
         g_state->frames = 0;
         g_state->scanoutMs = 0.0;
