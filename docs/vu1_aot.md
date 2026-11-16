@@ -285,3 +285,15 @@ code per image: from the profiled entries, following branches and the profiled J
 - Diff mode (the same 5 scenarios): 7.95 million VU1 and 3.87 million VU0 runs compared, 0 differences.
 - Full run_tests (native, with the kick hash): Overall PASS, every VU1 hash, picture and `[det]` fingerprint as
   before; `glade_split_hd` / `shop_walk_split` hold 120.0 even with the kick hash on (was 110 with it).
+
+## Recording in normal play (2026-11-17)
+
+- `run_rayman.bat` (so every `run_rayman_*.bat`) now sets `PS2X_VU1_PROFILE=1` / `PS2X_VU0_PROFILE=1` unless already
+  set: the profiler hooks only the interpreter, which runs just the code the native programs do not cover (bridge:
+  120 FPS with it on), so every play session records what is missing into out/vu1prof / out/vu0prof. Then regenerate
+  (`python tools/vu1aot/vu1gen.py`, `--unit 0 --with-flags` for VU0), rebuild, diff-check (`PS2X_VU1AOT=diff`).
+- The user's logs (out/logs, the newest 30) show the gaps: `[vu1aot]` / `[vu0aot]` counters `not_covered`, `jr`.
+  Before the budget fix most VU1 misses were cut runs (CLAUDE.md issue 19). Still missing on 2026-11-16: a VU0 routine
+  run once per frame in one place (around position -130, -30, 80; 47046 runs in one session) and a few VU1 JR targets
+  (14 in the last session).
+
