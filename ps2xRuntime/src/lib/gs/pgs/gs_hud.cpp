@@ -52,6 +52,22 @@ namespace ps2x::hud
         {
             uint32_t uploadId = 0, cbp = 0, psm = 0, csa = 0;
         } g_lastClut;
+        // The CLUT fields of the last indexed TEX0 with CLD that got past the first checks (PSM, CBP, CPSM, CSM, CSA)
+        // and the upload count then: the same fields with no upload since give the same answer (the same table, or
+        // the same undecodable load), so tex0Written returns before its g_uploads lookup. (Measured small: the cost
+        // was the table rebuild when the game switches between CLUTs, see g_clutCache.)
+        uint64_t g_lastTex0Clut = ~0ull;
+        uint32_t g_lastTex0Uploads = 0;
+        // Decoded 8-bit CLUT loads by (upload id << 32 | CBP): such a load replaces the whole table, so the table and
+        // its id are a function of that key (an upload id stands for one content; ids are never reused). Busy scenes
+        // switch between a few CLUTs: rebuilding the 256 entries every time was ~5% of the GS thread, and the new id
+        // made the decoded-texture memo miss (2026-11-16).
+        struct ClutTable
+        {
+            uint32_t entries[256];
+            uint32_t id;
+        };
+        std::unordered_map<uint64_t, ClutTable> g_clutCache;
 
         // Decode inputs -> texture key, and the decoded textures (read by the window thread).
         std::unordered_map<uint64_t, uint64_t> g_texMemo;
@@ -204,6 +220,11 @@ namespace ps2x::hud
             const uint32_t csa = static_cast<uint32_t>((v >> 56) & 0x1Fu);
             if (psm != 0x13u && psm != 0x14u)
                 return; // not an indexed texture: the CLUT is not used
+            const uint64_t clutFields = v & 0x1FFFFFE003F00000ull; // PSM (bits 20-25), CBP CPSM CSM CSA (37-60)
+            if (clutFields == g_lastTex0Clut && g_uploadIds == g_lastTex0Uploads)
+                return;
+            g_lastTex0Clut = clutFields;
+            g_lastTex0Uploads = g_uploadIds;
             const auto it = g_uploads.find(cbp);
             const bool decodable = it != g_uploads.end() && cpsm == 0u && csm == 0u && it->second.psm == 0x00u;
             const ClutLoad load{decodable ? it->second.id : 0u, cbp, psm, psm == 0x14u ? csa : 0u};
@@ -220,11 +241,26 @@ namespace ps2x::hud
             {
                 if (u.w < 16u || u.h < 16u)
                     return;
-                for (uint32_t i = 0; i < 256u; ++i)
+                const uint64_t cacheKey = (static_cast<uint64_t>(u.id) << 32) | cbp;
+                const auto cached = g_clutCache.find(cacheKey);
+                if (cached != g_clutCache.end())
                 {
-                    // CSM1: bits 3 and 4 of the index are swapped in the 16 x 16 CLUT image.
-                    const uint32_t pos = (i & ~0x18u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1);
-                    g_clut[i] = clutEntry(u, pos & 15u, pos >> 4);
+                    std::memcpy(g_clut, cached->second.entries, sizeof(g_clut));
+                    g_clutId = cached->second.id; // the table it named then: the same content
+                }
+                else
+                {
+                    for (uint32_t i = 0; i < 256u; ++i)
+                    {
+                        // CSM1: bits 3 and 4 of the index are swapped in the 16 x 16 CLUT image.
+                        const uint32_t pos = (i & ~0x18u) | ((i & 0x08u) << 1) | ((i & 0x10u) >> 1);
+                        g_clut[i] = clutEntry(u, pos & 15u, pos >> 4);
+                    }
+                    if (g_clutCache.size() >= 1024u)
+                        g_clutCache.clear();
+                    ClutTable &t = g_clutCache[cacheKey];
+                    std::memcpy(t.entries, g_clut, sizeof(g_clut));
+                    t.id = g_clutId;
                 }
             }
             else

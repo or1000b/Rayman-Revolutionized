@@ -586,6 +586,9 @@ namespace
                     wanted.emplace_back(p, n);
                 p += n + (end ? 1u : 0u);
             }
+            // PS2X_NATIVE_PROF_CHAIN_DEPTH: frames per chain (default 8, at most the 24 captured).
+            const char *depthEnv = std::getenv("PS2X_NATIVE_PROF_CHAIN_DEPTH");
+            const size_t chainDepth = depthEnv ? std::min<size_t>(24u, std::max<size_t>(1u, std::strtoul(depthEnv, nullptr, 10))) : 8u;
             for (const std::string &want : wanted)
             {
                 std::unordered_map<std::string, uint32_t> chains;
@@ -602,7 +605,7 @@ namespace
                     std::string chain;
                     std::string last;
                     size_t frames = 0;
-                    for (size_t i = 0; i < s.size() && frames < 8u; ++i)
+                    for (size_t i = 0; i < s.size() && frames < chainDepth; ++i)
                     {
                         const std::string &name = nameOf(s[i]);
                         if (name == last)

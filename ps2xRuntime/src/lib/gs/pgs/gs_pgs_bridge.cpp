@@ -1435,7 +1435,14 @@ namespace ps2x::pgs
             std::vector<PrivRegs> regs;
         };
 
-        constexpr size_t kMaxQueuedBytes = 8u << 20; // the game thread waits when the worker is this far behind
+        // The producer waits when the worker is this far behind (PS2X_GS_QUEUE_MB, default 8). The worker takes the whole
+        // queue at once and the bytes count until that batch is done, so the limit is also what the producer may add
+        // while the worker draws the batch before.
+        size_t maxQueuedBytes()
+        {
+            static const size_t bytes = static_cast<size_t>(std::min(256u, std::max(1u, watchBound("PS2X_GS_QUEUE_MB", 8u)))) << 20;
+            return bytes;
+        }
 
         std::mutex g_queueMutex;
         std::condition_variable g_workCv;  // the worker waits for work
@@ -1492,10 +1499,10 @@ namespace ps2x::pgs
             if (g_staged.commands.empty())
                 return;
             std::unique_lock<std::mutex> lock(g_queueMutex);
-            if (g_pendingBytes >= kMaxQueuedBytes)
+            if (g_pendingBytes >= maxQueuedBytes())
             {
                 ++g_roomWaits;
-                g_roomCv.wait(lock, [] { return g_pendingBytes < kMaxQueuedBytes || g_workerStop; });
+                g_roomCv.wait(lock, [] { return g_pendingBytes < maxQueuedBytes() || g_workerStop; });
             }
             const size_t base = g_filling.bytes.size();
             g_filling.bytes.insert(g_filling.bytes.end(), g_staged.bytes.begin(), g_staged.bytes.end());
@@ -1725,7 +1732,12 @@ namespace ps2x::pgs
 
         state->device = std::make_unique<Vulkan::Device>();
         state->device->set_context(*state->context);
-        state->device->init_frame_contexts(4);
+        // Frame contexts: how far the GS thread may run ahead of the GPU before Granite waits (PS2X_PGS_FRAME_CONTEXTS,
+        // 2..64, default 16). paraLLEl-GS advances one at every flush_submit, and it submits every 4096 primitives
+        // (check_flush_stats), so a busy frame (~90k primitives by the ability shop) uses ~20: with 4 the vsync's
+        // advance waited for GPU work submitted less than a frame before (~8% of the GS thread), and the GS thread ran
+        // in step with the GPU. Measured there (2026-11-16): 4 -> 85-89% busy, 8 -> 76-78%, 16 -> 74-75%.
+        state->device->init_frame_contexts(std::min(64u, std::max(2u, watchBound("PS2X_PGS_FRAME_CONTEXTS", 16u))));
         state->gpuName = state->device->get_gpu_properties().deviceName;
 
         state->gs = std::make_unique<ParallelGS::GSInterface>();

@@ -898,6 +898,37 @@
       ]
     },
     {
+      "name": "bridge_120",
+      "description": "The user's recording (2026-11-16 20:01, regular 120 FPS mode, made with record_for_claude.bat option 1 by mistake, so it first replaced shop_exit.input): from the save by the ability shop through the portal to the bridge in the Minisaurus Plain, where the user saw 90-100 FPS. tests/fixtures/bridge_120.input (local, like the other recordings).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_shop\\mc0",
+      "input": "",
+      "frames": 3000,
+      "shots": [
+        1650,
+        1950,
+        2150,
+        2400,
+        2700
+      ],
+      "env": {
+        "PS2X_FRAMERATE": "120",
+        "PS2X_GS_SSAA": "4",
+        "PS2X_WIDESCREEN": "16:9",
+        "PS2X_GFX_THREAD": "1",
+        "PS2X_HUD": "1",
+        "PS2X_FPS_LOG": "250"
+      },
+      "_note": "The recording ends at VSync ~4545 (120 Hz): the portal at ~3598, then the plain; Rayman then stands by the bridge (from tick ~2400: the measuring window, ~105 FPS on 2026-11-16 with the graphics and GS threads at 91-100%). Shots are in 20 ms ticks (guest vsync = tick * 120 / 50).",
+      "checks": [
+        {
+          "type": "exit_code",
+          "expect": 0,
+          "label": "run ends by frame budget (no hang, no crash)"
+        }
+      ]
+    },
+    {
       "name": "shop_exit",
       "description": "The user's recording (2026-11-15 18:41, 120 FPS, SSAA x4, 16:9): load the save, walk to the ability shop by the well of whirlpools, open it, leave with Triangle. Before the fix Rayman was run back into the shop each time (CLAUDE.md issue 22); with the shop zone fix (main.cpp) he stays outside, and the rest of the recording jumps in place in the gorge. PS2X_HUD=0: the menus show in the pictures.",
       "renderer": "gpu",

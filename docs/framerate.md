@@ -272,6 +272,29 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
   **~120 FPS in both modes** (the cap); graphics thread 100% -> 92-94% -> 75-77% busy, GS thread ~80-85% (now the
   busiest), the game thread no longer waits for room in the graphics queue.
 
+## The bridge in the Minisaurus Plain (2026-11-16, evening)
+
+The user: regular 120 mode is steady in ~95% of the places, but by the bridge in the Minisaurus Plain it drops to
+90-100. Their recording is scenario `bridge_120` (made with `record_for_claude.bat` option 1 by mistake, so it had
+replaced `shop_exit.input`; the shop recording is back from its kept copy). Standing by the bridge (from tick ~2400):
+~13 MB of GIF data a frame, 30% more than at the shop.
+
+- **GS thread, frame contexts.** paraLLEl-GS submits its pending work every 4096 primitives (`check_flush_stats`), and
+  each submission advances Granite's frame context; a busy frame uses ~20. With 4 contexts the vsync's advance waited
+  for GPU work submitted less than a frame before (`PerFrame::wait`, ~8% of the GS thread), so the GS thread ran in
+  step with the GPU, which was only ~52% busy (`nvidia-smi`). `PS2X_PGS_FRAME_CONTEXTS` (default now 16): at the shop
+  the GS thread went 85-89% -> 74-75% busy, and the graphics thread no longer finds the GS queue full.
+- **HUD layer.** The game switches between a few CLUTs, so the "same as the last load" test of 2026-11-16 rarely hit
+  and the 256-entry table was rebuilt each time (~5% of the GS thread). 8-bit CLUT loads are now cached by
+  (upload id, CBP) with their table id, which also lets the decoded-texture memo hit (`gs_hud.cpp` g_clutCache).
+- **VU1 runs cut at 65536 cycles** (CLAUDE.md issue 19): one VU1 run a frame at the bridge was longer than the
+  runtime's budget; the native code bailed, the interpreter redid it (~17% of the graphics thread), the rest of the
+  program was lost and a wall next to the camera was missing. The budget is now 4194304 (`PS2X_VU1_BUDGET`).
+- Bridge, regular mode: ~100 -> 115-117 FPS; both the graphics and the GS thread are at 100% there now.
+  `PS2X_PGS_FLUSH_PRIMS=16384` (fewer, bigger submissions) gave ~118. Tried and dropped: a ring of reused scanout
+  images in paraLLEl-GS's vsync (the allocations in the profile are Granite freeing each frame context's memory, not
+  those images); `PS2X_GS_QUEUE_MB=32` (no waits left to absorb once the frame contexts were raised; the setting stays).
+
 ## Frame-rate bugs in the game's scripts (2026-11-15)
 
 The physics steps once per frame, so a scripted move ends at a slightly different spot at another frame rate. Where a

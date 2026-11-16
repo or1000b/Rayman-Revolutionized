@@ -114,6 +114,24 @@ static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
+// The VU1 cycle budget of one MSCAL / MSCNT run (PS2X_VU1_BUDGET, default 4194304). The VU runs a program to its E-bit;
+// the VIF waits at the next MSCAL / MSCNT until it has. The budget used to be 65536: a longer run stopped in the
+// middle, the next MSCAL started over (the rest of the program was lost) and the next MSCNT finished it instead of
+// what it asked for. Big polygons near the camera go through the clipper and make long runs: that was CLAUDE.md issue
+// 19 (missing walls, the clear colour behind; the bridge in the Minisaurus Plain cut one run every frame), and every
+// cut run went to the interpreter (bridge: ~100 -> ~120 FPS). The budget is now only a guard against a runaway
+// program.
+static uint32_t vu1RunBudget()
+{
+    static const uint32_t budget = []
+    {
+        const char *env = std::getenv("PS2X_VU1_BUDGET");
+        const unsigned long v = env ? std::strtoul(env, nullptr, 0) : 0ul;
+        return v >= 1024ul && v <= (1ul << 30) ? static_cast<uint32_t>(v) : 4194304u;
+    }();
+    return budget;
+}
+
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
@@ -967,7 +985,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          // the game thread's; no retail game runs VU1 with those debug bits.
                                          m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                        m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                       m_gs, &m_memory, startPC, top, itop, 65536);
+                                                       m_gs, &m_memory, startPC, top, itop, vu1RunBudget());
                                          return;
                                      }
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
@@ -982,7 +1000,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      ProfActivityScope profScope(1);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                                   m_gs, &m_memory, startPC, top, itop, vu1RunBudget());
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -993,7 +1011,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      {
                                          m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                      m_gs, &m_memory, top, itop, 65536);
+                                                      m_gs, &m_memory, top, itop, vu1RunBudget());
                                          return;
                                      }
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
@@ -1008,7 +1026,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      ProfActivityScope profScope(1);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
+                                                  m_gs, &m_memory, top, itop, vu1RunBudget());
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
