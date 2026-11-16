@@ -93,6 +93,13 @@ namespace vu1aot
 
         // VF ready offsets after the run (cycles past the end; 0 = ready), for the interpreter's next MSCNT.
         uint8_t vfResidue[32][4]{};
+
+        // The FMAC operands as execUpper reads them: vuNormalizeOperand of every lane of every VF register and of ACC
+        // (vu1aot_ops.h, ops::nz4). The SSE templates read these instead of clamping a register on every use (~7
+        // vector operations per operand). Set for all registers when a run starts (ops::initNv); every write of a
+        // register in the generated code refreshes its copy before the next read. Scratch: never part of the state.
+        alignas(16) float nv[32][4]{};
+        alignas(16) float nacc[4]{};
         // The branch hazard the last pair leaves (the interpreter's m_viBranchBackup*).
         bool branchBackupValid = false;
         uint8_t branchBackupReg = 0;

@@ -247,6 +247,15 @@ def stores_data(p):
     return False
 
 
+def lower_keeps_nv(lo):
+    """LQ LQI MOVE MR32: the template (vu1aot_ops.h lower<>) writes the clamped copy (Ctx::nv) itself. Every other
+    lower instruction that writes a VF register goes through lowerPlain; the generated code refreshes the copy."""
+    op = lo >> 25 & 0x7f
+    if op == 0x00:
+        return True
+    return op == 0x40 and (lo & 0x3f) >= 0x3c and ((lo & 3) | ((lo >> 4) & 0x7c)) in (0x30, 0x31, 0x34)
+
+
 def loop_check(pc):
     """The budget check of a taken branch: bounds loops (cycle counts only grow; the exact check is at the end)."""
     return 'if (cyc >= budget) { c.bail = BailBudget; c.bailPc = 0x%x; return false; }' % pc
@@ -498,6 +507,10 @@ class Gen:
                 self.emit(ind + '%s;' % tmpl)
             else:
                 self.emit(ind + 'upper(c, 0x%08xu, fr, clipQ, clipV);' % p.upper)
+                if p.u.vfw[0]:
+                    self.emit(ind + 'ops::refreshNv<%d>(c);' % p.u.vfw[0])
+                if p.u.accwrite:
+                    self.emit(ind + 'ops::refreshNacc(c);')
             if uk == 'fmac' and not self.nf:
                 self.emit(ind + 'c.flags[%d] = {fr.mac, fr.status, fr.extraSticky, 0, true, WSTATUS_%s, false, false, fr.queued};' % (upper_slot, name))
                 new_flags.append([4, upper_slot, 'f', True, False])
@@ -515,6 +528,8 @@ class Gen:
             pass
         elif lc == 'plain':
             self.emit(ind + 'ops::lower<0x%08xu>(c);' % lo)
+            if p.l.vfw[0] and not lower_keeps_nv(lo):
+                self.emit(ind + 'ops::refreshNv<%d>(c);' % p.l.vfw[0])
         elif lc == 'fdiv':
             self.emit(ind + '{ uint32_t lat; fdiv(c, 0x%08xu, c.pendingQ, c.pendingQDi, lat); }' % lo)
         elif lc == 'efu':
@@ -577,12 +592,12 @@ class Gen:
             self.emit(ind + 'br = %s;' % cond)
             br_ctl = ('bc', (pc + 8 + sx11(lo) * 8) & CODE_MASK, pc + 16)
         if shadow:
-            self.emit(ind + 'std::memcpy(s.vf[%d], shNew, 16); }' % shadow)
+            self.emit(ind + 'std::memcpy(s.vf[%d], shNew, 16); ops::refreshNv<%d>(c); }' % (shadow, shadow))
         # VI registers hold 16 bits (the queued write lands as int16_t).
         if written_vi:
             self.emit(ind + 's.vi[%d] = static_cast<int16_t>(s.vi[%d]);' % (written_vi, written_vi))
         if may_write_reg0(p, lc, uk):
-            self.emit(ind + 's.vf[0][0] = 0.0f; s.vf[0][1] = 0.0f; s.vf[0][2] = 0.0f; s.vf[0][3] = 1.0f; s.vi[0] = 0;')
+            self.emit(ind + 's.vf[0][0] = 0.0f; s.vf[0][1] = 0.0f; s.vf[0][2] = 0.0f; s.vf[0][3] = 1.0f; s.vi[0] = 0; ops::refreshNv<0>(c);')
         if next_backup:
             self.emit(ind + 'bk = bkOld%s;' % name)
 
@@ -837,7 +852,8 @@ def main():
                   '    const uint64_t budget = c.budget;', '    FlagResult fr;', '    bool clipQ = false;', '    uint32_t clipV = 0;',
                   '    int32_t bk = 0;', '    bool br = false;', '    uint32_t jt = 0;',
                   '    uint64_t kc = cyc; // the cycle the XGKICK transfer was brought to (kickSync); none runs at entry',
-                  '    (void)clipQ; (void)clipV; (void)bk; (void)br; (void)jt; (void)kc;', '    switch (entry)', '    {']
+                  '    (void)clipQ; (void)clipV; (void)bk; (void)br; (void)jt; (void)kc;',
+                  '    ops::initNv(c); // the clamped copies of the registers (Ctx::nv)', '    switch (entry)', '    {']
         for e, n in sorted(starts.items()):
             lines.append('    case 0x%x: goto %s;' % (e, n))
         lines += ['    default: return false;', '    }']

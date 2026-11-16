@@ -33,6 +33,62 @@ namespace vu1aot
     {
         VU1AOT_INLINE float nz(float v) { return vuNormalizeOperand(v); }
 
+        // ---------------------------------------------------------------- SSE helpers (also used by lower<>)
+
+        VU1AOT_INLINE __m128i nz4i(__m128i b)
+        {
+            const __m128i e = _mm_and_si128(b, _mm_set1_epi32(0x7F800000));
+            const __m128i sign = _mm_and_si128(b, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+            b = _mm_blendv_epi8(b, sign, _mm_cmpeq_epi32(e, _mm_setzero_si128()));
+            return _mm_blendv_epi8(b, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7F800000)));
+        }
+
+        VU1AOT_INLINE __m128 nz4(const float *v) { return _mm_castsi128_ps(nz4i(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v)))); }
+        VU1AOT_INLINE __m128 nz4v(__m128 v) { return _mm_castsi128_ps(nz4i(_mm_castps_si128(v))); }
+
+        // The clamped copies (Ctx::nv / nacc) from the registers.
+        template <uint8_t R>
+        VU1AOT_INLINE void refreshNv(Ctx &c) { _mm_storeu_ps(c.nv[R], nz4(c.s.vf[R])); }
+        VU1AOT_INLINE void refreshNacc(Ctx &c) { _mm_storeu_ps(c.nacc, nz4(c.s.acc)); }
+        template <bool TOACC, uint8_t FD>
+        VU1AOT_INLINE void refreshDst(Ctx &c)
+        {
+            if constexpr (TOACC)
+                refreshNacc(c);
+            else
+                refreshNv<FD>(c);
+        }
+        VU1AOT_INLINE void initNv(Ctx &c)
+        {
+            for (uint32_t r = 0; r < 32u; ++r)
+                _mm_storeu_ps(c.nv[r], nz4(c.s.vf[r]));
+            refreshNacc(c);
+        }
+
+        VU1AOT_INLINE __m128i exp4(__m128 v) { return _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(v), 23), _mm_set1_epi32(0xFF)); }
+
+        VU1AOT_INLINE __m128 signBit4() { return _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))); }
+
+        // DEST (0x8 = x) -> SSE lane bits (bit 0 = x), for movemask / blends. Use it in constant expressions only.
+        constexpr int laneMask(uint8_t dest) { return ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8); }
+
+        // Lane bits (bit 0 = x) -> a lane mask (all ones in the lanes set).
+        VU1AOT_INLINE __m128 bitsMask(int bits)
+        {
+            const __m128i sel = _mm_setr_epi32(1, 2, 4, 8);
+            return _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(bits), sel), sel));
+        }
+
+        template <uint8_t DEST>
+        VU1AOT_INLINE void store4(float *dst, __m128 r)
+        {
+            constexpr int m = laneMask(DEST);
+            if constexpr (m == 0xF)
+                _mm_storeu_ps(dst, r);
+            else if constexpr (m != 0)
+                _mm_storeu_ps(dst, _mm_blend_ps(_mm_loadu_ps(dst), r, m));
+        }
+
         constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
         constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
 
@@ -221,6 +277,15 @@ namespace vu1aot
             return ((uint32_t)(int32_t)(vi + IMM11(I))) * 16u & (c.dataSize - 1);
         }
 
+        // LQ / LQI: the qword (raw bits) into the register's lanes, its clamped value into the copy.
+        template <uint8_t DEST, uint8_t VFT>
+        VU1AOT_INLINE void loadVf(Ctx &c, const uint8_t *source)
+        {
+            const __m128 v = _mm_loadu_ps(reinterpret_cast<const float *>(source));
+            store4<DEST>(c.s.vf[VFT], v);
+            store4<DEST>(c.nv[VFT], nz4v(v));
+        }
+
         template <uint32_t I>
         VU1AOT_INLINE void lower(Ctx &c)
         {
@@ -233,11 +298,7 @@ namespace vu1aot
             {
                 const uint32_t addr = qwordAddress<I>(s.vi[viS], c);
                 if (addr + 16 <= c.dataSize)
-                {
-                    float tmp[4];
-                    std::memcpy(tmp, c.data + addr, 16);
-                    applyDest(s.vf[vfT], tmp, dest);
-                }
+                    loadVf<dest, vfT>(c, c.data + addr);
             }
             else if constexpr (opHi == 0x01) // SQ
             {
@@ -295,24 +356,24 @@ namespace vu1aot
             }
             else if constexpr (opHi == 0x40 && (I & 0x3F) >= 0x3C && ((I & 0x3u) | ((I >> 4) & 0x7Cu)) == 0x30) // MOVE
             {
-                float tmp[4];
-                std::memcpy(tmp, s.vf[vfS], 16);
-                applyDest(s.vf[vfT], tmp, dest);
+                // The copy of the clamped source is the clamped copy (clamping works lane by lane).
+                const __m128 v = _mm_loadu_ps(s.vf[vfS]);
+                const __m128 n = _mm_loadu_ps(c.nv[vfS]);
+                store4<dest>(s.vf[vfT], v);
+                store4<dest>(c.nv[vfT], n);
             }
             else if constexpr (opHi == 0x40 && (I & 0x3F) >= 0x3C && ((I & 0x3u) | ((I >> 4) & 0x7Cu)) == 0x31) // MR32
             {
-                float tmp[4] = {s.vf[vfS][1], s.vf[vfS][2], s.vf[vfS][3], s.vf[vfS][0]};
-                applyDest(s.vf[vfT], tmp, dest);
+                const __m128 v = _mm_loadu_ps(s.vf[vfS]);
+                const __m128 n = _mm_loadu_ps(c.nv[vfS]);
+                store4<dest>(s.vf[vfT], _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 3, 2, 1))); // y z w x
+                store4<dest>(c.nv[vfT], _mm_shuffle_ps(n, n, _MM_SHUFFLE(0, 3, 2, 1)));
             }
             else if constexpr (opHi == 0x40 && (I & 0x3F) >= 0x3C && ((I & 0x3u) | ((I >> 4) & 0x7Cu)) == 0x34) // LQI
             {
                 const uint32_t addr = ((uint32_t)(uint16_t)s.vi[viS]) * 16u & (c.dataSize - 1);
                 if (addr + 16 <= c.dataSize)
-                {
-                    float tmp[4];
-                    std::memcpy(tmp, c.data + addr, 16);
-                    applyDest(s.vf[vfT], tmp, dest);
-                }
+                    loadVf<dest, vfT>(c, c.data + addr);
                 if constexpr (viS != 0)
                     s.vi[viS] = (int16_t)(s.vi[viS] + 1);
             }
@@ -351,39 +412,6 @@ namespace vu1aot
         //    expressions (no NaN after clamping).
         //  - OPMSUB / OPMULA always take the interpreter's exact path: the scalar template.
 
-        VU1AOT_INLINE __m128i nz4i(__m128i b)
-        {
-            const __m128i e = _mm_and_si128(b, _mm_set1_epi32(0x7F800000));
-            const __m128i sign = _mm_and_si128(b, _mm_set1_epi32(static_cast<int>(0x80000000u)));
-            b = _mm_blendv_epi8(b, sign, _mm_cmpeq_epi32(e, _mm_setzero_si128()));
-            return _mm_blendv_epi8(b, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), _mm_cmpeq_epi32(e, _mm_set1_epi32(0x7F800000)));
-        }
-
-        VU1AOT_INLINE __m128 nz4(const float *v) { return _mm_castsi128_ps(nz4i(_mm_loadu_si128(reinterpret_cast<const __m128i *>(v)))); }
-
-        VU1AOT_INLINE __m128i exp4(__m128 v) { return _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(v), 23), _mm_set1_epi32(0xFF)); }
-
-        VU1AOT_INLINE __m128 signBit4() { return _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))); }
-
-        // DEST (0x8 = x) -> SSE lane bits (bit 0 = x), for movemask / blends. Use it in constant expressions only.
-        constexpr int laneMask(uint8_t dest) { return ((dest >> 3) & 1) | ((dest >> 1) & 2) | ((dest << 1) & 4) | ((dest << 3) & 8); }
-
-        // Lane bits (bit 0 = x) -> a lane mask (all ones in the lanes set).
-        VU1AOT_INLINE __m128 bitsMask(int bits)
-        {
-            const __m128i sel = _mm_setr_epi32(1, 2, 4, 8);
-            return _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(bits), sel), sel));
-        }
-
-        template <uint8_t DEST>
-        VU1AOT_INLINE void store4(float *dst, __m128 r)
-        {
-            constexpr int m = laneMask(DEST);
-            if constexpr (m == 0xF)
-                _mm_storeu_ps(dst, r);
-            else if constexpr (m != 0)
-                _mm_storeu_ps(dst, _mm_blend_ps(_mm_loadu_ps(dst), r, m));
-        }
 
         // The second operand of every lane, clamped (yOperand for 4 lanes; not YCross).
         template <YSource Y, uint8_t FT, uint8_t BC>
@@ -391,7 +419,7 @@ namespace vu1aot
         {
             if constexpr (Y == YBc)
             {
-                const __m128 t = nz4(c.s.vf[FT]);
+                const __m128 t = _mm_loadu_ps(c.nv[FT]);
                 return _mm_shuffle_ps(t, t, _MM_SHUFFLE(BC, BC, BC, BC));
             }
             else if constexpr (Y == YQ)
@@ -399,7 +427,7 @@ namespace vu1aot
             else if constexpr (Y == YI)
                 return _mm_set1_ps(nz(c.s.i));
             else
-                return nz4(c.s.vf[FT]);
+                return _mm_loadu_ps(c.nv[FT]);
         }
 
         // An FMAC-family instruction with flags not live (the caller knows: c.flagsLive is false).
@@ -410,17 +438,30 @@ namespace vu1aot
             {
                 FlagResult unused;
                 fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, unused);
+                refreshDst<TOACC, FD>(c);
             }
             else
             {
                 constexpr int M = laneMask(DEST);
-                const __m128 vs = nz4(c.s.vf[FS]);
+                const __m128 vs = _mm_loadu_ps(c.nv[FS]);
                 const __m128 y = yOperand4<Y, FT, BC>(c);
                 float *dst = TOACC ? c.s.acc : c.s.vf[FD];
+                float *ndst = TOACC ? c.nacc : c.nv[FD];
+                // Every result stored below is already clamped (both operands were; an exponent-0 result keeps only
+                // its sign; round toward zero never overflows to infinity), except where noted: it goes into the
+                // copy as it is.
                 if constexpr (OP == Op::Max)
-                    store4<DEST>(dst, _mm_max_ps(vs, y)); // (vs > y) ? vs : y
+                {
+                    const __m128 r = _mm_max_ps(vs, y); // (vs > y) ? vs : y
+                    store4<DEST>(dst, r);
+                    store4<DEST>(ndst, r);
+                }
                 else if constexpr (OP == Op::Min)
-                    store4<DEST>(dst, _mm_min_ps(vs, y)); // (vs < y) ? vs : y
+                {
+                    const __m128 r = _mm_min_ps(vs, y); // (vs < y) ? vs : y
+                    store4<DEST>(dst, r);
+                    store4<DEST>(ndst, r);
+                }
                 else if constexpr (OP == Op::Add || OP == Op::Sub || OP == Op::Mul)
                 {
                     __m128 r;
@@ -431,11 +472,13 @@ namespace vu1aot
                     else
                         r = _mm_mul_ps(vs, y);
                     const __m128 tiny = _mm_castsi128_ps(_mm_cmpeq_epi32(exp4(r), _mm_setzero_si128()));
-                    store4<DEST>(dst, _mm_blendv_ps(r, _mm_and_ps(r, signBit4()), tiny));
+                    r = _mm_blendv_ps(r, _mm_and_ps(r, signBit4()), tiny);
+                    store4<DEST>(dst, r);
+                    store4<DEST>(ndst, r);
                 }
                 else
                 {
-                    const __m128 acc = nz4(c.s.acc);
+                    const __m128 acc = _mm_loadu_ps(c.nacc);
                     const __m128 product = _mm_mul_ps(vs, y);
                     __m128 r;
                     if constexpr (OP == Op::MAdd)
@@ -448,12 +491,14 @@ namespace vu1aot
                     {
                         FlagResult unused;
                         fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, unused);
+                        refreshDst<TOACC, FD>(c);
                         return;
                     }
                     const __m128i er = exp4(r);
                     __m128i fast = _mm_and_si128(_mm_cmpgt_epi32(er, _mm_set1_epi32(1)), _mm_cmplt_epi32(er, _mm_set1_epi32(254)));
                     fast = _mm_and_si128(fast, _mm_cmpgt_epi32(_mm_add_epi32(er, _mm_set1_epi32(21)), exp4(acc)));
                     const int slow = ~_mm_movemask_ps(_mm_castsi128_ps(fast)) & M;
+                    __m128 rn = r; // the copy: r is clamped on the fast lanes
                     if (slow != 0)
                     {
                         // normalizeFmacExactResult: the double result (the product of two floats is exact in double).
@@ -472,8 +517,10 @@ namespace vu1aot
                         const __m128 sign = _mm_and_ps(bitsMask(_mm256_movemask_pd(d)), signBit4());
                         r = _mm_blendv_ps(r, sign, bitsMask(slow & below));
                         r = _mm_blendv_ps(r, _mm_or_ps(sign, _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF))), bitsMask(slow & above));
+                        rn = nz4v(r); // a lane between FLT_MIN and FLT_MAX exactly keeps the float result: maybe below
                     }
                     store4<DEST>(dst, r);
+                    store4<DEST>(ndst, rn);
                 }
             }
         }
@@ -485,6 +532,7 @@ namespace vu1aot
             if (c.flagsLive)
             {
                 fmac<OP, Y, DEST, FS, FT, FD, BC, TOACC, INSTR>(c, flags);
+                refreshDst<TOACC, FD>(c);
                 return;
             }
             flags = {};
@@ -504,6 +552,7 @@ namespace vu1aot
             else if constexpr (SC == 3)
                 r = _mm_div_ps(r, _mm_set1_ps(32768.0f));
             store4<DEST>(c.s.vf[FT], r);
+            store4<DEST>(c.nv[FT], r);
         }
 
         // FTOI0 / 4 / 12 / 15 (special 0x14..0x17): vuFloatToInt of the clamped operand into FT: the double product
@@ -512,7 +561,7 @@ namespace vu1aot
         template <uint8_t SC, uint8_t DEST, uint8_t FS, uint8_t FT>
         VU1AOT_INLINE void ftoi(Ctx &c)
         {
-            __m256d d = _mm256_cvtps_pd(nz4(c.s.vf[FS]));
+            __m256d d = _mm256_cvtps_pd(_mm_loadu_ps(c.nv[FS]));
             if constexpr (SC == 1)
                 d = _mm256_mul_pd(d, _mm256_set1_pd(16.0));
             else if constexpr (SC == 2)
@@ -520,14 +569,18 @@ namespace vu1aot
             else if constexpr (SC == 3)
                 d = _mm256_mul_pd(d, _mm256_set1_pd(32768.0));
             d = _mm256_min_pd(d, _mm256_set1_pd(2147483647.0));
-            store4<DEST>(c.s.vf[FT], _mm_castsi128_ps(_mm256_cvttpd_epi32(d)));
+            const __m128 r = _mm_castsi128_ps(_mm256_cvttpd_epi32(d));
+            store4<DEST>(c.s.vf[FT], r);
+            store4<DEST>(c.nv[FT], nz4v(r));
         }
 
         // ABS (special 0x1D): fabs of the clamped operand into FT.
         template <uint8_t DEST, uint8_t FS, uint8_t FT>
         VU1AOT_INLINE void absT(Ctx &c)
         {
-            store4<DEST>(c.s.vf[FT], _mm_and_ps(nz4(c.s.vf[FS]), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))));
+            const __m128 r = _mm_and_ps(_mm_loadu_ps(c.nv[FS]), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
+            store4<DEST>(c.s.vf[FT], r);
+            store4<DEST>(c.nv[FT], r);
         }
 
         // CLIP (special 0x1F): x, y, z (raw bits, as signed integers) against +|w| and -|w|, six bits shifted into the

@@ -263,3 +263,23 @@ code per image: from the profiled entries, following branches and the profiled J
 - Busy spot (`-NoKickHash`): smooth ~118 -> ~120 FPS (the cap), plain 120 ~116 -> ~120; graphics thread 100% ->
   92-94% busy, the game thread no longer waits for it (room waits ~2600 per second -> 0). The GS thread (~86%) is
   next.
+
+## Speed at 120 FPS: clamped copies of the registers (2026-11-16)
+
+- Every SSE FMAC template clamped each operand (vuNormalizeOperand on 4 lanes, ~7 vector operations) on every use,
+  about half of the instruction's work. Now `Ctx::nv` / `nacc` hold the clamped value of every VF register and of ACC:
+  `ops::initNv` sets them when a run starts, and every write of a register refreshes its copy before the next read.
+  The templates read the copies; what they store is clamped already (both operands were; an exponent-0 result keeps
+  its sign; round toward zero never overflows to infinity; MAX / MINI return an operand; ITOF gives zero or a normal
+  float; ABS of a clamped value), so the result goes into both. Exceptions take `nz4v` of the result or a refresh
+  from the register: the MADD / MSUB lanes that keep the float result between FLT_MIN and FLT_MAX (it can be below),
+  FTOI (integers), the scalar fallbacks (OPMSUB / OPMULA / cross, a product that may overflow, `fmacSse` with flags),
+  the generic `upper()`. The generator adds a refresh after lowerPlain writes of a VF register (decode table), after
+  a pair with a VF shadow (the shadow's final value), and when VF0 is restored.
+- First try: the refresh after LQ / LQI read the register back right after `applyDest` wrote it lane by lane: a
+  store-forwarding stall on every load (the hottest lines of the programs; busy spot 120 -> 113 FPS). Now LQ, LQI,
+  MOVE and MR32 write the register with one 16-byte store and set the copy from the value itself (`loadVf`,
+  MOVE / MR32 copy the copy: clamping works lane by lane), and FTOI clamps its result instead of reading it back.
+- Busy spot (`-NoKickHash`, 120 FPS both modes): graphics thread 92-94% -> 75-77% busy; the GS thread (~80-85%) is
+  now the busiest of the three.
+- Diff mode (the same 5 scenarios): 7.95 million VU1 and 3.87 million VU0 runs compared, 0 differences.

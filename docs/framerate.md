@@ -267,6 +267,10 @@ game time per wall-clock second while the host is overloaded (metric game_ms_per
     thread fixes). Still the limit there: the graphics thread (VU1 programs ~50%: `prog_6af8ebd05633`,
     `prog_4ead7b35a3a6`; VIF unpack ~6%; three locks per packet on the way to the GS ~5%). docs/vu1_aot.md: a real
     gain in the programs needs the VF registers in SSE locals across a block.
+- **VU1 code generator** (same day, docs/vu1_aot.md "Speed at 120 FPS"): the per-pair transfer and budget checks
+  only where they matter, then clamped copies of the registers (no operand clamping per FMAC instruction). Busy spot:
+  **~120 FPS in both modes** (the cap); graphics thread 100% -> 92-94% -> 75-77% busy, GS thread ~80-85% (now the
+  busiest), the game thread no longer waits for room in the graphics queue.
 
 ## Frame-rate bugs in the game's scripts (2026-11-15)
 
