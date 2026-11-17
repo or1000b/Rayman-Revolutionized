@@ -302,6 +302,23 @@ replaced `shop_exit.input`; the shop recording is back from its kept copy). Stan
   instead of 118-119); `PS2X_GS_QUEUE_MB=32` (no waits left to absorb once the frame contexts were raised; the
   setting stays).
 
+## The game thread (2026-11-17)
+
+- The user's session after the VU1 budget fix (out/logs, 2026-11-16 23:13) was at 120 almost everywhere, but had dips
+  to 85-112 where neither the GS nor the graphics thread was at 100%. The game thread's load was not logged: now
+  `game busy=N%` in `[threads]` (real time minus its sleep in the EE scheduler waiting for VBlank). At the shop busy
+  spot it was the busiest thread (95%; GS 73%, graphics 76%).
+- `PS2X_NATIVE_PROF_THREAD=GameThread` + `PS2X_NATIVE_PROF_CHAIN`: ~12% was the EE scheduler at every checkpoint
+  (`processPendingEvents` / `processDueDeadlines`: three locks and a new `std::deque` per call, even with nothing
+  due). Now a lock-free "is anything due" test on the atomic earliest deadline, reused event buffers, no swap lock
+  when nothing was posted. Game thread 95% -> 85%. `[det]` fingerprints identical (7 scenarios).
+- The dispatcher's hottest instruction (`dispatchGuestBranch`, 4% of the thread on one address) was a store-forwarding
+  stall: `trace = BranchTraceEntry{...}` built a temporary with narrow stores and copied it with a 16-byte load on every
+  guest call (same for `GuestCallFrame`). Written field by field: dispatch 12% -> 6% of the thread, game thread
+  ~83% busy (~15% asleep waiting for VBlank).
+- Busy spot by the shop: all three threads below 85% at 120. Bridge (`bridge_120`): ~120 FPS (all three still at
+  their limit there).
+
 ## Frame-rate bugs in the game's scripts (2026-11-15)
 
 The physics steps once per frame, so a scripted move ends at a slightly different spot at another frame rate. Where a
