@@ -1035,40 +1035,29 @@
       ]
     },
     {
-      "name": "autosave_write",
-      "description": "Auto-save (PS2X_AUTOSAVE=1, main.cpp installRaymanAutosave): load the user's save by the ability shop (a copy of the card) and play on; the game's own save writes the progress into its own slot BESLES-50044jjjjjjjjj ('auto') 10 s after the level is loaded and then every 15 s here, after a backup of the card. The player's slots stay as they were.",
+      "name": "autosave_question",
+      "description": "Auto-save (PS2X_AUTOSAVE=1, main.cpp installRaymanAutosave): the user's bridge recording (tests/fixtures/autosave_question.input = a local copy of bridge_120.input); after the portal the game asks 'do you want to save the game?' (VSync ~3596; in the recording the user then chose yes, the slot, overwrite yes). With auto-save the game saves into the current slot (BESLES-50044iggbdbfcj, on a copy of the card) and the question is answered 'no', so the game goes on without the dialogs. The rest of the recording then drives gameplay instead of the dialogs.",
       "renderer": "gpu",
       "memcard": "fixtures\\mc_shop\\mc0",
-      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
-      "frames": 5200,
-      "shots": [5000],
+      "input": "",
+      "frames": 2000,
+      "shots": [1650, 1900],
       "env": {
-        "PS2X_AUTOSAVE": "1",
-        "PS2X_AUTOSAVE_MINUTES": "0.25"
+        "PS2X_FRAMERATE": "120",
+        "PS2X_GS_SSAA": "4",
+        "PS2X_WIDESCREEN": "16:9",
+        "PS2X_GFX_THREAD": "1",
+        "PS2X_HUD": "0",
+        "PS2X_AUTOSAVE": "1"
       },
       "checks": [
-        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
-        { "type": "log_present", "pattern": "\\[autosave\\] memory card backed up to .*mc0_backups", "label": "the card is backed up before the first auto-save" },
-        { "type": "log_present", "pattern": "\\[autosave\\] vsync \\d+: saving \\(new place\\)", "label": "an auto-save 10 s after the level is loaded" },
-        { "type": "log_present", "pattern": "\\[autosave\\] vsync \\d+: saving \\(timer\\)", "label": "an auto-save after the set time" },
-        { "type": "log_present", "pattern": "\\[autosave\\] vsync \\d+: saved \\(2 saved, 0 failed", "label": "both written" },
-        { "type": "log_absent", "pattern": "\\[autosave\\] vsync \\d+: FAILED", "label": "no auto-save failed" },
-        { "type": "shot", "tick": 5000, "min_variance": 300, "label": "the game goes on after the auto-saves" }
-      ]
-    },
-    {
-      "name": "autosave_load",
-      "description": "Load an auto-save: a card that holds only the slot BESLES-50044jjjjjjjjj written by the auto-save (tests/fixtures/mc_auto/mc0, local, copied from an autosave_write run). MAIN MENU -> LOAD -> the first slot -> YES must read it and start the level.",
-      "renderer": "gpu",
-      "memcard": "fixtures\\mc_auto\\mc0",
-      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
-      "frames": 5200,
-      "shots": [2500, 2600, 2700, 2800, 5000],
-      "checks": [
-        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
-        { "type": "log_present", "pattern": "GetDir port=0 'BESLES-50044jjjjjjjjj/BESLES-50044jjjjjjjjj'", "label": "the auto-save's progress file is read" },
-        { "type": "log_present", "pattern": "Sync cmd=5 result=40316", "label": "all 40316 bytes read" },
-        { "type": "shot", "tick": 5000, "min_variance": 300, "label": "a level shows after loading the auto-save" }
+        {"type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)"},
+        {"type": "log_present", "pattern": "\\[autosave\\] vsync \\d+: the game asks to save: saving into BESLES-50044iggbdbfcj", "label": "the save question is caught"},
+        {"type": "log_present", "pattern": "\\[autosave\\] memory card backed up to .*mc0_backups", "label": "the card is backed up first"},
+        {"type": "log_present", "pattern": "Sync cmd=6 result=40316", "label": "the game's save is written"},
+        {"type": "log_present", "pattern": "\\[autosave\\] vsync \\d+: saved, the question is answered", "label": "saved, then the question is answered no"},
+        {"type": "log_absent", "pattern": "\\[autosave\\] vsync \\d+: (the question did not close|FAILED)", "label": "the question closes"},
+        {"type": "shot", "tick": 1900, "min_variance": 300, "label": "the game goes on in the level"}
       ]
     },
     {

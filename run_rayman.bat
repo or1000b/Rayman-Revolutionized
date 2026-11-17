@@ -12,7 +12,7 @@ rem (docs\vu1_aot.md). It only hooks the interpreter, which runs just that code,
 rem Claude regenerates the native code from the recordings (tools\vu1aot\vu1gen.py). Set to 0 to turn it off.
 if not defined PS2X_VU1_PROFILE set PS2X_VU1_PROFILE=1
 if not defined PS2X_VU0_PROFILE set PS2X_VU0_PROFILE=1
-rem Auto-save into the game's own "AUTO" slot (your saves are never touched; the card is backed up first to
+rem Auto-save: when the game asks to save, it saves into the current save and goes on (the card is backed up first to
 rem "Rayman revolution files\mc0_backups"). run_rayman_hd.bat has the setting; 0 = off.
 if not defined PS2X_AUTOSAVE set PS2X_AUTOSAVE=1
 echo Starting Rayman Revolution... (log: %RUNLOG%)

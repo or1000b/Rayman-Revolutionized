@@ -900,12 +900,26 @@ extern "C" void ps2xTestRecordPad(int port, uint16_t *buttonsInOut, uint8_t axes
 }
 
 // EE thread (scePadRead): buttons the script holds down right now, active-high.
+// main.cpp (auto-save answers the game's save question): buttons held down on port 1 for a few VSyncs, merged like
+// scripted input (and recorded like it).
+static std::atomic<uint32_t> g_injectedMask{0u};
+static std::atomic<uint64_t> g_injectedUntil{0u};
+
+extern "C" void ps2xInjectPadPress(uint16_t mask, uint32_t vsyncs)
+{
+    g_injectedMask.store(mask, std::memory_order_relaxed);
+    g_injectedUntil.store(g_guestVsync.load(std::memory_order_relaxed) + vsyncs, std::memory_order_relaxed);
+}
+
 extern "C" uint16_t ps2xTestPadButtons(int port)
 {
+    const uint16_t injected = (port == 0 && g_guestVsync.load(std::memory_order_relaxed) < g_injectedUntil.load(std::memory_order_relaxed))
+                                  ? static_cast<uint16_t>(g_injectedMask.load(std::memory_order_relaxed))
+                                  : 0u;
     if (!scriptDrivesPort(port) || g_padScript.empty())
-        return 0;
+        return injected;
     const uint64_t tick = inputClock();
-    uint16_t mask = 0;
+    uint16_t mask = injected;
     for (const PadEvent &ev : g_padScript)
     {
         if (ev.axis < 0 && tick >= ev.tick && tick < ev.tick + ev.hold)

@@ -39,11 +39,9 @@ set PS2X_HUD_DUMP=1
 rem Show the FPS counter: 1 = yes, 0 = no.
 set PS2X_SHOW_FPS=1
 
-rem Auto-save: 1 = the game saves itself into a slot of its own, "AUTO" in the LOAD MENU (10 seconds after a new level
-rem loads, and every few minutes of play). Your own saves are never touched; the memory card is backed up first to
-rem "Rayman revolution files\mc0_backups" (the newest 10 are kept). 0 = off.
+rem Auto-save: 1 = when the game asks "do you want to save the game?" (for example when you enter a level), it saves
+rem into the save you are playing and goes on without asking. The memory card is backed up first, once per run, to
+rem "Rayman revolution files\mc0_backups" (the newest 10 are kept). 0 = off (the game asks, as on the PS2).
 set PS2X_AUTOSAVE=1
-rem Minutes of play between auto-saves.
-set PS2X_AUTOSAVE_MINUTES=5
 
 call "%~dp0run_rayman.bat"

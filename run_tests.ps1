@@ -223,7 +223,7 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     (Get-Item -Force $mcRoot).LastWriteTime = $cardTime
     $env:PS2X_MC_ROOT = $mcRoot
     # No auto-save in test runs and recordings (the launchers turn it on; it runs extra game code, so a replay would
-    # differ), unless the scenario asks for it (autosave_write).
+    # differ), unless the scenario asks for it (autosave_question).
     $env:PS2X_AUTOSAVE = '0'
     # Extra variables of this scenario ("env": { "PS2X_UBI_TRACE": "1" }); cleared again after the run.
     $extraEnv = @()

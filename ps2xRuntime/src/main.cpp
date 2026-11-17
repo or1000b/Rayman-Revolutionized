@@ -31,6 +31,7 @@ extern "C" void ps2xSetGameStatsLine(int (*fn)(const uint8_t *rdram, char *buffe
 void ps2xVu1ProfileFlush(); // ps2_vu1_core.cpp
 int ps2xVu1AotReplay(const char *path); // ps2_vu1_core.cpp: PS2X_VU1AOT_REPLAY
 extern "C" uint32_t ps2xVBlankRateOverrideHz(); // EeScheduler.cpp (PS2X_FRAMERATE)
+extern "C" void ps2xInjectPadPress(uint16_t mask, uint32_t vsyncs); // ps2_test_harness.cpp
 extern "C" bool ps2xGuestYieldPending();        // ps2_runtime.cpp
 extern "C" void ps2xHudFrameMark(int drawOnly);  // gs_frontend.cpp: the HUD layer's frame mark
 extern "C" void ps2xSetGuestVsyncHook(void (*fn)(uint64_t scriptTime, uint64_t vsync, const uint8_t *rdram)); // ps2_test_harness.cpp
@@ -2226,33 +2227,36 @@ namespace
     }
 
     // ------------------------------------------------------------------
-    // PS2X_AUTOSAVE=1: the game saves itself into a slot of its own, BESLES-50044jjjjjjjjj named "auto" (the user's
-    // choice, 2026-11-17: never overwrite the player's own saves), every PS2X_AUTOSAVE_MINUTES (default 5) of play and
-    // 10 s after a new place is loaded. It is the game's own save: the current save slot at 0x34A300 (+0x40 play
-    // time, +0x44 the folder's id, +0x48 completion %, +0x4A "saved", +0x4B name, +0x52 folder suffix, +0x5C stage
-    // text: the game keeps these up to date) is pointed at the auto-save folder, 0x1455E0 (slot, data, size, new
-    // folder = 0) writes icon.sys, data.add and the 40316-byte progress data at 0x34A380 (the live data, not a copy:
-    // it is the same as the save file plus what changed since), and the slot's id, flag, name and suffix go back, so
-    // the player's own saves keep going to the player's slot. 0x140DC0 creates the folder (and its icons) the first
-    // time. The write is entered from the game step's entry (between two frames) like a guest call: the step's
-    // registers are kept, 0x1455E0 returns to an unused address whose hook puts them back and enters the step again.
-    // Before the first auto-save of a run the whole card folder is copied to <card>_backups/<date> (newest 10 kept).
+    // PS2X_AUTOSAVE=1 (the launchers' default): when the game asks "do you want to save the game?" (after entering a
+    // level, ...), it saves by itself instead (the user's wish, 2026-11-17): into the current save slot, with the game's
+    // own "save the current game" routine 0x145168 (what YES -> the slot -> overwrite YES ends in: the slot's folder,
+    // or a new one for a game that has none), and then the question is answered "no" (the default: a press of X, after
+    // a press of right if "yes" is lit), so the game goes on as if the player declined - after the save.
+    // Found with the user's bridge recording (bridge_120: the question at VSync ~3596, after the portal): the menu shows
+    // text 410 of the text table ([0x254034]: 1009 string pointers; 453 / 454 = "yes" / "no") in one of its text
+    // objects (0x380B00..: string pointer, x, y, size, flags; flags 0 = hidden, above 0xFF = the lit choice).
+    // The save record at 0x34A300 (+0x40 play time, +0x44 the folder's id, +0x48 completion %, +0x4A "saved", +0x4B
+    // name, +0x52 folder suffix, +0x5C stage text) and the live progress data at 0x34A380 are the game's own.
+    // The save is entered from the game step's entry (between two frames) like a guest call: the step's registers are
+    // kept, 0x145168 returns to an unused address whose hook puts them back and enters the step again. Before the first
+    // auto-save of a run the whole card folder is copied to <card>_backups/<date> (newest 10 kept).
     constexpr uint32_t kRaymanSaveSlotAddr = 0x0034A300u;
-    constexpr uint32_t kRaymanSaveDataAddr = 0x0034A380u;
-    constexpr uint32_t kRaymanSaveDataBytes = 0x9D7Cu;
-    constexpr uint32_t kRaymanSaveWriteAddr = 0x001455E0u;
-    constexpr uint32_t kRaymanAutosaveReturnAddr = 0x001456ECu; // padding after 0x1455E0 (never executed)
-    constexpr char kRaymanAutosaveSuffix[] = "jjjjjjjjj";        // 9 letters, like the game's (digits of a time, 0 = a)
-    constexpr char kRaymanAutosaveName[] = "auto";
+    constexpr uint32_t kRaymanSaveCurrentAddr = 0x00145168u;      // (save record): saves the current game
+    constexpr uint32_t kRaymanAutosaveReturnAddr = 0x001456ECu;   // padding after 0x1455E0 (never executed)
+    constexpr uint32_t kRaymanTextTablePtr = 0x00254034u;
+    constexpr uint32_t kRaymanTextSaveQuestion = 410u, kRaymanTextYes = 453u, kRaymanTextNo = 454u;
+    constexpr uint32_t kRaymanMenuTextsFrom = 0x00380B00u, kRaymanMenuTextsTo = 0x00381400u;
+    constexpr uint16_t kRaymanPadCross = 0x4000u, kRaymanPadRight = 0x0020u; // libpad bits (Pad.cpp order)
+    enum class RaymanAutosaveState
+    {
+        Idle,
+        Saving,  // 0x145168 runs
+        Closing, // the question is being answered "no"
+    };
     struct RaymanAutosave
     {
-        uint64_t intervalVsyncs = 0u;
-        uint64_t rateHz = 50u;
-        uint64_t lastSaveVsync = 0u;
-        uint64_t lastStepVsync = 0u;
-        uint64_t dueVsync = 0u; // a save scheduled after a new place was loaded (0 = none)
-        uint64_t playStartVsync = 0u; // since when a game is in progress without a break (0 = not now)
-        bool writing = false;
+        RaymanAutosaveState state = RaymanAutosaveState::Idle;
+        uint64_t closingSince = 0u, lastPress = 0u;
         bool backedUp = false;
         uint32_t saves = 0u, failures = 0u;
         // The interrupted step call's registers.
@@ -2261,7 +2265,6 @@ namespace
         uint32_t sa = 0u, fcr31 = 0u;
         float f[32] = {};
         float facc = 0.0f;
-        uint8_t slot[0x20] = {}; // the slot's bytes +0x40..+0x5F before the write
     };
     RaymanAutosave g_raymanAutosave;
     void raymanSetArg(R5900Context *ctx, int reg, uint32_t value) // sign-extended, as the R5900 keeps 32-bit values
@@ -2301,91 +2304,102 @@ namespace
             fs::remove_all(all[i], ec);
     }
 
-    // A game in progress (a save loaded or a game started: the slot has its stage text), not the attract demo.
-    bool raymanAutosaveAllowed(const uint8_t *rdram, uint32_t gp)
+    struct RaymanSaveQuestion
     {
-        if (raymanDemoPlayback(rdram, gp))
-            return false;
-        if (rdram[kRaymanSaveSlotAddr + 0x5Cu] == 0u)
-            return false;
-        for (uint32_t i = 0; i < 1024u; i += 4u) // progress data present
-            if (raymanRam32(rdram, kRaymanSaveDataAddr + i) != 0u)
-                return true;
-        return false;
+        bool shown = false, yesLit = false, noLit = false;
+    };
+
+    RaymanSaveQuestion raymanFindSaveQuestion(const uint8_t *rdram)
+    {
+        RaymanSaveQuestion q;
+        const uint32_t table = raymanRam32(rdram, kRaymanTextTablePtr);
+        if (!raymanGuestPtr(table))
+            return q;
+        const uint32_t question = raymanRam32(rdram, table + kRaymanTextSaveQuestion * 4u);
+        const uint32_t yes = raymanRam32(rdram, table + kRaymanTextYes * 4u);
+        const uint32_t no = raymanRam32(rdram, table + kRaymanTextNo * 4u);
+        if (question < 0x00100000u || question >= 0x02000000u) // a string: any alignment
+            return q;
+        for (uint32_t a = kRaymanMenuTextsFrom; a < kRaymanMenuTextsTo; a += 4u)
+        {
+            const uint32_t text = raymanRam32(rdram, a);
+            if (text != question && text != yes && text != no)
+                continue;
+            const uint32_t flags = raymanRam32(rdram, a + 0x10u);
+            if (flags == 0u)
+                continue; // hidden
+            if (text == question)
+                q.shown = true;
+            else if (text == yes)
+                q.yesLit = q.yesLit || flags > 0xFFu;
+            else
+                q.noLit = q.noLit || flags > 0xFFu;
+        }
+        return q;
     }
 
     void raymanAutosaveStep(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         RaymanAutosave &a = g_raymanAutosave;
         const uint64_t vsync = ps2xGuestVsync();
-        if (!a.writing)
+        const uint32_t rate = std::max<uint32_t>(50u, ps2xVBlankRateOverrideHz());
+        if (a.state == RaymanAutosaveState::Idle && !raymanDemoPlayback(rdram, getRegU32(ctx, 28)) &&
+            raymanFindSaveQuestion(rdram).shown)
         {
-            // A second or more without a game step: a new place (or a menu) was loaded; save once it has run 10 s.
-            if (vsync - a.lastStepVsync > a.rateHz)
-                a.dueVsync = vsync + 10u * a.rateHz;
-            a.lastStepVsync = vsync;
-            const bool allowed = raymanAutosaveAllowed(rdram, getRegU32(ctx, 28));
-            // The timer counts play only: from the last auto-save, or from when a game was first in progress.
-            if (!allowed)
-                a.playStartVsync = 0u;
-            else if (a.playStartVsync == 0u)
-                a.playStartVsync = vsync;
-            const uint64_t since = std::max(a.lastSaveVsync, a.playStartVsync);
-            const bool timer = allowed && since != 0u && vsync - since >= a.intervalVsyncs;
-            bool place = a.dueVsync != 0u && vsync >= a.dueVsync;
-            if (place && (!allowed || (a.lastSaveVsync != 0u && vsync - a.lastSaveVsync < 60u * a.rateHz)))
+            if (!a.backedUp)
             {
-                a.dueVsync = 0u; // not in a game, or saved less than a minute ago
-                place = false;
+                a.backedUp = true;
+                raymanAutosaveBackup();
             }
-            if (timer || place)
+            a.state = RaymanAutosaveState::Saving;
+            std::memcpy(a.r, ctx->r, sizeof(a.r));
+            a.hi = ctx->hi;
+            a.lo = ctx->lo;
+            a.hi1 = ctx->hi1;
+            a.lo1 = ctx->lo1;
+            a.sa = ctx->sa;
+            std::memcpy(a.f, ctx->f, sizeof(a.f));
+            a.facc = ctx->f_acc;
+            a.fcr31 = ctx->fcr31;
+            char suffix[11] = {};
+            std::memcpy(suffix, rdram + kRaymanSaveSlotAddr + 0x52u, 10u);
+            std::fprintf(stderr, "[autosave] vsync %llu: the game asks to save: saving into BESLES-50044%s, stage '%s', %u%%\n",
+                         static_cast<unsigned long long>(vsync), suffix[0] ? suffix : "(new)",
+                         reinterpret_cast<const char *>(rdram + kRaymanSaveSlotAddr + 0x5Cu),
+                         static_cast<unsigned>(raymanRam32(rdram, kRaymanSaveSlotAddr + 0x48u) & 0xFFFFu));
+            raymanSetArg(ctx, 4, kRaymanSaveSlotAddr);
+            raymanSetArg(ctx, 31, kRaymanAutosaveReturnAddr);
+            ctx->pc = kRaymanSaveCurrentAddr;
+            return;
+        }
+        if (a.state == RaymanAutosaveState::Closing)
+        {
+            const RaymanSaveQuestion q = raymanFindSaveQuestion(rdram);
+            if (!q.shown || vsync - a.closingSince > 4u * rate)
             {
-                if (!a.backedUp)
-                {
-                    a.backedUp = true;
-                    raymanAutosaveBackup();
-                }
-                a.writing = true;
-                a.dueVsync = 0u;
-                std::memcpy(a.r, ctx->r, sizeof(a.r));
-                a.hi = ctx->hi;
-                a.lo = ctx->lo;
-                a.hi1 = ctx->hi1;
-                a.lo1 = ctx->lo1;
-                a.sa = ctx->sa;
-                std::memcpy(a.f, ctx->f, sizeof(a.f));
-                a.facc = ctx->f_acc;
-                a.fcr31 = ctx->fcr31;
-                std::memcpy(a.slot, rdram + kRaymanSaveSlotAddr + 0x40u, sizeof(a.slot));
-                // The auto-save folder and name (the name field ends where the suffix begins: 7 bytes).
-                std::memset(rdram + kRaymanSaveSlotAddr + 0x4Bu, 0, 7u);
-                std::memcpy(rdram + kRaymanSaveSlotAddr + 0x4Bu, kRaymanAutosaveName, sizeof(kRaymanAutosaveName));
-                std::memset(rdram + kRaymanSaveSlotAddr + 0x52u, 0, 10u);
-                std::memcpy(rdram + kRaymanSaveSlotAddr + 0x52u, kRaymanAutosaveSuffix, sizeof(kRaymanAutosaveSuffix));
-                std::fprintf(stderr, "[autosave] vsync %llu: saving (%s) to BESLES-50044%s, stage '%s', %u%%\n",
-                             static_cast<unsigned long long>(vsync), timer ? "timer" : "new place", kRaymanAutosaveSuffix,
-                             reinterpret_cast<const char *>(rdram + kRaymanSaveSlotAddr + 0x5Cu),
-                             static_cast<unsigned>(raymanRam32(rdram, kRaymanSaveSlotAddr + 0x48u) & 0xFFFFu));
-                raymanSetArg(ctx, 4, kRaymanSaveSlotAddr);
-                raymanSetArg(ctx, 5, kRaymanSaveDataAddr);
-                raymanSetArg(ctx, 6, kRaymanSaveDataBytes);
-                raymanSetArg(ctx, 7, 0u); // the slot's own folder (the suffix above), not a new time-named one
-                raymanSetArg(ctx, 31, kRaymanAutosaveReturnAddr);
-                ctx->pc = kRaymanSaveWriteAddr;
-                return;
+                std::fprintf(stderr, q.shown ? "[autosave] vsync %llu: the question did not close: left to the player\n"
+                                             : "[autosave] vsync %llu: the question closed\n",
+                             static_cast<unsigned long long>(vsync));
+                a.state = RaymanAutosaveState::Idle; // closed (or given up: the player answers)
+                if (q.shown)
+                    a.closingSince = ~0ull; // do not save again for this question
+            }
+            else if (vsync - a.lastPress >= rate / 4u) // a press every quarter second until it closes
+            {
+                a.lastPress = vsync;
+                ps2xInjectPadPress(q.yesLit && !q.noLit ? kRaymanPadRight : kRaymanPadCross, std::max<uint32_t>(2u, rate / 15u));
             }
         }
         g_raymanAutosaveStepNext(rdram, ctx, runtime);
     }
 
-    // 0x1455E0 returned: put the slot and the step's registers back and enter the step again.
+    // 0x145168 returned: put the step's registers back, answer the question, enter the step again.
     void raymanAutosaveReturn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        (void)rdram;
         (void)runtime;
         RaymanAutosave &a = g_raymanAutosave;
-        const uint32_t ok = getRegU32(ctx, 2); // the folder's id, 0 = failed
-        std::memcpy(rdram + kRaymanSaveSlotAddr + 0x44u, a.slot + 0x04u, 4u);   // id
-        std::memcpy(rdram + kRaymanSaveSlotAddr + 0x4Au, a.slot + 0x0Au, 0x12u); // flag, name, suffix
+        const uint32_t ok = getRegU32(ctx, 2); // 1 = saved
         std::memcpy(ctx->r, a.r, sizeof(a.r));
         ctx->hi = a.hi;
         ctx->lo = a.lo;
@@ -2395,14 +2409,23 @@ namespace
         std::memcpy(ctx->f, a.f, sizeof(a.f));
         ctx->f_acc = a.facc;
         ctx->fcr31 = a.fcr31;
+        const uint64_t vsync = ps2xGuestVsync();
         if (ok)
+        {
             ++a.saves;
+            a.state = RaymanAutosaveState::Closing; // answer "no": the game was saved
+            a.closingSince = vsync;
+            a.lastPress = 0u;
+        }
         else
+        {
             ++a.failures;
-        a.lastSaveVsync = ps2xGuestVsync();
-        a.writing = false;
-        std::fprintf(stderr, "[autosave] vsync %llu: %s (%u saved, %u failed this run)\n",
-                     static_cast<unsigned long long>(a.lastSaveVsync), ok ? "saved" : "FAILED", a.saves, a.failures);
+            a.state = RaymanAutosaveState::Closing; // keeps the question: the player answers (no presses: see below)
+            a.closingSince = vsync - 4u * std::max<uint32_t>(50u, ps2xVBlankRateOverrideHz()) - 1u;
+        }
+        std::fprintf(stderr, "[autosave] vsync %llu: %s (%u saved, %u failed this run)\n", static_cast<unsigned long long>(vsync),
+                     ok ? "saved, the question is answered \"no\"" : "FAILED, the question is left to the player", a.saves,
+                     a.failures);
         ctx->pc = kRaymanGameStepAddr;
     }
 
@@ -2411,20 +2434,14 @@ namespace
         const char *env = std::getenv("PS2X_AUTOSAVE");
         if (!env || std::strcmp(env, "1") != 0)
             return;
-        // addiu sp,sp,-0x120 / andi a3,a3,0xFF (0x1455E0), the padding after it, and the step.
-        if (raymanRam32(rdram, kRaymanSaveWriteAddr) != 0x27BDFEE0u || raymanRam32(rdram, kRaymanSaveWriteAddr + 4u) != 0x30E700FFu ||
-            raymanRam32(rdram, kRaymanAutosaveReturnAddr) != 0u || runtime.hasFunction(kRaymanAutosaveReturnAddr) ||
-            !runtime.hasFunction(kRaymanGameStepAddr) || !runtime.hasFunction(kRaymanSaveWriteAddr))
+        // addiu sp,sp,-0x20 (0x145168), the padding after 0x1455E0, the step, and the text table pointer.
+        if (raymanRam32(rdram, kRaymanSaveCurrentAddr) != 0x27BDFFE0u || raymanRam32(rdram, kRaymanAutosaveReturnAddr) != 0u ||
+            runtime.hasFunction(kRaymanAutosaveReturnAddr) || !runtime.hasFunction(kRaymanGameStepAddr) ||
+            !runtime.hasFunction(kRaymanSaveCurrentAddr))
         {
             std::cerr << "[autosave] the game's save code was not found: auto-save off" << std::endl;
             return;
         }
-        double minutes = 5.0;
-        if (const char *m = std::getenv("PS2X_AUTOSAVE_MINUTES"))
-            minutes = std::max(0.25, std::atof(m));
-        const uint32_t rate = ps2xVBlankRateOverrideHz();
-        g_raymanAutosave.rateHz = rate ? rate : 50u;
-        g_raymanAutosave.intervalVsyncs = static_cast<uint64_t>(minutes * 60.0 * static_cast<double>(g_raymanAutosave.rateHz));
         g_raymanAutosaveStepNext = runtime.lookupFunction(kRaymanGameStepAddr); // the split's hook, when on
         if (!runtime.registerFunction(kRaymanGameStepAddr, &raymanAutosaveStep) ||
             !runtime.registerFunction(kRaymanAutosaveReturnAddr, &raymanAutosaveReturn))
@@ -2432,8 +2449,7 @@ namespace
             std::cerr << "[autosave] cannot install: auto-save off" << std::endl;
             return;
         }
-        std::cerr << "[autosave] on: every " << minutes << " min of play and after loading a new place, to BESLES-50044"
-                  << kRaymanAutosaveSuffix << " (\"" << kRaymanAutosaveName << "\")" << std::endl;
+        std::cerr << "[autosave] on: when the game asks to save, it saves into the current slot and goes on" << std::endl;
     }
 
     void installGameHle(PS2Runtime &runtime, const std::string &gameId)
