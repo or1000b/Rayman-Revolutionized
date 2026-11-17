@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <chrono>
+#include <ctime>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -2224,6 +2225,217 @@ namespace
                      gameSeconds, frames, n, static_cast<long long>(hostMs));
     }
 
+    // ------------------------------------------------------------------
+    // PS2X_AUTOSAVE=1: the game saves itself into a slot of its own, BESLES-50044jjjjjjjjj named "auto" (the user's
+    // choice, 2026-11-17: never overwrite the player's own saves), every PS2X_AUTOSAVE_MINUTES (default 5) of play and
+    // 10 s after a new place is loaded. It is the game's own save: the current save slot at 0x34A300 (+0x40 play
+    // time, +0x44 the folder's id, +0x48 completion %, +0x4A "saved", +0x4B name, +0x52 folder suffix, +0x5C stage
+    // text: the game keeps these up to date) is pointed at the auto-save folder, 0x1455E0 (slot, data, size, new
+    // folder = 0) writes icon.sys, data.add and the 40316-byte progress data at 0x34A380 (the live data, not a copy:
+    // it is the same as the save file plus what changed since), and the slot's id, flag, name and suffix go back, so
+    // the player's own saves keep going to the player's slot. 0x140DC0 creates the folder (and its icons) the first
+    // time. The write is entered from the game step's entry (between two frames) like a guest call: the step's
+    // registers are kept, 0x1455E0 returns to an unused address whose hook puts them back and enters the step again.
+    // Before the first auto-save of a run the whole card folder is copied to <card>_backups/<date> (newest 10 kept).
+    constexpr uint32_t kRaymanSaveSlotAddr = 0x0034A300u;
+    constexpr uint32_t kRaymanSaveDataAddr = 0x0034A380u;
+    constexpr uint32_t kRaymanSaveDataBytes = 0x9D7Cu;
+    constexpr uint32_t kRaymanSaveWriteAddr = 0x001455E0u;
+    constexpr uint32_t kRaymanAutosaveReturnAddr = 0x001456ECu; // padding after 0x1455E0 (never executed)
+    constexpr char kRaymanAutosaveSuffix[] = "jjjjjjjjj";        // 9 letters, like the game's (digits of a time, 0 = a)
+    constexpr char kRaymanAutosaveName[] = "auto";
+    struct RaymanAutosave
+    {
+        uint64_t intervalVsyncs = 0u;
+        uint64_t rateHz = 50u;
+        uint64_t lastSaveVsync = 0u;
+        uint64_t lastStepVsync = 0u;
+        uint64_t dueVsync = 0u; // a save scheduled after a new place was loaded (0 = none)
+        uint64_t playStartVsync = 0u; // since when a game is in progress without a break (0 = not now)
+        bool writing = false;
+        bool backedUp = false;
+        uint32_t saves = 0u, failures = 0u;
+        // The interrupted step call's registers.
+        __m128i r[32];
+        uint64_t hi = 0u, lo = 0u, hi1 = 0u, lo1 = 0u;
+        uint32_t sa = 0u, fcr31 = 0u;
+        float f[32] = {};
+        float facc = 0.0f;
+        uint8_t slot[0x20] = {}; // the slot's bytes +0x40..+0x5F before the write
+    };
+    RaymanAutosave g_raymanAutosave;
+    void raymanSetArg(R5900Context *ctx, int reg, uint32_t value) // sign-extended, as the R5900 keeps 32-bit values
+    {
+        ctx->r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(value)));
+    }
+    PS2Runtime::RecompiledFunction g_raymanAutosaveStepNext = nullptr;
+
+    // A copy of the whole memory card folder before the first auto-save of a run (the newest 10 are kept).
+    void raymanAutosaveBackup()
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path card = PS2Runtime::getIoPaths().mcRoot;
+        if (card.empty() || !fs::is_directory(card, ec))
+            return;
+        const fs::path backups = card.parent_path() / (card.filename().string() + "_backups");
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+#if defined(_WIN32)
+        localtime_s(&local, &now);
+#else
+        localtime_r(&now, &local);
+#endif
+        char stamp[32];
+        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &local);
+        const fs::path target = backups / stamp;
+        fs::create_directories(target, ec);
+        fs::copy(card, target, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        std::fprintf(stderr, "[autosave] memory card backed up to %s%s\n", target.string().c_str(), ec ? " (FAILED)" : "");
+        std::vector<fs::path> all;
+        for (const auto &entry : fs::directory_iterator(backups, ec))
+            if (entry.is_directory())
+                all.push_back(entry.path());
+        std::sort(all.begin(), all.end()); // the names are dates
+        for (size_t i = 0; i + 10u < all.size(); ++i)
+            fs::remove_all(all[i], ec);
+    }
+
+    // A game in progress (a save loaded or a game started: the slot has its stage text), not the attract demo.
+    bool raymanAutosaveAllowed(const uint8_t *rdram, uint32_t gp)
+    {
+        if (raymanDemoPlayback(rdram, gp))
+            return false;
+        if (rdram[kRaymanSaveSlotAddr + 0x5Cu] == 0u)
+            return false;
+        for (uint32_t i = 0; i < 1024u; i += 4u) // progress data present
+            if (raymanRam32(rdram, kRaymanSaveDataAddr + i) != 0u)
+                return true;
+        return false;
+    }
+
+    void raymanAutosaveStep(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        RaymanAutosave &a = g_raymanAutosave;
+        const uint64_t vsync = ps2xGuestVsync();
+        if (!a.writing)
+        {
+            // A second or more without a game step: a new place (or a menu) was loaded; save once it has run 10 s.
+            if (vsync - a.lastStepVsync > a.rateHz)
+                a.dueVsync = vsync + 10u * a.rateHz;
+            a.lastStepVsync = vsync;
+            const bool allowed = raymanAutosaveAllowed(rdram, getRegU32(ctx, 28));
+            // The timer counts play only: from the last auto-save, or from when a game was first in progress.
+            if (!allowed)
+                a.playStartVsync = 0u;
+            else if (a.playStartVsync == 0u)
+                a.playStartVsync = vsync;
+            const uint64_t since = std::max(a.lastSaveVsync, a.playStartVsync);
+            const bool timer = allowed && since != 0u && vsync - since >= a.intervalVsyncs;
+            bool place = a.dueVsync != 0u && vsync >= a.dueVsync;
+            if (place && (!allowed || (a.lastSaveVsync != 0u && vsync - a.lastSaveVsync < 60u * a.rateHz)))
+            {
+                a.dueVsync = 0u; // not in a game, or saved less than a minute ago
+                place = false;
+            }
+            if (timer || place)
+            {
+                if (!a.backedUp)
+                {
+                    a.backedUp = true;
+                    raymanAutosaveBackup();
+                }
+                a.writing = true;
+                a.dueVsync = 0u;
+                std::memcpy(a.r, ctx->r, sizeof(a.r));
+                a.hi = ctx->hi;
+                a.lo = ctx->lo;
+                a.hi1 = ctx->hi1;
+                a.lo1 = ctx->lo1;
+                a.sa = ctx->sa;
+                std::memcpy(a.f, ctx->f, sizeof(a.f));
+                a.facc = ctx->f_acc;
+                a.fcr31 = ctx->fcr31;
+                std::memcpy(a.slot, rdram + kRaymanSaveSlotAddr + 0x40u, sizeof(a.slot));
+                // The auto-save folder and name (the name field ends where the suffix begins: 7 bytes).
+                std::memset(rdram + kRaymanSaveSlotAddr + 0x4Bu, 0, 7u);
+                std::memcpy(rdram + kRaymanSaveSlotAddr + 0x4Bu, kRaymanAutosaveName, sizeof(kRaymanAutosaveName));
+                std::memset(rdram + kRaymanSaveSlotAddr + 0x52u, 0, 10u);
+                std::memcpy(rdram + kRaymanSaveSlotAddr + 0x52u, kRaymanAutosaveSuffix, sizeof(kRaymanAutosaveSuffix));
+                std::fprintf(stderr, "[autosave] vsync %llu: saving (%s) to BESLES-50044%s, stage '%s', %u%%\n",
+                             static_cast<unsigned long long>(vsync), timer ? "timer" : "new place", kRaymanAutosaveSuffix,
+                             reinterpret_cast<const char *>(rdram + kRaymanSaveSlotAddr + 0x5Cu),
+                             static_cast<unsigned>(raymanRam32(rdram, kRaymanSaveSlotAddr + 0x48u) & 0xFFFFu));
+                raymanSetArg(ctx, 4, kRaymanSaveSlotAddr);
+                raymanSetArg(ctx, 5, kRaymanSaveDataAddr);
+                raymanSetArg(ctx, 6, kRaymanSaveDataBytes);
+                raymanSetArg(ctx, 7, 0u); // the slot's own folder (the suffix above), not a new time-named one
+                raymanSetArg(ctx, 31, kRaymanAutosaveReturnAddr);
+                ctx->pc = kRaymanSaveWriteAddr;
+                return;
+            }
+        }
+        g_raymanAutosaveStepNext(rdram, ctx, runtime);
+    }
+
+    // 0x1455E0 returned: put the slot and the step's registers back and enter the step again.
+    void raymanAutosaveReturn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        RaymanAutosave &a = g_raymanAutosave;
+        const uint32_t ok = getRegU32(ctx, 2); // the folder's id, 0 = failed
+        std::memcpy(rdram + kRaymanSaveSlotAddr + 0x44u, a.slot + 0x04u, 4u);   // id
+        std::memcpy(rdram + kRaymanSaveSlotAddr + 0x4Au, a.slot + 0x0Au, 0x12u); // flag, name, suffix
+        std::memcpy(ctx->r, a.r, sizeof(a.r));
+        ctx->hi = a.hi;
+        ctx->lo = a.lo;
+        ctx->hi1 = a.hi1;
+        ctx->lo1 = a.lo1;
+        ctx->sa = a.sa;
+        std::memcpy(ctx->f, a.f, sizeof(a.f));
+        ctx->f_acc = a.facc;
+        ctx->fcr31 = a.fcr31;
+        if (ok)
+            ++a.saves;
+        else
+            ++a.failures;
+        a.lastSaveVsync = ps2xGuestVsync();
+        a.writing = false;
+        std::fprintf(stderr, "[autosave] vsync %llu: %s (%u saved, %u failed this run)\n",
+                     static_cast<unsigned long long>(a.lastSaveVsync), ok ? "saved" : "FAILED", a.saves, a.failures);
+        ctx->pc = kRaymanGameStepAddr;
+    }
+
+    void installRaymanAutosave(PS2Runtime &runtime, uint8_t *rdram)
+    {
+        const char *env = std::getenv("PS2X_AUTOSAVE");
+        if (!env || std::strcmp(env, "1") != 0)
+            return;
+        // addiu sp,sp,-0x120 / andi a3,a3,0xFF (0x1455E0), the padding after it, and the step.
+        if (raymanRam32(rdram, kRaymanSaveWriteAddr) != 0x27BDFEE0u || raymanRam32(rdram, kRaymanSaveWriteAddr + 4u) != 0x30E700FFu ||
+            raymanRam32(rdram, kRaymanAutosaveReturnAddr) != 0u || runtime.hasFunction(kRaymanAutosaveReturnAddr) ||
+            !runtime.hasFunction(kRaymanGameStepAddr) || !runtime.hasFunction(kRaymanSaveWriteAddr))
+        {
+            std::cerr << "[autosave] the game's save code was not found: auto-save off" << std::endl;
+            return;
+        }
+        double minutes = 5.0;
+        if (const char *m = std::getenv("PS2X_AUTOSAVE_MINUTES"))
+            minutes = std::max(0.25, std::atof(m));
+        const uint32_t rate = ps2xVBlankRateOverrideHz();
+        g_raymanAutosave.rateHz = rate ? rate : 50u;
+        g_raymanAutosave.intervalVsyncs = static_cast<uint64_t>(minutes * 60.0 * static_cast<double>(g_raymanAutosave.rateHz));
+        g_raymanAutosaveStepNext = runtime.lookupFunction(kRaymanGameStepAddr); // the split's hook, when on
+        if (!runtime.registerFunction(kRaymanGameStepAddr, &raymanAutosaveStep) ||
+            !runtime.registerFunction(kRaymanAutosaveReturnAddr, &raymanAutosaveReturn))
+        {
+            std::cerr << "[autosave] cannot install: auto-save off" << std::endl;
+            return;
+        }
+        std::cerr << "[autosave] on: every " << minutes << " min of play and after loading a new place, to BESLES-50044"
+                  << kRaymanAutosaveSuffix << " (\"" << kRaymanAutosaveName << "\")" << std::endl;
+    }
+
     void installGameHle(PS2Runtime &runtime, const std::string &gameId)
     {
         if (gameId != "SLES-50044")
@@ -2401,6 +2613,8 @@ namespace
                     std::cerr << "[hle] Rayman: screen effect manager trace installed at 0x1D4FA8" << std::endl;
             }
         }
+
+        installRaymanAutosave(runtime, rdram); // last: it wraps whatever the step's entry is by now
     }
 
     std::string normalizeGameId(const std::string &folderName)
