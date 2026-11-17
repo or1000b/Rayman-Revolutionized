@@ -735,7 +735,16 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
         const size_t sourceRowBytes = static_cast<size_t>(g_pgs ? outWidth : kHostFrameWidth) * 4u;
         if (sourceRowBytes == packedRowBytes && m_hostPresentationFrame.size() >= outPixels.size())
         {
-            std::memcpy(outPixels.data(), m_hostPresentationFrame.data(), outPixels.size()); // one block, not row by row
+            // Handed over, not copied: the window thread is the only reader and latches a new picture before every
+            // copy (UploadFrame). A real-1440p picture is 14.7 MB, and every copy of it through the CPU caches slowed
+            // the game, graphics and GS threads (bridge_1440: 114 FPS; 120 with a small picture, 2026-11-17). The
+            // picture counts as taken, so a latch that brings nothing new reports "no picture" (the window keeps the
+            // one it shows) instead of handing back an older one.
+            auto &frame = const_cast<std::vector<uint8_t> &>(m_hostPresentationFrame);
+            const size_t bytes = outPixels.size();
+            outPixels.swap(frame);
+            outPixels.resize(bytes);
+            const_cast<bool &>(m_hasHostPresentationFrame) = false;
             return true;
         }
         for (uint32_t y = 0; y < outHeight; ++y)

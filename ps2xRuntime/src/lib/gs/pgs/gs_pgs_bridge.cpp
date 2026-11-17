@@ -57,6 +57,8 @@ namespace ps2x::pgs
         // PS2X_GS_SSAA >= 4 (start()): VSyncInfo::high_resolution_scanout; PS2X_GS_SSAA=16: ps2x_scanout_4x too.
         bool g_hiresScanout = false;
         bool g_scanout4x = false;
+        // PS2X_PGS_GPU_TIMES: the window thread's time per picture waiting for the GS thread / copying the readback.
+        std::atomic<uint64_t> g_windowWaitNs{0u}, g_windowCopyNs{0u}, g_windowPictures{0u};
         // setPresentationTarget: the window's picture size, width << 16 | height (0 = unknown).
         std::atomic<uint32_t> g_presentTarget{0u};
 
@@ -111,8 +113,11 @@ namespace ps2x::pgs
             std::unique_ptr<Vulkan::Device> device;
             std::unique_ptr<ParallelGS::GSInterface> gs;
             SignalForwarder signals;
-            Vulkan::BufferHandle readback;
-            VkDeviceSize readbackSize = 0;
+            // Readback buffers, a ring: with the pipelined scanout (scanout()) the window copies one picture while the
+            // GS thread already reads the next ones back.
+            Vulkan::BufferHandle readback[4];
+            VkDeviceSize readbackSize[4] = {};
+            uint32_t readbackNext = 0;
             std::string gpuName;
             uint64_t frames = 0;
             uint64_t gifBytes = 0;
@@ -160,7 +165,8 @@ namespace ps2x::pgs
                 pending.device->map_host_buffer(*pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT));
             if (!pixels)
                 return false;
-            // Copy and make opaque in one pass, 16 bytes at a time (a 2560 x 2048 picture is 21 MB: a separate
+            // Copy and make opaque in one pass, 16 bytes at a time, with streaming stores that bypass the CPU caches (the
+            // destination is 16-byte aligned: vector storage). A 2560 x 2048 picture is 21 MB: a separate
             // byte loop for the alpha cost ~4 ms a frame on the window thread, 2026-11-17).
             rgba.resize(size);
             uint8_t *out = rgba.data();
@@ -172,11 +178,12 @@ namespace ps2x::pgs
                 const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pixels + i + 16u));
                 const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pixels + i + 32u));
                 const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pixels + i + 48u));
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + i), _mm_or_si128(a, opaque));
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + i + 16u), _mm_or_si128(b, opaque));
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + i + 32u), _mm_or_si128(c, opaque));
-                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + i + 48u), _mm_or_si128(d, opaque));
+                _mm_stream_si128(reinterpret_cast<__m128i *>(out + i), _mm_or_si128(a, opaque));
+                _mm_stream_si128(reinterpret_cast<__m128i *>(out + i + 16u), _mm_or_si128(b, opaque));
+                _mm_stream_si128(reinterpret_cast<__m128i *>(out + i + 32u), _mm_or_si128(c, opaque));
+                _mm_stream_si128(reinterpret_cast<__m128i *>(out + i + 48u), _mm_or_si128(d, opaque));
             }
+            _mm_sfence(); // the streaming stores above bypass the caches (14.7 MB a frame at real 1440p)
             for (; i + 4u <= size; i += 4u)
             {
                 std::memcpy(out + i, pixels + i, 3u);
@@ -719,7 +726,15 @@ namespace ps2x::pgs
                 const uint32_t tw = static_cast<uint32_t>((value >> 26) & 0xFu);
                 const uint32_t th = static_cast<uint32_t>((value >> 30) & 0xFu);
                 if (((value >> 61) & 7u) != 0u)
+                {
                     ++g_frameStats.clutLoads;
+                    static const uint32_t s_logFrom = watchBound("PS2X_PGS_UPLOAD_LOG", 0u); // research: 2 frames from this one
+                    if (s_logFrom && g_frameNumber >= s_logFrom && g_frameNumber < s_logFrom + 2u)
+                        std::fprintf(stderr, "[upl] f%llu TEX0 cbp=%x cpsm=%u csm=%u csa=%u cld=%u psm=%u tbp=%x\n",
+                                     (unsigned long long)g_frameNumber, (unsigned)((value >> 37) & 0x3FFFu), (unsigned)((value >> 51) & 0xFu),
+                                     (unsigned)((value >> 55) & 1u), (unsigned)((value >> 56) & 0x1Fu), (unsigned)((value >> 61) & 7u),
+                                     (unsigned)((value >> 20) & 0x3Fu), (unsigned)(value & 0x3FFFu));
+                }
                 if (tw > 10u || th > 10u)
                 {
                     ++g_frameStats.badTex;
@@ -748,6 +763,14 @@ namespace ps2x::pgs
                     ++g_frameStats.localCopies;
                 else
                     ++g_frameStats.uploads;
+                {
+                    static const uint32_t s_logFrom = watchBound("PS2X_PGS_UPLOAD_LOG", 0u);
+                    if (s_logFrom && g_frameNumber >= s_logFrom && g_frameNumber < s_logFrom + 2u)
+                        std::fprintf(stderr, "[upl] f%llu XFER dir=%u dbp=%x dbw=%u dpsm=%u rect=%ux%u at %u,%u\n",
+                                     (unsigned long long)g_frameNumber, dir, (unsigned)((sh.bitbltbuf >> 32) & 0x3FFFu),
+                                     (unsigned)((sh.bitbltbuf >> 48) & 0x3Fu), (unsigned)((sh.bitbltbuf >> 56) & 0x3Fu), rrw, rrh,
+                                     (unsigned)((sh.trxpos >> 32) & 0x7FFu), (unsigned)((sh.trxpos >> 48) & 0x7FFu));
+                }
                 const uint32_t dbw = static_cast<uint32_t>((sh.bitbltbuf >> 48) & 0x3Fu);
                 if (g_upload.active)
                     finishUploadWatch(); // the previous one ended short
@@ -1399,14 +1422,15 @@ namespace ps2x::pgs
             const bool shrink = g_scanout4x && scaleToWindowWanted() && tw >= 64u && th >= 64u && tw <= w && th <= h &&
                                 (tw != w || th != h);
             const VkDeviceSize size = static_cast<VkDeviceSize>(shrink ? tw : w) * (shrink ? th : h) * 4u;
-            if (!g_state->readback || g_state->readbackSize < size)
+            const uint32_t slot = g_state->readbackNext++ % 4u;
+            if (!g_state->readback[slot] || g_state->readbackSize[slot] < size)
             {
                 Vulkan::BufferCreateInfo info = {};
                 info.size = size;
                 info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
                 info.domain = Vulkan::BufferDomain::CachedHost;
-                g_state->readback = device.create_buffer(info);
-                g_state->readbackSize = size;
+                g_state->readback[slot] = device.create_buffer(info);
+                g_state->readbackSize[slot] = size;
             }
 
             auto cmd = device.request_command_buffer();
@@ -1435,7 +1459,7 @@ namespace ps2x::pgs
                     h = th;
                 }
             }
-            cmd->copy_image_to_buffer(*g_state->readback, *readFrom, 0, {}, {w, h, 1}, 0, 0,
+            cmd->copy_image_to_buffer(*g_state->readback[slot], *readFrom, 0, {}, {w, h, 1}, 0, 0,
                                       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
             cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
@@ -1445,7 +1469,7 @@ namespace ps2x::pgs
             PendingReadback readback;
             readback.device = &device;
             readback.fence = fence;
-            readback.buffer = g_state->readback;
+            readback.buffer = g_state->readback[slot];
             readback.width = w;
             readback.height = h;
             width = w;
@@ -1845,6 +1869,13 @@ namespace ps2x::pgs
             g_traceFrames = std::atoi(trace) != 0;
         state->signals.sink = sink;
         state->gs->set_signal_interface(&state->signals);
+        // PS2X_PGS_GPU_TIMES=1: GPU time per frame of each paraLLEl-GS stage in the [threads] line (`gpu ms/frame`).
+        if (watchBound("PS2X_PGS_GPU_TIMES", 0u) != 0u)
+        {
+            ParallelGS::DebugMode debug = {};
+            debug.timestamps = true;
+            state->gs->set_debug_mode(debug);
+        }
         g_state = state.release();
         g_threaded = gsThreadWanted();
         if (g_threaded)
@@ -1890,7 +1921,8 @@ namespace ps2x::pgs
         }
         if (g_state->device)
             g_state->device->wait_idle();
-        g_state->readback.reset();
+        for (auto &buffer : g_state->readback)
+            buffer.reset();
         g_state->gs.reset();
         g_state->device.reset();
         g_state->context.reset();
@@ -2001,6 +2033,30 @@ namespace ps2x::pgs
             bindThread();
             return scanoutNow(regs, rgba, width, height);
         }
+        // Pipelined (normal play; PS2X_GS_PIPELINED_SCANOUT=0 or test mode: off): the window takes the newest picture the
+        // GS thread has finished, if any, and asks for the next one without waiting for it. Waiting for the GS thread
+        // and the GPU cost the window ~8 ms a picture where the GS thread is busy (the bridge in the Minisaurus Plain at
+        // real 1440p: ~100 pictures a second for 109 game frames, 2026-11-17); now it shows each picture one window
+        // frame later. Take first, then ask: the readback ring (4) is reused only after the window copied from it.
+        static const bool pipelined = []
+        {
+            const char *env = std::getenv("PS2X_GS_PIPELINED_SCANOUT");
+            const char *test = std::getenv("PS2X_TEST_MODE");
+            if (env && *env)
+                return std::strcmp(env, "0") != 0;
+            return !(test && std::atoi(test) != 0);
+        }() && asyncScanoutWanted();
+        PendingReadback ready;
+        if (pipelined)
+        {
+            std::lock_guard<std::mutex> lock(g_scanMutex);
+            if (g_scanOk && g_scanPending.fence)
+            {
+                ready = std::move(g_scanPending);
+                g_scanPending = PendingReadback{};
+                g_scanOk = false;
+            }
+        }
         uint64_t id = 0;
         {
             // What the game staged so far comes before this picture; the stage lock keeps a packet staged
@@ -2017,10 +2073,37 @@ namespace ps2x::pgs
             if (wake)
                 g_workCv.notify_one();
         }
+        if (pipelined)
+        {
+            g_windowPictures.fetch_add(1u, std::memory_order_relaxed);
+            if (!ready.fence)
+                return false; // nothing new yet: the window keeps its picture
+            const auto copyBegin = std::chrono::steady_clock::now();
+            const bool copied = finishReadback(ready, rgba);
+            g_windowCopyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - copyBegin).count()), std::memory_order_relaxed);
+            if (!copied)
+                return false;
+            width = ready.width;
+            height = ready.height;
+            static auto s_lastPipelinedDump = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_lastPipelinedDump >= std::chrono::seconds(5))
+            {
+                s_lastPipelinedDump = now;
+                dumpFrameBmp(rgba, width, height); // out/pgs_frame.bmp about every 5 s (CLAUDE.md)
+            }
+            return true;
+        }
         // The worker gets there after what the game queued before; a frame that takes too long keeps the previous
         // picture on screen (the window thread must not hang).
+        const auto waitBegin = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(g_scanMutex);
-        if (!g_scanCv.wait_for(lock, std::chrono::milliseconds(250), [id] { return g_scanDone >= id; }))
+        const bool done = g_scanCv.wait_for(lock, std::chrono::milliseconds(250), [id] { return g_scanDone >= id; });
+        g_windowWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - waitBegin).count()), std::memory_order_relaxed);
+        g_windowPictures.fetch_add(1u, std::memory_order_relaxed);
+        if (!done)
         {
             ++g_scanoutTimeouts;
             return false;
@@ -2035,7 +2118,11 @@ namespace ps2x::pgs
             PendingReadback pending = std::move(g_scanPending);
             g_scanPending = PendingReadback{};
             lock.unlock();
-            if (!finishReadback(pending, rgba))
+            const auto copyBegin = std::chrono::steady_clock::now();
+            const bool copied = finishReadback(pending, rgba);
+            g_windowCopyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - copyBegin).count()), std::memory_order_relaxed);
+            if (!copied)
                 return false;
             width = pending.width;
             height = pending.height;
@@ -2100,11 +2187,45 @@ namespace ps2x::pgs
                       (unsigned long long)g_windowStats.badTex, (unsigned long long)g_windowStats.badTransfers,
                       g_threaded ? "on" : "off", pending / 1024u, (unsigned long long)roomWaits, (unsigned long long)drains,
                       (unsigned long long)timeouts, busyPercent);
+        std::string gpu;
+        if (watchBound("PS2X_PGS_GPU_TIMES", 0u) != 0u && g_state->frames != 0u)
+        {
+            static const char *const kNames[] = {"sync", "copy", "clut", "upload", "setup", "bin", "shade", "readback", "vsync"};
+            static double s_last[int(ParallelGS::TimestampType::Count)] = {};
+            char part[48];
+            double total = 0.0;
+            gpu = " | gpu ms/frame";
+            for (int t = 0; t < int(ParallelGS::TimestampType::Count) && t < 9; ++t)
+            {
+                const double now = g_state->gs->get_accumulated_timestamps(ParallelGS::TimestampType(t));
+                const double perFrame = (now - s_last[t]) * 1000.0 / static_cast<double>(g_state->frames);
+                s_last[t] = now;
+                total += perFrame;
+                std::snprintf(part, sizeof(part), " %s=%.2f", kNames[t], perFrame);
+                gpu += part;
+            }
+            std::snprintf(part, sizeof(part), " total=%.2f", total);
+            gpu += part;
+            const ParallelGS::FlushStats fs = g_state->gs->consume_flush_stats();
+            char counts[224];
+            std::snprintf(counts, sizeof(counts), " | per frame: palettes=%u copies=%u copy_threads=%u copy_barriers=%u passes=%u prims=%u",
+                          fs.num_palette_updates / g_state->frames, fs.num_copies / g_state->frames, fs.num_copy_threads / g_state->frames, fs.num_copy_barriers / g_state->frames,
+                          fs.num_render_passes / g_state->frames, fs.num_primitives / g_state->frames);
+            gpu += counts;
+            const uint64_t pictures = g_windowPictures.exchange(0u);
+            if (pictures != 0u)
+            {
+                std::snprintf(counts, sizeof(counts), " | window ms/picture: wait=%.2f copy=%.2f",
+                              g_windowWaitNs.exchange(0u) / 1e6 / static_cast<double>(pictures),
+                              g_windowCopyNs.exchange(0u) / 1e6 / static_cast<double>(pictures));
+                gpu += counts;
+            }
+        }
         g_windowStats = GifStats{};
         g_state->frames = 0;
         g_state->scanoutMs = 0.0;
         g_state->scanoutSamples = 0;
-        return std::string(line) + hud::statsLine();
+        return std::string(line) + gpu + hud::statsLine();
     }
 
     void requestCapture()

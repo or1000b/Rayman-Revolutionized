@@ -1188,6 +1188,68 @@ extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uin
 
 // Calling thread (the game thread, at start): keeps 256 KiB of stack in reserve, so after a stack overflow the
 // crash handler above still has room to print the report instead of faulting itself.
+// The window's frame pacing in normal play (ps2_runtime.cpp; PS2X_WINDOW_PACER=0: raylib's own). raylib sleeps with
+// Sleep() for most of the frame and busy-waits the rest; with every core busy (the bridge in the Minisaurus Plain) the
+// window thread woke ~2 ms late, so it drew ~100 pictures a second while the game made 110-120 (2026-11-17). Here:
+// fixed deadlines (no drift; a frame more than one period late starts a new schedule), a high-resolution waitable timer
+// for all but the last ~0.7 ms, a spin for the rest, and the window thread above normal priority (it idles most of the
+// time, so this costs the game threads little).
+extern "C" bool ps2xWindowPacerWanted()
+{
+    static const bool wanted = []
+    {
+        const char *env = std::getenv("PS2X_WINDOW_PACER");
+        return !(env && std::strcmp(env, "0") == 0);
+    }();
+#if defined(_WIN32)
+    return wanted;
+#else
+    return false;
+#endif
+}
+
+extern "C" void ps2xWindowPace(uint32_t hz)
+{
+#if defined(_WIN32)
+    using clock = std::chrono::steady_clock;
+    static HANDLE s_timer = nullptr;
+    static bool s_init = false;
+    static clock::time_point s_next{};
+    if (!s_init)
+    {
+        s_init = true;
+        s_timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                         TIMER_ALL_ACCESS);
+        if (!s_timer)
+            s_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        s_next = clock::now();
+    }
+    const auto period = std::chrono::nanoseconds(1000000000ull / (hz ? hz : 60u));
+    s_next += period;
+    const auto now = clock::now();
+    if (now >= s_next)
+    {
+        if (now - s_next > period)
+            s_next = now; // more than a frame late: a new schedule
+        return;
+    }
+    const auto spinFor = std::chrono::microseconds(700);
+    const auto remaining = s_next - now;
+    if (remaining > spinFor && s_timer)
+    {
+        LARGE_INTEGER due;
+        due.QuadPart = -static_cast<LONGLONG>(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining - spinFor).count() / 100);
+        if (SetWaitableTimer(s_timer, &due, 0, nullptr, nullptr, FALSE))
+            WaitForSingleObject(s_timer, INFINITE);
+    }
+    while (clock::now() < s_next)
+        YieldProcessor();
+#else
+    (void)hz;
+#endif
+}
+
 extern "C" void ps2xTestThreadStackGuarantee()
 {
 #if defined(_WIN32)

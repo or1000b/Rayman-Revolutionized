@@ -55,6 +55,8 @@ extern "C" void ps2xTestHarnessExiting();
 extern "C" void ps2xTestThreadStackGuarantee();
 extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels);
 extern "C" bool ps2xTestBurstActive(); // ps2_test_harness.cpp (PS2X_TEST_BURST)
+extern "C" bool ps2xWindowPacerWanted();       // ps2_test_harness.cpp: the window's own frame pacing
+extern "C" void ps2xWindowPace(uint32_t hz);
 extern "C" uint64_t ps2xTestLastShotTick();     // ps2_test_harness.cpp: the tick of the last test_shot (0 = none)
 void ps2xInstallIopToEeRpcHooks(PS2Runtime *runtime);       // Kernel/Syscalls/RPC.cpp
 void ps2xInstallIopCdReader(bool install);                  // Kernel/Stubs/CD.cpp
@@ -630,6 +632,9 @@ namespace
     }
 }
 
+// Normal play: the window's own frame rate (ps2xWindowPace), 0 = raylib's SetTargetFPS.
+static uint32_t g_windowPacerHz = 0u;
+
 static int HostTextureFilter()
 {
     static const int filter = []
@@ -680,6 +685,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
     static bool s_hasUploadedFrame = false;
+    static bool s_hasRealFrame = false; // a picture from the GS was uploaded (not the magenta placeholder)
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer;
 
@@ -711,6 +717,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
+        // No new picture (the GPU renderer hands each picture over once): keep showing the last real one.
+        if (s_hasRealFrame)
+        {
+            outWidth = s_lastWidth;
+            outHeight = s_lastHeight;
+            return;
+        }
         Image blank = GenImageColor(tex.width, tex.height, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
@@ -741,6 +754,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
         ++s_uploadDebugCount;
     });
+    s_hasRealFrame = true;
     s_lastDisplayFbp = displayFbp;
     if (ps2x::hud::enabled() && ps2x::pgs::active())
         ps2x::hud::latest(g_hudFrame); // the 2D layer of this scanout
@@ -1122,7 +1136,12 @@ bool PS2Runtime::initialize(const char *title)
             const char *testMode = std::getenv("PS2X_TEST_MODE");
             const bool testRun = testMode && std::atoi(testMode) != 0;
             // PS2X_TEST_BURST (research: every VSync's picture to a file): uncapped, so no VSync is skipped.
-            SetTargetFPS(ps2xTestBurstActive() ? 0 : testRun ? 60 : static_cast<int>(std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz())));
+            // Normal play: the window paces itself (ps2xWindowPace after each frame, precise under load); raylib's limiter
+            // only in test runs and when PS2X_WINDOW_PACER=0.
+            const uint32_t windowHz = std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz());
+            g_windowPacerHz = (!testRun && !ps2xTestBurstActive() && ps2xWindowPacerWanted()) ? windowHz : 0u;
+            SetTargetFPS(ps2xTestBurstActive() || g_windowPacerHz ? 0 : testRun ? 60 : static_cast<int>(windowHz));
+            ThreadNaming::SetCurrentThreadName("WindowThread"); // PS2X_NATIVE_PROF_THREAD=WindowThread
         }
         if (m_debugUiInitCallback)
         {
@@ -3501,6 +3520,8 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        if (g_windowPacerHz)
+            ps2xWindowPace(g_windowPacerHz);
 
         if (WindowShouldClose())
         {

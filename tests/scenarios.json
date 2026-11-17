@@ -1094,6 +1094,29 @@
         { "type": "shot", "tick": 6000, "min_variance": 300, "label": "the Fairy Glade shows" },
         { "type": "fps", "after_tick": 4500, "min": 110, "label": "the Fairy Glade at 120 FPS with the 4x scanout (average game FPS)" }
       ]
+    },
+    {
+      "name": "bridge_1440",
+      "description": "bridge_120 (the busiest spot known: the user's recording, the bridge in the Minisaurus Plain) at the user's real-1440p settings: PS2X_GS_SSAA=16 (4x scanout shrunk to the 2560 x 1440 window). ~113-118 FPS on 2026-11-17 against ~120 at quality 4, GPU ~92% busy (nvidia-smi). Standing from tick ~2400 to the end (4200). No VU1 kick hash (it costs ~40% of the graphics thread here), so the FPS check holds in a normal run_tests run. The recording is tests/fixtures/bridge_1440.input (a local copy of bridge_120.input).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_shop\\mc0",
+      "input": "",
+      "frames": 4200,
+      "shots": [2700],
+      "env": {
+        "PS2X_FRAMERATE": "120",
+        "PS2X_GS_SSAA": "16",
+        "PS2X_WIDESCREEN": "16:9",
+        "PS2X_GFX_THREAD": "1",
+        "PS2X_HUD": "1",
+        "PS2X_FPS_LOG": "250",
+        "PS2X_WINDOW": "2560x1440",
+        "PS2X_VU1_KICK_HASH": "0"
+      },
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "fps", "after_tick": 2400, "min": 110, "label": "the bridge at quality 16 (average game FPS while standing)" }
+      ]
     }
   ]
 }

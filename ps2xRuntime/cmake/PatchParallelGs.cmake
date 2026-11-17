@@ -38,6 +38,105 @@ ps2x_patch_source("${ps2x_parallel_gs_SOURCE_DIR}/gs/gs_renderer.cpp"
 static const uint32_t MinimumPrimitivesForFlush = ps2x_flush_prims();]==]
     "PS2RECOMP-PATCH flush-prims")
 
+# Palette memoization kept across uploads (memo-keep). paraLLEl-GS skips a CLUT load that repeats one of the last 16 of
+# the render pass, but forgets them all whenever a write hits VRAM that was read as a texture. Rayman draws the world in
+# passes and, for every object, uploads three small lightmaps into the same three texture slots and then reloads the
+# CLUT with every texture change (~5000 loads a frame at the bridge in the Minisaurus Plain): each lightmap upload made
+# paraLLEl-GS forget, so ~500 loads a frame reached the GPU, each a step of a serial compute job (~2.2 ms of GPU time a
+# frame; with PS2X_GS_SSAA=16 the GPU was the limit there, 2026-11-17). Now, when the forgetting comes from a host->local
+# transfer or a local->local copy, only the remembered CLUTs whose source pages the transfer writes are marked stale
+# (kept in the list, as the bank-history check walks it, but never matched), and every transfer marks them so even when
+# the page tracker does not flush. Everything else forgets as before. A remembered CLUT is also not matched once 512
+# CLUT uploads came after it (the GPU keeps 1024 CLUT instances in a ring). PS2X_PGS_MEMO_KEEP=0: upstream behaviour.
+set(_ps2x_gsi "${ps2x_parallel_gs_SOURCE_DIR}/gs/gs_interface.cpp")
+ps2x_patch_source("${ps2x_parallel_gs_SOURCE_DIR}/gs/gs_interface.hpp"
+    [==[PaletteUploadDescriptor upload;]==]
+    [==[PaletteUploadDescriptor upload;
+			PageRect ps2x_page; /* PS2RECOMP-PATCH memo-keep-fields: the CLUT's source pages */
+			uint32_t ps2x_serial; // ps2x_palette_serial when its CLUT instance was made
+			bool ps2x_stale;      // its source pages were written since: not matched]==]
+    "PS2RECOMP-PATCH memo-keep-fields")
+ps2x_patch_source("${ps2x_parallel_gs_SOURCE_DIR}/gs/gs_interface.hpp"
+    [==[void forget_in_render_pass_memoization();]==]
+    [==[void forget_in_render_pass_memoization();
+	// PS2Recomp memo-keep (PatchParallelGs.cmake). /* PS2RECOMP-PATCH memo-keep-members */
+	void ps2x_reset_memo();
+	void ps2x_mark_memo_stale(const PageRect &rect);
+	void ps2x_transfer_begin(const PageRect &rect);
+	void ps2x_transfer_end(const PageRect &rect);
+	bool ps2x_in_transfer = false;
+	PageRect ps2x_transfer_rect = {};
+	uint32_t ps2x_palette_serial = 0;]==]
+    "PS2RECOMP-PATCH memo-keep-members")
+ps2x_patch_source("${_ps2x_gsi}"
+    [==[void GSInterface::forget_in_render_pass_memoization()]==]
+    [==[// PS2Recomp memo-keep (PatchParallelGs.cmake): page-level overlap (blocks ignored: conservative). /* PS2RECOMP-PATCH memo-keep-functions */
+static bool ps2x_memo_keep_on()
+{
+	static const bool on = [] { const char *e = getenv("PS2X_PGS_MEMO_KEEP"); return !(e && e[0] == '0'); }();
+	return on;
+}
+
+static bool ps2x_pages_overlap(const PageRect &a, const PageRect &b)
+{
+	for (uint32_t ay = 0; ay < a.page_height; ay++)
+		for (uint32_t ax = 0; ax < a.page_width; ax++)
+		{
+			const uint32_t pa = (a.base_page + ay * a.page_stride + ax) & 511u;
+			for (uint32_t by = 0; by < b.page_height; by++)
+				for (uint32_t bx = 0; bx < b.page_width; bx++)
+					if (((b.base_page + by * b.page_stride + bx) & 511u) == pa)
+						return true;
+		}
+	return false;
+}
+
+void GSInterface::ps2x_mark_memo_stale(const PageRect &rect)
+{
+	for (uint32_t i = 0; i < render_pass.num_memoized_palettes; i++)
+		if (ps2x_pages_overlap(render_pass.memoized_palettes[i].ps2x_page, rect))
+			render_pass.memoized_palettes[i].ps2x_stale = true;
+}
+
+void GSInterface::ps2x_reset_memo()
+{
+	if (ps2x_in_transfer)
+		ps2x_mark_memo_stale(ps2x_transfer_rect);
+	else
+		render_pass.num_memoized_palettes = 0u; // "0u": the memo-keep-reset patch replaces the "= 0;" form
+}
+
+void GSInterface::ps2x_transfer_begin(const PageRect &rect)
+{
+	ps2x_in_transfer = ps2x_memo_keep_on();
+	ps2x_transfer_rect = rect;
+}
+
+void GSInterface::ps2x_transfer_end(const PageRect &rect)
+{
+	ps2x_in_transfer = false;
+	ps2x_mark_memo_stale(rect);
+}
+
+void GSInterface::forget_in_render_pass_memoization()]==]
+    "PS2RECOMP-PATCH memo-keep-functions")
+foreach(_pair
+        "render_pass.num_memoized_palettes = 0;|ps2x_reset_memo(); /* PS2RECOMP-PATCH memo-keep-reset (was: render_pass.num_memoized_palettes = 0) */"
+        "tracker.mark_transfer_write(dst_rect);|ps2x_transfer_begin(dst_rect); tracker.mark_transfer_write(dst_rect); ps2x_transfer_end(dst_rect); /* PS2RECOMP-PATCH memo-keep-upload */"
+        "transfer_state.copy.needs_shadow_vram = tracker.mark_transfer_copy(dst_rect, src_rect);|ps2x_transfer_begin(dst_rect); transfer_state.copy.needs_shadow_vram = tracker.mark_transfer_copy(dst_rect, src_rect); ps2x_transfer_end(dst_rect); /* PS2RECOMP-PATCH memo-keep-copy */"
+        "if (memoized.csa_mask == page.csa_mask &&|if (!memoized.ps2x_stale && ps2x_palette_serial - memoized.ps2x_serial < 512u && /* PS2RECOMP-PATCH memo-keep-match */ memoized.csa_mask == page.csa_mask &&"
+        "if (memoized.clut_instance != render_pass.clut_instance)|const uint32_t ps2x_found_serial = memoized.ps2x_serial; /* PS2RECOMP-PATCH memo-keep-found */ if (memoized.clut_instance != render_pass.clut_instance)"
+        "last_memoized.clut_instance = render_pass.clut_instance;|last_memoized.clut_instance = render_pass.clut_instance; last_memoized.ps2x_page = page; last_memoized.ps2x_serial = ps2x_found_serial; last_memoized.ps2x_stale = false; /* PS2RECOMP-PATCH memo-keep-move */"
+        "render_pass.clut_instance = renderer.update_palette_cache(palette_desc);|ps2x_palette_serial++; /* PS2RECOMP-PATCH memo-keep-serial */ render_pass.clut_instance = renderer.update_palette_cache(palette_desc);"
+        "auto &memoized = render_pass.memoized_palettes[render_pass.num_memoized_palettes++];|auto &memoized = render_pass.memoized_palettes[render_pass.num_memoized_palettes++]; memoized.ps2x_page = page; memoized.ps2x_serial = ps2x_palette_serial; memoized.ps2x_stale = false; /* PS2RECOMP-PATCH memo-keep-new */")
+    string(FIND "${_pair}" "|" _bar)
+    string(SUBSTRING "${_pair}" 0 ${_bar} _anchor)
+    math(EXPR _rest "${_bar} + 1")
+    string(SUBSTRING "${_pair}" ${_rest} -1 _replacement)
+    string(REGEX MATCH "PS2RECOMP-PATCH memo-keep-[a-z-]+" _marker "${_replacement}")
+    ps2x_patch_source("${_ps2x_gsi}" "${_anchor}" "${_replacement}" "${_marker}")
+endforeach()
+
 # PS2X_GS_SSAA=16: a 4x scanout (2560 x 2048 for PAL, real 1440p: the user's request, 2026-11-17). With 16 samples on
 # the ordered grid each PS2 pixel holds a 4 x 4 grid of samples, but paraLLEl-GS scans out at most 2x (each output pixel
 # averages the 4 samples of a quarter). VSyncInfo::ps2x_scanout_4x makes it 4x: the circuits and the merged picture 4x
