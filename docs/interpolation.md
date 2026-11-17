@@ -175,6 +175,33 @@ Also checked:
 - Still at the logic rate, as on the console: particles (the sparkles around a lum: frozen for a step, then new ones)
   and texture animation (water, waterfalls).
 
+## Still a little flicker: the picture followed the last gap, not the 25 Hz grid (2026-11-17)
+
+The user, after the camera fix: "there is still a little bit flikering in the smooth mode although its much better".
+The logic steps sit on the 25 Hz grid of guest VBlanks, at 120 Hz every 5, 5, 5, 5, 4 VBlanks. The in-between
+pictures measured their place by the gap between the last two steps: t = (v - step) / (last gap). After a gap of 5
+followed by 4, the last draw-only picture was at t = 0.6 and the logic picture jumped to 1.0 (twice the usual
+step); after a gap of 4 followed by 5, t reached 1.0 one picture early and the logic picture showed the same place
+again. A hitch 5 times a second, everything on the screen (camera and objects alike).
+
+Measured with `PS2X_TEST_BURST=18440,100 PS2X_HUD=1` on `rayman_interp` (Rayman walking): the mean change between
+consecutive pictures (scratch tool: mean absolute difference, capture misses left out) was ~4.5 on most pictures,
+but 10.8 on the logic picture after a 4-gap and 0.6-0.9 on the next logic picture (cv 0.32). Now (main.cpp
+`raymanInterpGridT`): the picture follows the grid itself. On the frame of VBlank v after the logic step of slot s,
+x = (v * L - s * R) / R steps have passed; the picture shows the logic's time minus 1 + d steps, d = (L - gcd(L, R)) /
+R = the most x can be on a logic frame (1/6 step = 7 ms at 120 Hz). A logic frame k (its own step is not final yet)
+shows k-2..k-1 at t = 1 + x - d (the two steps saved before it; it showed k-1 before), the draw-only frames after it
+show k-1..k at t = x - d. Snapshots are paired by logic step number (`g_raymanLogicSteps`), not by VBlank. After:
+logic pictures 4.1-6.5, draw-only 3.2-6.5, cv 0.14. RenderWare's camera frames get the same treatment (each keeps
+the steps of its two pictures; a logic frame blends the two before its own).
+
+Also checked (normal play, real-time clock, window at 120, 1440p; `PS2X_PRESENT_STATS=1` in ps2_runtime.cpp
+UploadFrame counts window frames that found no new game VSync or more than one): during play every game frame was
+shown exactly once (0 of 600 in most 5 s windows); repeats only while booting and loading. Objects kept as they are
+(`PS2X_RAYMAN_INTERP_KEPT=<n>` logs them with the reason): ~0.6 a frame in `rayman_interp`, nearly all one effect
+shrinking to nothing (size ratio over 1.25 per step, the guard against an effect appearing), a few turns over 90
+degrees; ~0.5 a frame unpaired (new parts).
+
 ## Next steps
 
 1. More flicker checks (effects, other levels); the user's impression.

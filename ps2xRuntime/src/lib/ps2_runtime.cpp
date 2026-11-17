@@ -690,6 +690,31 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_uploadBuffer;
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+    // PS2X_PRESENT_STATS=1 (research): how the window's frames meet the game's, every 600 window frames. Each game
+    // frame should be shown once: "same VSync" = no game frame since the last window frame (the picture shown twice),
+    // "skipped" = more than one (a game frame never shown), "not ready" = the GS thread had no picture yet.
+    static const bool s_stats = []() {
+        const char *e = std::getenv("PS2X_PRESENT_STATS");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    static uint64_t s_statFrames = 0u, s_statSame = 0u, s_statSkipFrames = 0u, s_statSkipped = 0u, s_statNotReady = 0u;
+    if (s_stats && s_hasLatchedInitialFrame)
+    {
+        const uint64_t delta = currentTick - s_lastPresentationTick;
+        s_statSame += delta == 0u ? 1u : 0u;
+        if (delta > 1u)
+        {
+            ++s_statSkipFrames;
+            s_statSkipped += delta - 1u;
+        }
+        if (++s_statFrames % 600u == 0u)
+        {
+            std::fprintf(stderr, "[present] 600 window frames: same VSync %llu, VSyncs skipped %llu (in %llu frames), no picture ready %llu\n",
+                         static_cast<unsigned long long>(s_statSame), static_cast<unsigned long long>(s_statSkipped),
+                         static_cast<unsigned long long>(s_statSkipFrames), static_cast<unsigned long long>(s_statNotReady));
+            s_statSame = s_statSkipFrames = s_statSkipped = s_statNotReady = 0u;
+        }
+    }
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
@@ -718,6 +743,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &usedPreferredDisplaySource))
     {
         // No new picture (the GPU renderer hands each picture over once): keep showing the last real one.
+        s_statNotReady += s_stats ? 1u : 0u;
         if (s_hasRealFrame)
         {
             outWidth = s_lastWidth;

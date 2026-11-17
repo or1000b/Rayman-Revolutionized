@@ -455,6 +455,8 @@ namespace
     uint32_t g_raymanLogicHz = 0u;   // 0 = off
     bool g_raymanNextStepLogic = true;
     uint64_t g_raymanLastLogicSlot = ~0ull;
+    uint64_t g_raymanClockVsync = 0u; // the VBlank the last frame clock saw (the current frame's)
+    uint64_t g_raymanLogicSteps = 0u; // logic steps so far (PS2X_RAYMAN_INTERP pairs its snapshots by them)
     bool g_raymanDrawOnly = false;   // the current frame's step only draws
     bool g_raymanStepSinceClock = false;
     bool g_raymanTailRuns = true;    // decided with the clock: the next step is a logic step
@@ -492,6 +494,7 @@ namespace
         g_raymanDrawOnly = !g_raymanNextStepLogic && !raymanDemoPlayback(rdram, getRegU32(ctx, 28));
         if (!g_raymanDrawOnly)
         {
+            ++g_raymanLogicSteps;
             raymanInterpRestore(rdram);    // the logic starts from the true matrices
             g_raymanRequestsValid = false; // saved again when this step's requests are consumed
         }
@@ -544,7 +547,8 @@ namespace
         // Called after the VBlank wait: the guest VBlank now is the next frame's. The clock moves only when a new 40 ms
         // slot begins, also in frames without a game step (loading, some menus): with the clock unit 0.02 s, a clock
         // update every 120 Hz frame would count 20 ms per 8.3 ms (game time 2.4 times too fast there).
-        const uint64_t slot = ps2xGuestVsync() * g_raymanLogicHz / g_raymanFrameRate;
+        g_raymanClockVsync = ps2xGuestVsync();
+        const uint64_t slot = g_raymanClockVsync * g_raymanLogicHz / g_raymanFrameRate;
         if (!g_raymanStepSinceClock) // a frame without a game step (menu, loading): its 2D is a logic frame's
             ps2xHudFrameMark(0);
         bool logicNext = true;
@@ -703,7 +707,7 @@ namespace
     bool g_raymanInterp = false;
     std::vector<RaymanNodeMatrix> g_raymanInterpPrev, g_raymanInterpCur; // true matrices of steps N-1 and N
     std::unordered_map<uint64_t, uint32_t> g_raymanInterpPrevIndex;
-    uint64_t g_raymanInterpPrevVsync = 0u, g_raymanInterpCurVsync = 0u;
+    uint64_t g_raymanInterpPrevStep = 0u, g_raymanInterpCurStep = 0u; // the logic steps of the two snapshots (0 = none)
     bool g_raymanInterpWritten = false; // interpolated matrices are in guest memory now
     bool g_raymanInterpNeedCapture = false; // the last logic step's final matrices are still to be taken
     std::vector<RaymanNodeMatrix> g_raymanInterpNow; // the logic step's objects, on its own frame
@@ -729,18 +733,45 @@ namespace
     struct RaymanRwFrame
     {
         uint32_t address = 0u; // the frame's modelling matrix; 0 = free
-        bool hasPrev = false, hasCur = false;
+        uint64_t prevStep = 0u, curStep = 0u; // the logic steps of prev and cur (0 = none)
         float prev[16] = {}, cur[16] = {};
     };
     std::array<RaymanRwFrame, 4> g_raymanRwFrames;
     uint32_t g_raymanRwFrameNextSlot = 0u;
-    uint64_t g_raymanInterpFrames = 0u, g_raymanInterpObjects = 0u, g_raymanInterpJumps = 0u;
+    uint64_t g_raymanInterpFrames = 0u, g_raymanInterpObjects = 0u, g_raymanInterpJumps = 0u, g_raymanInterpUnpaired = 0u;
     PS2Runtime::RecompiledFunction g_raymanCameraUpdate = nullptr;
     PS2Runtime::RecompiledFunction g_raymanAfterDisplay = nullptr;
 
     bool raymanGuestPtr(uint32_t address)
     {
         return address >= 0x00100000u && address < 0x01FFFFC0u && (address & 3u) == 0u;
+    }
+
+    // Where the picture lies between two logic steps. The steps sit on the 25 Hz grid of guest VBlanks (at 120 Hz every
+    // 5, 5, 5, 5, 4 VBlanks). Measured by the gap between the last two steps (until 2026-11-17), the picture moved twice
+    // as far once in five steps and showed the same picture twice in the next: a hitch 5 times a second (the user's
+    // "still a little bit flickering"). Now it follows the grid itself: on the frame of VBlank v after the logic step
+    // of slot s, x = (v * L - s * R) / R steps have passed (0 <= x < 1). The picture shows the logic's time minus
+    // 1 + d steps: one step behind, as before, plus d = (L - gcd(L, R)) / R, the most x can be on a logic frame (1/6
+    // step = 7 ms at 120 Hz). So a logic frame k (its own step is not final yet) shows k-2..k-1 at 1 + x - d, and the
+    // draw-only frames after it show k-1..k at x - d; both between 0 and 1.
+    float raymanInterpGridT(bool logicFrame)
+    {
+        const uint32_t L = g_raymanLogicHz, R = g_raymanFrameRate;
+        if (L == 0u || R == 0u || g_raymanLastLogicSlot == ~0ull)
+            return 1.0f;
+        uint32_t g = L, r = R;
+        while (r != 0u)
+        {
+            const uint32_t rest = g % r;
+            g = r;
+            r = rest;
+        }
+        const int64_t num = static_cast<int64_t>(g_raymanClockVsync) * L - static_cast<int64_t>(g_raymanLastLogicSlot) * R;
+        const float x = static_cast<float>(num) / static_cast<float>(R);
+        const float d = static_cast<float>(L - g) / static_cast<float>(R);
+        const float t = (logicFrame ? 1.0f : 0.0f) + x - d;
+        return std::min(1.0f, std::max(0.0f, t));
     }
 
     void raymanInterpSnapshot(const uint8_t *rdram, std::vector<RaymanNodeMatrix> &out)
@@ -886,6 +917,8 @@ namespace
         g_raymanInterpNow.clear();
         g_raymanInterpPrevIndex.clear();
         g_raymanInterpCurIndex.clear();
+        g_raymanInterpPrevStep = 0u;
+        g_raymanInterpCurStep = 0u;
         g_raymanViewPrev.address = 0u;
         g_raymanViewCur.address = 0u;
         g_raymanRwFrames = {};
@@ -970,23 +1003,40 @@ namespace
                     *entry = RaymanRwFrame{};
                     entry->address = modelling;
                 }
-                if (!g_raymanDrawOnly)
-                {
-                    if (entry->hasCur)
-                    {
-                        std::memcpy(entry->prev, entry->cur, sizeof(entry->prev));
-                        entry->hasPrev = true;
-                    }
-                    std::memcpy(entry->cur, rdram + modelling, sizeof(entry->cur));
-                    entry->hasCur = true;
-                }
-                const uint64_t span = g_raymanInterpCurVsync - g_raymanInterpPrevVsync;
+                // The objects' time (raymanInterpGridT): a logic frame k shows k-2..k-1 (the steps saved before this
+                // one), a draw-only frame k-1..k.
+                const uint64_t k = g_raymanLogicSteps;
+                const bool logicFrame = !g_raymanDrawOnly;
+                const float t = raymanInterpGridT(logicFrame);
                 float m[16];
-                if (span > 0u && span < 64u && entry->hasPrev)
+                bool write = false;
+                if (logicFrame)
                 {
-                    const float t = std::min(1.0f, static_cast<float>(ps2xGuestVsync() - g_raymanInterpCurVsync) / static_cast<float>(span));
-                    if (raymanInterpMatrix(entry->prev, entry->cur, t, m))
-                        std::memcpy(rdram + modelling, m, sizeof(m));
+                    if (entry->curStep == k - 1u && entry->curStep != 0u)
+                    {
+                        if (entry->prevStep == k - 2u && entry->prevStep != 0u && raymanInterpMatrix(entry->prev, entry->cur, t, m))
+                            write = true;
+                        else
+                        {
+                            std::memcpy(m, entry->cur, sizeof(m)); // step k-1 as it was
+                            write = true;
+                        }
+                    }
+                    std::memcpy(entry->prev, entry->cur, sizeof(entry->prev));
+                    entry->prevStep = entry->curStep;
+                    std::memcpy(entry->cur, rdram + modelling, sizeof(entry->cur));
+                    entry->curStep = k;
+                    float check[16];
+                    if (write && !raymanInterpMatrix(m, entry->cur, 0.0f, check)) // a cut between k-1 and k: show k
+                        write = false;
+                }
+                else if (entry->curStep == k && entry->prevStep == k - 1u && entry->prevStep != 0u)
+                    write = raymanInterpMatrix(entry->prev, entry->cur, t, m);
+                if (write)
+                {
+                    for (int word = 3; word < 16; word += 4) // the flags and padding words stay this frame's
+                        std::memcpy(&m[word], rdram + modelling + word * 4u, 4u);
+                    std::memcpy(rdram + modelling, m, sizeof(m));
                 }
             }
         }
@@ -1031,24 +1081,33 @@ namespace
         // written (the drawing may have computed a matrix meanwhile).
         float m[16];
         int pairedCount = 0;
-        if (!g_raymanDrawOnly) // logic step N: N's final matrices are not there yet; show N-1 in N's objects
+        const uint64_t k = g_raymanLogicSteps;
+        if (!g_raymanDrawOnly) // logic step k: k's final matrices are not there yet; show k-2..k-1 in k's objects
         {
-            g_raymanInterpPrevVsync = g_raymanInterpCurVsync;
-            g_raymanInterpCurVsync = vsync;
             g_raymanInterpNeedCapture = true;
             raymanInterpSnapshot(rdram, g_raymanInterpNow); // this step's objects (their values are not final yet)
-            if (raymanInterpParts() & 1)
+            const bool haveLast = g_raymanInterpCurStep == k - 1u && g_raymanInterpCurStep != 0u;
+            const bool havePair = haveLast && g_raymanInterpPrevStep == k - 2u && g_raymanInterpPrevStep != 0u;
+            const float t = raymanInterpGridT(true);
+            if (haveLast && (raymanInterpParts() & 1))
                 for (const RaymanNodeMatrix &now : g_raymanInterpNow)
                 {
                     const auto it = g_raymanInterpCurIndex.find(now.key);
                     if (it == g_raymanInterpCurIndex.end())
                         continue;
                     const RaymanNodeMatrix &last = g_raymanInterpCur[it->second];
-                    if (raymanInterpMatrix(last.m, now.m, 0.0f, m)) // t = 0 with the checks (jumps, sizes)
+                    if (!raymanInterpMatrix(last.m, now.m, 0.0f, m)) // k-1 as it was, with the checks (jumps, sizes)
+                        continue;
+                    if (havePair)
                     {
-                        raymanInterpWrite(rdram, now.matrix, m);
-                        ++pairedCount;
+                        const auto before = g_raymanInterpPrevIndex.find(now.key);
+                        float mixed[16];
+                        if (before != g_raymanInterpPrevIndex.end() &&
+                            raymanInterpMatrix(g_raymanInterpPrev[before->second].m, last.m, t, mixed))
+                            std::memcpy(m, mixed, sizeof(m));
                     }
+                    raymanInterpWrite(rdram, now.matrix, m);
+                    ++pairedCount;
                 }
         }
         else
@@ -1057,6 +1116,8 @@ namespace
             {
                 g_raymanInterpNeedCapture = false;
                 std::swap(g_raymanInterpPrev, g_raymanInterpCur);
+                g_raymanInterpPrevStep = g_raymanInterpCurStep;
+                g_raymanInterpCurStep = k;
                 raymanInterpSnapshot(rdram, g_raymanInterpCur);
                 g_raymanInterpPrevIndex.clear();
                 for (uint32_t i = 0; i < g_raymanInterpPrev.size(); ++i)
@@ -1065,10 +1126,10 @@ namespace
                 for (uint32_t i = 0; i < g_raymanInterpCur.size(); ++i)
                     g_raymanInterpCurIndex.emplace(g_raymanInterpCur[i].key, i);
             }
-            const uint64_t span = g_raymanInterpCurVsync - g_raymanInterpPrevVsync;
-            if (span > 0u && span < 64u && !g_raymanInterpPrev.empty() && (raymanInterpParts() & 1))
+            if (g_raymanInterpCurStep == k && g_raymanInterpPrevStep == k - 1u && g_raymanInterpPrevStep != 0u &&
+                !g_raymanInterpPrev.empty() && (raymanInterpParts() & 1))
             {
-                const float t = std::min(1.0f, static_cast<float>(vsync - g_raymanInterpCurVsync) / static_cast<float>(span));
+                const float t = raymanInterpGridT(false);
                 // PS2X_RAYMAN_INTERP_LOG=<vsync> (research): every object of the first draw-only frame from that VSync,
                 // with its translation at N-1, at N and as drawn.
                 static const uint64_t s_logAt = []() {
@@ -1097,8 +1158,49 @@ namespace
                                      !paired ? "unpaired" : (!same ? "moved" : (done ? "blend" : "kept")), pm[12], pm[13], pm[14], cur.m[12],
                                      cur.m[13], cur.m[14], done ? m[12] : cur.m[12], done ? m[13] : cur.m[13], done ? m[14] : cur.m[14]);
                     }
+                    if (!paired)
+                        ++g_raymanInterpUnpaired;
                     if (paired && same && !done)
+                    {
                         ++g_raymanInterpJumps;
+                        // PS2X_RAYMAN_INTERP_KEPT=<n> (research): the first n objects kept as they are, with why
+                        // (distance per step, the smallest cosine between their rows, the largest size ratio).
+                        static long s_keptLeft = []() {
+                            const char *e = std::getenv("PS2X_RAYMAN_INTERP_KEPT");
+                            return e ? std::strtol(e, nullptr, 10) : 0L;
+                        }();
+                        if (s_keptLeft > 0)
+                        {
+                            --s_keptLeft;
+                            const float *a = g_raymanInterpPrev[it->second].m, *b = cur.m;
+                            const float dist = std::sqrt((b[12] - a[12]) * (b[12] - a[12]) + (b[13] - a[13]) * (b[13] - a[13]) +
+                                                         (b[14] - a[14]) * (b[14] - a[14]));
+                            float minCos = 1.0f, maxRatio = 1.0f;
+                            for (int r = 0; r < 3; ++r)
+                            {
+                                float la = 0.0f, lb = 0.0f, dot = 0.0f;
+                                for (int c = 0; c < 3; ++c)
+                                {
+                                    la += a[r * 4 + c] * a[r * 4 + c];
+                                    lb += b[r * 4 + c] * b[r * 4 + c];
+                                    dot += a[r * 4 + c] * b[r * 4 + c];
+                                }
+                                la = std::sqrt(la);
+                                lb = std::sqrt(lb);
+                                if (la > 1e-6f && lb > 1e-6f)
+                                {
+                                    minCos = std::min(minCos, dot / (la * lb));
+                                    maxRatio = std::max(maxRatio, std::max(la / lb, lb / la));
+                                }
+                                else
+                                    maxRatio = 99.0f;
+                            }
+                            std::fprintf(stderr, "[interp-kept] vsync %llu node %x type %u data %x parent %x dist %.2f cos %.3f size %.2f at (%.1f %.1f %.1f)\n",
+                                         static_cast<unsigned long long>(vsync), cur.node, raymanRam32(rdram, cur.node),
+                                         raymanRam32(rdram, cur.node + 4u), raymanRam32(rdram, cur.node + 0x1Cu), dist, minCos,
+                                         maxRatio, b[12], b[13], b[14]);
+                        }
+                    }
                     if (!done)
                         continue;
                     raymanInterpWrite(rdram, cur.matrix, m);
@@ -1108,10 +1210,10 @@ namespace
         }
         g_raymanInterpObjects += static_cast<uint64_t>(pairedCount);
         if (++g_raymanInterpFrames % 600u == 0u)
-            std::fprintf(stderr, "[hle] Rayman: in-between pictures: %llu frames, %.1f objects interpolated per frame, %llu jumps kept\n",
+            std::fprintf(stderr, "[hle] Rayman: in-between pictures: %llu frames, %.1f objects interpolated per frame, %llu jumps kept, %llu unpaired\n",
                          static_cast<unsigned long long>(g_raymanInterpFrames),
                          static_cast<double>(g_raymanInterpObjects) / static_cast<double>(g_raymanInterpFrames),
-                         static_cast<unsigned long long>(g_raymanInterpJumps));
+                         static_cast<unsigned long long>(g_raymanInterpJumps), static_cast<unsigned long long>(g_raymanInterpUnpaired));
         g_raymanCameraUpdate(rdram, ctx, runtime);
     }
 
