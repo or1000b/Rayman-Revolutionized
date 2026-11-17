@@ -571,6 +571,7 @@ void EeScheduler::postEvent(EeEvent event)
     {
         std::lock_guard lock(m_eventMutex);
         m_events.push_back(event);
+        m_eventsPosted.store(true, std::memory_order_release);
         m_checkpointPending.store(true, std::memory_order_release);
     }
     m_eventCv.notify_one();
@@ -2093,14 +2094,31 @@ void EeScheduler::processPendingEvents()
             dispatchIrq(false, 9u + timer);
         }
     }
-    std::deque<EeEvent> pending;
+    // Posted events: swapped out under the lock into a buffer reused from earlier calls (a new std::deque each call
+    // was a heap allocation and free, ~4% of the game thread at 120 FPS, 2026-11-17). Each call level takes its own
+    // buffer, so a nested call (an event's handler reaching a checkpoint) cannot disturb the outer loop. No lock when
+    // nothing was posted: a post that races with the test still sets m_checkpointPending below, under the lock.
+    if (m_eventsPosted.load(std::memory_order_acquire))
     {
-        std::lock_guard lock(m_eventMutex);
-        pending.swap(m_events);
-    }
-    for (const EeEvent &event : pending)
-    {
-        processEvent(event);
+        thread_local std::vector<std::vector<EeEvent>> t_eventBuffers;
+        std::vector<EeEvent> pending;
+        if (!t_eventBuffers.empty())
+        {
+            pending.swap(t_eventBuffers.back());
+            t_eventBuffers.pop_back();
+        }
+        {
+            std::lock_guard lock(m_eventMutex);
+            pending.swap(m_events); // m_events keeps the reused buffer's capacity
+            m_eventsPosted.store(false, std::memory_order_relaxed);
+        }
+        for (const EeEvent &event : pending)
+        {
+            processEvent(event);
+        }
+        pending.clear();
+        if (t_eventBuffers.size() < 8u)
+            t_eventBuffers.push_back(std::move(pending));
     }
 
     {
@@ -2115,6 +2133,14 @@ void EeScheduler::processPendingEvents()
 
 void EeScheduler::processDueDeadlines()
 {
+    // Nothing due by cycle: both paths below would only take the lock, find nothing and return (~4% of the game
+    // thread in locks, 2026-11-17). m_nextDeadlineCycle is the earliest deadline (updateNextDeadline after every
+    // change of m_deadlines); a deadline another thread adds right now is seen by the next checkpointDue.
+    {
+        const uint64_t nextCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (nextCycle == 0u || nextCycle > m_eeCycle)
+            return;
+    }
     if (ps2xDeterministic())
     {
         // One event at a time, in guest-cycle order (then type, id, sequence). Each still waits for its host

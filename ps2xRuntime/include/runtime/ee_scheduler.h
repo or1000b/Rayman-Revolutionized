@@ -436,7 +436,8 @@ private:
 
     mutable std::mutex m_eventMutex;
     std::condition_variable m_eventCv;
-    std::deque<EeEvent> m_events;
+    std::vector<EeEvent> m_events; // posted events, oldest first (a vector: processPendingEvents swaps in a reused buffer)
+    std::atomic<bool> m_eventsPosted{false}; // set with m_events non-empty (under m_eventMutex): skip the swap lock when false
     std::vector<ScheduledEvent> m_deadlines;
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
