@@ -222,6 +222,9 @@ function Invoke-GameRun($sc, $log, $shotDir) {
     (Get-Item -Force $mcRoot).CreationTime = $cardTime
     (Get-Item -Force $mcRoot).LastWriteTime = $cardTime
     $env:PS2X_MC_ROOT = $mcRoot
+    # No auto-save in test runs and recordings (the launchers turn it on; it runs extra game code, so a replay would
+    # differ), unless the scenario asks for it (autosave_write).
+    $env:PS2X_AUTOSAVE = '0'
     # Extra variables of this scenario ("env": { "PS2X_UBI_TRACE": "1" }); cleared again after the run.
     $extraEnv = @()
     if ($sc.PSObject.Properties['env']) {
@@ -231,14 +234,25 @@ function Invoke-GameRun($sc, $log, $shotDir) {
         }
     }
     if ($Record -and -not $RecordScript) {
-        # The window like run_rayman_hd.bat (full screen, F10 toggles; smooth scaling; FPS counter). Window settings
-        # only: what the game does comes from the scenario's env, the same in the recording and the replays.
-        foreach ($kv in @(@('PS2X_WINDOW', '1280x720'), @('PS2X_FULLSCREEN', '1'), @('PS2X_FILTER', 'bilinear'), @('PS2X_SHOW_FPS', '1'))) {
-            if (-not (Test-Path "Env:$($kv[0])")) {
-                Set-Item -Path "Env:$($kv[0])" -Value $kv[1]
-                $extraEnv += $kv[0]
+        # The picture and the window as the player has them in run_rayman_hd.bat (picture quality, e.g. 16 = real
+        # 1440p; full screen, F10 toggles; scaling; picture shape; FPS counter; the HUD layer). These only change the
+        # picture, not what the game does, so they may differ from the scenario's (the replays use the scenario's);
+        # what the game does (frame rate, widescreen, ...) stays the scenario's, the same in the recording and the
+        # replays. Defaults when run_rayman_hd.bat does not set one.
+        $look = [ordered]@{ PS2X_GS_SSAA = '16'; PS2X_FULLSCREEN = '1'; PS2X_WINDOW = '1280x720'; PS2X_FILTER = 'bilinear';
+            PS2X_ASPECT = ''; PS2X_SHOW_FPS = '1'; PS2X_HUD = '1' }
+        $hdBat = Join-Path $Root 'run_rayman_hd.bat'
+        if (Test-Path $hdBat) {
+            foreach ($line in Get-Content $hdBat) {
+                if ($line -match '^\s*set\s+(PS2X_[A-Z0-9_]+)=(.*)$' -and $look.Contains($Matches[1])) { $look[$Matches[1]] = $Matches[2].Trim() }
             }
         }
+        foreach ($name in $look.Keys) {
+            if ($look[$name] -eq '') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+            else { Set-Item -Path "Env:$name" -Value $look[$name] }
+            $extraEnv += $name
+        }
+        Write-Host ("  picture as in run_rayman_hd.bat: quality {0}, HUD layer {1}, full screen {2}" -f $look['PS2X_GS_SSAA'], $look['PS2X_HUD'], $look['PS2X_FULLSCREEN'])
     }
 
     # The game paces itself to ~60 frames per second; allow 3x plus start-up before giving up.
