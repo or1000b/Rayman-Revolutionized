@@ -945,38 +945,14 @@ extern "C" uint64_t ps2xTestLastShotTick()
     return g_lastShotTick.load(std::memory_order_relaxed);
 }
 
-extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels)
+namespace
 {
-    if (g_nextShot >= g_shotTicks.size() || !rgba || width == 0 || height == 0)
-        return;
-    const uint64_t tick = scriptClock();
-    if (tick < g_shotTicks[g_nextShot])
-        return;
-    g_lastShotTick.store(tick, std::memory_order_relaxed);
-    while (g_nextShot < g_shotTicks.size() && g_shotTicks[g_nextShot] <= tick)
-        ++g_nextShot;
-
-    // Luma mean / variance: a black or flat picture is the first sign of a broken renderer.
-    double sum = 0.0;
-    double sumSq = 0.0;
-    for (uint32_t y = 0; y < height; ++y)
+    // A picture as a top-down 32-bit BMP.
+    bool writeBmp(const char *path, const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels)
     {
-        const uint8_t *row = rgba + static_cast<size_t>(y) * rowPixels * 4u;
-        for (uint32_t x = 0; x < width; ++x)
-        {
-            const double luma = 0.299 * row[x * 4] + 0.587 * row[x * 4 + 1] + 0.114 * row[x * 4 + 2];
-            sum += luma;
-            sumSq += luma * luma;
-        }
-    }
-    const double count = static_cast<double>(width) * height;
-    const double mean = sum / count;
-    const double variance = sumSq / count - mean * mean;
-
-    char path[96];
-    std::snprintf(path, sizeof(path), "out/test_shot_%llu.bmp", static_cast<unsigned long long>(tick));
-    if (FILE *f = std::fopen(path, "wb"))
-    {
+        FILE *f = std::fopen(path, "wb");
+        if (!f)
+            return false;
         const uint32_t imageBytes = width * height * 4u;
         uint8_t header[54] = {};
         const auto put32 = [&](int at, uint32_t v) { for (int i = 0; i < 4; ++i) header[at + i] = uint8_t(v >> (8 * i)); };
@@ -1005,7 +981,87 @@ extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32
             std::fwrite(bgra.data(), 1u, bgra.size(), f);
         }
         std::fclose(f);
+        return true;
     }
+
+    // PS2X_TEST_BURST="<first VSync>,<count>" (research, e.g. flicker of the in-between pictures): every new picture the
+    // window fetches while the guest VSync is in [first, first + count) goes to out/burst_<vsync>.bmp. The window runs
+    // uncapped then (ps2_runtime.cpp), so at 120 Hz every VSync's picture is fetched unless the host falls behind
+    // (missing numbers show it).
+    struct Burst
+    {
+        uint64_t first = 0, end = 0;
+    };
+    const Burst &burstRange()
+    {
+        static const Burst range = []
+        {
+            Burst b;
+            if (const char *env = std::getenv("PS2X_TEST_BURST"))
+            {
+                char *end = nullptr;
+                b.first = std::strtoull(env, &end, 10);
+                const uint64_t count = (end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0u;
+                b.end = b.first + count;
+            }
+            return b;
+        }();
+        return range;
+    }
+
+    void burstShot(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels)
+    {
+        static uint64_t s_last = ~0ull;
+        const Burst &range = burstRange();
+        const uint64_t vsync = g_guestVsync.load(std::memory_order_relaxed);
+        if (range.end == 0u || vsync < range.first || vsync >= range.end || vsync == s_last)
+            return;
+        s_last = vsync;
+        char path[96];
+        std::snprintf(path, sizeof(path), "out/burst_%llu.bmp", static_cast<unsigned long long>(vsync));
+        writeBmp(path, rgba, width, height, rowPixels);
+    }
+}
+
+// ps2_runtime.cpp: PS2X_TEST_BURST is set (the window then runs uncapped).
+extern "C" bool ps2xTestBurstActive()
+{
+    return burstRange().end != 0u;
+}
+
+extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels)
+{
+    if (rgba && width != 0 && height != 0)
+        burstShot(rgba, width, height, rowPixels);
+    if (g_nextShot >= g_shotTicks.size() || !rgba || width == 0 || height == 0)
+        return;
+    const uint64_t tick = scriptClock();
+    if (tick < g_shotTicks[g_nextShot])
+        return;
+    g_lastShotTick.store(tick, std::memory_order_relaxed);
+    while (g_nextShot < g_shotTicks.size() && g_shotTicks[g_nextShot] <= tick)
+        ++g_nextShot;
+
+    // Luma mean / variance: a black or flat picture is the first sign of a broken renderer.
+    double sum = 0.0;
+    double sumSq = 0.0;
+    for (uint32_t y = 0; y < height; ++y)
+    {
+        const uint8_t *row = rgba + static_cast<size_t>(y) * rowPixels * 4u;
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            const double luma = 0.299 * row[x * 4] + 0.587 * row[x * 4 + 1] + 0.114 * row[x * 4 + 2];
+            sum += luma;
+            sumSq += luma * luma;
+        }
+    }
+    const double count = static_cast<double>(width) * height;
+    const double mean = sum / count;
+    const double variance = sumSq / count - mean * mean;
+
+    char path[96];
+    std::snprintf(path, sizeof(path), "out/test_shot_%llu.bmp", static_cast<unsigned long long>(tick));
+    writeBmp(path, rgba, width, height, rowPixels);
     std::fprintf(stderr, "[test] shot tick=%llu file=%s size=%ux%u mean=%.1f variance=%.1f\n",
                  static_cast<unsigned long long>(tick), path, width, height, mean, variance);
 }

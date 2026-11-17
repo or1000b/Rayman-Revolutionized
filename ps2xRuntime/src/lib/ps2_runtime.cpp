@@ -53,6 +53,7 @@ extern "C" bool ps2xTestHarnessTick(uint64_t tick);
 extern "C" void ps2xTestHarnessExiting();
 extern "C" void ps2xTestThreadStackGuarantee();
 extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32_t height, uint32_t rowPixels);
+extern "C" bool ps2xTestBurstActive(); // ps2_test_harness.cpp (PS2X_TEST_BURST)
 extern "C" uint64_t ps2xTestLastShotTick();     // ps2_test_harness.cpp: the tick of the last test_shot (0 = none)
 void ps2xInstallIopToEeRpcHooks(PS2Runtime *runtime);       // Kernel/Syscalls/RPC.cpp
 void ps2xInstallIopCdReader(bool install);                  // Kernel/Stubs/CD.cpp
@@ -1119,7 +1120,8 @@ bool PS2Runtime::initialize(const char *title)
         {
             const char *testMode = std::getenv("PS2X_TEST_MODE");
             const bool testRun = testMode && std::atoi(testMode) != 0;
-            SetTargetFPS(testRun ? 60 : static_cast<int>(std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz())));
+            // PS2X_TEST_BURST (research: every VSync's picture to a file): uncapped, so no VSync is skipped.
+            SetTargetFPS(ps2xTestBurstActive() ? 0 : testRun ? 60 : static_cast<int>(std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz())));
         }
         if (m_debugUiInitCallback)
         {

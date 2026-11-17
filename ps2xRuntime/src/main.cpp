@@ -497,6 +497,17 @@ namespace
         ++g_raymanSteps;
         if (g_raymanDrawOnly)
             ++g_raymanDrawOnlySteps;
+        // PS2X_TEST_BURST="<first VSync>,<count>" (research, ps2_test_harness.cpp: every picture of those VSyncs to a
+        // file): which steps were logic steps, to pair the pictures with them.
+        static const std::pair<uint64_t, uint64_t> s_burst = []() {
+            const char *e = std::getenv("PS2X_TEST_BURST");
+            char *end = nullptr;
+            const uint64_t first = e ? std::strtoull(e, &end, 10) : 0ull;
+            const uint64_t count = (e && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+            return std::make_pair(first, first + count);
+        }();
+        if (vsync >= s_burst.first && vsync < s_burst.second)
+            std::fprintf(stderr, "[split] vsync %llu step %s\n", static_cast<unsigned long long>(vsync), g_raymanDrawOnly ? "draw-only" : "logic");
         // The HUD layer keeps the last logic frame's 2D during draw-only frames (some 2D is drawn only by the logic:
         // the box behind Murfy's text, parts of the HUD; gs_hud.h markFrame).
         static const bool s_hudMark = []() { // PS2X_RAYMAN_HUD_MARK=0: off (experiments)
@@ -711,7 +722,16 @@ namespace
         float m[16] = {};
     };
     RaymanView g_raymanViewPrev, g_raymanViewCur;
-    RaymanView g_raymanRwFramePrev, g_raymanRwFrameCur; // RenderWare's camera frame (below)
+    // RenderWare's camera frames (below), one entry per camera: 0x1174E0 runs twice per frame (from the step and from
+    // 0x1109E0), each time for another camera.
+    struct RaymanRwFrame
+    {
+        uint32_t address = 0u; // the frame's modelling matrix; 0 = free
+        bool hasPrev = false, hasCur = false;
+        float prev[16] = {}, cur[16] = {};
+    };
+    std::array<RaymanRwFrame, 4> g_raymanRwFrames;
+    uint32_t g_raymanRwFrameNextSlot = 0u;
     uint64_t g_raymanInterpFrames = 0u, g_raymanInterpObjects = 0u, g_raymanInterpJumps = 0u;
     PS2Runtime::RecompiledFunction g_raymanCameraUpdate = nullptr;
     PS2Runtime::RecompiledFunction g_raymanAfterDisplay = nullptr;
@@ -866,8 +886,7 @@ namespace
         g_raymanInterpCurIndex.clear();
         g_raymanViewPrev.address = 0u;
         g_raymanViewCur.address = 0u;
-        g_raymanRwFramePrev.address = 0u;
-        g_raymanRwFrameCur.address = 0u;
+        g_raymanRwFrames = {};
     }
 
     void raymanViewSnapshot(const uint8_t *rdram, RaymanView &out)
@@ -936,18 +955,35 @@ namespace
             if (raymanGuestPtr(frame))
             {
                 const uint32_t modelling = frame + 0x10u;
+                // Each camera keeps its own last two logic steps (one shared pair, overwritten by the second camera
+                // of the frame, never matched: the camera was not interpolated at all, 2026-11-17).
+                RaymanRwFrame *entry = nullptr;
+                for (RaymanRwFrame &f : g_raymanRwFrames)
+                    if (f.address == modelling)
+                        entry = &f;
+                if (!entry)
+                {
+                    entry = &g_raymanRwFrames[g_raymanRwFrameNextSlot];
+                    g_raymanRwFrameNextSlot = (g_raymanRwFrameNextSlot + 1u) % g_raymanRwFrames.size();
+                    *entry = RaymanRwFrame{};
+                    entry->address = modelling;
+                }
                 if (!g_raymanDrawOnly)
                 {
-                    g_raymanRwFramePrev = g_raymanRwFrameCur;
-                    g_raymanRwFrameCur.address = modelling;
-                    std::memcpy(g_raymanRwFrameCur.m, rdram + modelling, sizeof(g_raymanRwFrameCur.m));
+                    if (entry->hasCur)
+                    {
+                        std::memcpy(entry->prev, entry->cur, sizeof(entry->prev));
+                        entry->hasPrev = true;
+                    }
+                    std::memcpy(entry->cur, rdram + modelling, sizeof(entry->cur));
+                    entry->hasCur = true;
                 }
                 const uint64_t span = g_raymanInterpCurVsync - g_raymanInterpPrevVsync;
                 float m[16];
-                if (span > 0u && span < 64u && g_raymanRwFrameCur.address == modelling && g_raymanRwFramePrev.address == modelling)
+                if (span > 0u && span < 64u && entry->hasPrev)
                 {
                     const float t = std::min(1.0f, static_cast<float>(ps2xGuestVsync() - g_raymanInterpCurVsync) / static_cast<float>(span));
-                    if (raymanInterpMatrix(g_raymanRwFramePrev.m, g_raymanRwFrameCur.m, t, m))
+                    if (raymanInterpMatrix(entry->prev, entry->cur, t, m))
                         std::memcpy(rdram + modelling, m, sizeof(m));
                 }
             }

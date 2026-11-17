@@ -152,6 +152,29 @@ Flicker (things drawn only on logic frames):
 - Check: with no interpolation two pictures of the same step must be identical: `hub_split_off` (the user's hub
   recording, level change included): 0.00 (0.01 twice); `rayman_interp_off`: identical except the text box.
 
+## Moving objects flickered: the camera was not interpolated (issue 24, 2026-11-17)
+
+Tool: `PS2X_TEST_BURST="<first VSync>,<count>"` (ps2_test_harness.cpp) saves every picture the window fetches in that
+VSync range to `out/burst_<vsync>.bmp` (the window runs uncapped then; at 640 x 512 every VSync is caught, with SSAA x4
+some are missed or late), and main.cpp logs `[split] vsync N step logic|draw-only` for the same range. A picture shows
+the step of one VSync earlier (two with SSAA x4). Use `PS2X_HUD=1`, so the GS picture has no 2D (the logic draws it only
+on its own frames; in normal play the HUD layer holds it). Compare runs with and without `PS2X_RAYMAN_INTERP_PARTS`
+(0 = nothing interpolated: then every picture of a step is the logic picture).
+
+Found: Rayman walking in `rayman_interp`, the whole picture changed by ~14.5 (mean per channel) at each logic picture
+and by ~0.3 in between, as without interpolation: the camera stood still for 4-5 frames and jumped 25 times a second,
+while the objects, interpolated one step behind, moved smoothly. On the screen every moving object then slid back at
+each step and crept forward until the next: the user's "moving objects flicker". Cause: 0x1174E0 runs twice per frame
+(from the step and from 0x1109E0), and each time 0x18C450 is entered for another camera (frames 0xFD1110, the 3D view,
+and 0xFD11C0, a camera at the fixed offset). One shared "last two steps" pair was overwritten by the second camera, so
+the two steps never belonged to the same camera and nothing was interpolated (since 565e88f). Now each camera keeps
+its own pair. After the fix: ~4.5 on every picture, the background moves a little each frame and Rayman stays steady.
+Also checked:
+- Rayman's limbs are interpolated (an experiment that lifted every part by 2 units on the draw-only frames lifted them
+  in the picture; the per-object log `PS2X_RAYMAN_INTERP_LOG=<vsync>` shows them all as "blend").
+- Still at the logic rate, as on the console: particles (the sparkles around a lum: frozen for a step, then new ones)
+  and texture animation (water, waterfalls).
+
 ## Next steps
 
 1. More flicker checks (effects, other levels); the user's impression.
