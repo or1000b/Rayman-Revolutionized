@@ -46,3 +46,12 @@ __pycache__/
 /tools/realesrgan/
 /hud_dump/
 /hud_textures/
+
+# Disc images and the disc folder: never commit ROM files
+/Rayman Revolution*/
+*.iso
+*.ISO
+*.cso
+*.chd
+*.cue
+*.ecm
