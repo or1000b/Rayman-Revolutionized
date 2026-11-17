@@ -5,7 +5,8 @@
     run_tests.bat -NoBuild              skip the build
     run_tests.bat -Only choose_english  one scenario
     run_tests.bat -UpdateGolden         save this run's checkpoint pictures as the new golden pictures
-    run_tests.bat -NoKickHash           no PS2X_VU1_KICK_HASH (~10% of the game thread): for profiling; vu1_hash checks fail
+    run_tests.bat -NoKickHash           no PS2X_VU1_KICK_HASH (a byte-by-byte hash on the graphics thread: bridge_120
+                                        120 -> 74 FPS with it): for profiling and FPS; vu1_hash checks fail
     run_tests.bat -Record -Only <name>  play the scenario yourself (its memory card, env, deterministic, real pad, no
                                         frame budget); the pad goes to tests\fixtures\<name>.input, which the
                                         scenario replays from then on (VSync clock) instead of its "input"
@@ -184,9 +185,12 @@ function Invoke-GameRun($sc, $log, $shotDir) {
             $env:PS2X_WATCHDOG_SEC = '0'
         }
     }
-    # [vu1-hash] every 600 VSyncs: hash of every byte VU1 sent to the GS (check type vu1_hash).
+    # [vu1-hash] every 600 VSyncs: hash of every byte VU1 sent to the GS (check type vu1_hash). Not while recording
+    # (-Record): a recording has no checks (its replays hash), and the hash goes byte by byte on the graphics thread,
+    # which made the recorder far slower than normal play where that thread is busy (bridge_120: 74 FPS instead of
+    # 120, and a deterministic run cannot skip time, so the game itself ran at ~60% speed).
     $env:PS2X_VU1_KICK_HASH = '1'
-    if ($NoKickHash) { Remove-Item Env:PS2X_VU1_KICK_HASH -ErrorAction SilentlyContinue }
+    if ($NoKickHash -or $Record) { Remove-Item Env:PS2X_VU1_KICK_HASH -ErrorAction SilentlyContinue }
     if ($sc.PSObject.Properties['deterministic'] -and -not $sc.deterministic) { $env:PS2X_DETERMINISTIC = '0' }
     if ($sc.renderer -eq 'cpu') { $env:PS2X_GS_RENDERER = 'cpu' } else { Remove-Item Env:PS2X_GS_RENDERER -ErrorAction SilentlyContinue }
     # Every run gets an empty memory card of its own (<shot dir>\mc0): the user's saves in
