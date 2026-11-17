@@ -68,6 +68,10 @@ namespace ps2x::pgs
     // RGBA8 rows (alpha forced opaque). Returns false when nothing is displayed.
     bool scanout(const PrivRegs &regs, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
 
+    // The size the window shows the picture at (window thread, every frame). With the 4x scanout (PS2X_GS_SSAA=16)
+    // the GPU shrinks the picture to it before the readback, so less comes back and the window draws it 1:1.
+    void setPresentationTarget(uint32_t width, uint32_t height);
+
     // One line for the periodic log ("pgs: <gpu name> frames=N ...").
     std::string statsLine();
 

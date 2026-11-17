@@ -5,8 +5,10 @@ rem Picture quality:
 rem   1  = the PS2's own picture (640 x 512)
 rem   2  = smoother edges
 rem   4  = double resolution (1280 x 1024) and smooth edges
-rem   8, 16 = even smoother edges (needs a strong graphics card)
-set PS2X_GS_SSAA=4
+rem   8  = double resolution, even smoother edges
+rem   16 = real 1440p: four times the PS2's resolution (2560 x 2048), shrunk to your screen's size by the graphics
+rem        card (needs a strong graphics card; 120 FPS almost everywhere, ~113 at the busiest spot known)
+set PS2X_GS_SSAA=16
 
 rem Full screen at the monitor's resolution (720p, 1080p, 1440p...): 1 = yes, 0 = a window.
 rem F10 switches between full screen and a window while playing.

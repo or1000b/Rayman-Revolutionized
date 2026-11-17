@@ -29,6 +29,7 @@ namespace ps2x::pgs
 #include "thread_id.hpp"
 
 #include <algorithm>
+#include <emmintrin.h>
 #include <chrono>
 #include <cstdio>
 #include <cmath>
@@ -53,8 +54,22 @@ namespace ps2x::pgs
         // The GS thread is on (see "the GS thread" below): SIGNAL / FINISH / LABEL then reach the guest from the game
         // thread when it queues the write, never from paraLLEl-GS's callbacks or noteRegister on the worker.
         bool g_threaded = false;
-        // PS2X_GS_SSAA >= 4 (start()): VSyncInfo::high_resolution_scanout.
+        // PS2X_GS_SSAA >= 4 (start()): VSyncInfo::high_resolution_scanout; PS2X_GS_SSAA=16: ps2x_scanout_4x too.
         bool g_hiresScanout = false;
+        bool g_scanout4x = false;
+        // setPresentationTarget: the window's picture size, width << 16 | height (0 = unknown).
+        std::atomic<uint32_t> g_presentTarget{0u};
+
+        // PS2X_GS_SCALE_TO_WINDOW=0: read the 4x picture back whole (research: compare it with the 2x one).
+        bool scaleToWindowWanted()
+        {
+            static const bool wanted = []
+            {
+                const char *env = std::getenv("PS2X_GS_SCALE_TO_WINDOW");
+                return !(env && std::strcmp(env, "0") == 0);
+            }();
+            return wanted;
+        }
 
         bool deterministicMode()
         {
@@ -145,11 +160,29 @@ namespace ps2x::pgs
                 pending.device->map_host_buffer(*pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT));
             if (!pixels)
                 return false;
+            // Copy and make opaque in one pass, 16 bytes at a time (a 2560 x 2048 picture is 21 MB: a separate
+            // byte loop for the alpha cost ~4 ms a frame on the window thread, 2026-11-17).
             rgba.resize(size);
-            std::memcpy(rgba.data(), pixels, size);
+            uint8_t *out = rgba.data();
+            const __m128i opaque = _mm_set1_epi32(static_cast<int>(0xFF000000u));
+            size_t i = 0;
+            for (; i + 64u <= size; i += 64u)
+            {
+                const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pixels + i));
+                const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pixels + i + 16u));
+                const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pixels + i + 32u));
+                const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pixels + i + 48u));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + i), _mm_or_si128(a, opaque));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + i + 16u), _mm_or_si128(b, opaque));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + i + 32u), _mm_or_si128(c, opaque));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out + i + 48u), _mm_or_si128(d, opaque));
+            }
+            for (; i + 4u <= size; i += 4u)
+            {
+                std::memcpy(out + i, pixels + i, 3u);
+                out[i + 3] = 0xFFu;
+            }
             pending.device->unmap_host_buffer(*pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
-            for (size_t i = 3; i < rgba.size(); i += 4)
-                rgba[i] = 0xFFu;
             return true;
         }
 
@@ -1156,6 +1189,17 @@ namespace ps2x::pgs
         {
             if (w == 0u || h == 0u || rgba.size() < static_cast<size_t>(w) * h * 4u)
                 return;
+            // A 4x picture (2560 x 2048, 21 MB) is written at 1280 x 1024 (every other pixel): the dump runs on the
+            // window thread about every 5 s, and a full one stalled a frame.
+            if (w > 1280u && (w % 2u) == 0u && (h % 2u) == 0u)
+            {
+                std::vector<uint8_t> half(static_cast<size_t>(w / 2u) * (h / 2u) * 4u);
+                for (uint32_t y = 0; y < h / 2u; ++y)
+                    for (uint32_t x = 0; x < w / 2u; ++x)
+                        std::memcpy(&half[(static_cast<size_t>(y) * (w / 2u) + x) * 4u], &rgba[(static_cast<size_t>(y) * 2u * w + x * 2u) * 4u], 4u);
+                dumpFrameBmp(half, w / 2u, h / 2u, path);
+                return;
+            }
             FILE *f = std::fopen(path, "wb");
             if (!f)
                 return;
@@ -1325,6 +1369,7 @@ namespace ps2x::pgs
             info.adapt_to_internal_horizontal_resolution = false;
             // PS2X_GS_SSAA >= 4: scan out at twice the resolution from the super samples (see start()).
             info.high_resolution_scanout = g_hiresScanout;
+            info.ps2x_scanout_4x = g_scanout4x;
 
             if (watchBound("PS2X_PGS_BIGPRIM", 0u) != 0u && g_frameNumber >= coverFrom() &&
                 g_bigPrimLogs < watchBound("PS2X_PGS_BIGPRIM_MAX", 3000u))
@@ -1344,9 +1389,16 @@ namespace ps2x::pgs
                 return false;
 
             auto &device = *g_state->device;
-            const uint32_t w = result.image->get_width();
-            const uint32_t h = result.image->get_height();
-            const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4u;
+            uint32_t w = result.image->get_width();
+            uint32_t h = result.image->get_height();
+            // The 4x picture (2560 x 2048, 21 MB) is shrunk on the GPU to the size the window shows it at (2560 x 1440 on
+            // a 16:9 1440p screen): the readback, the copies and the upload on the window thread were too much for 120
+            // pictures a second (81 at 21 MB, 2026-11-17), and the window then draws it 1:1. Shrinking only.
+            const uint32_t target = g_presentTarget.load(std::memory_order_relaxed);
+            const uint32_t tw = target >> 16, th = target & 0xFFFFu;
+            const bool shrink = g_scanout4x && scaleToWindowWanted() && tw >= 64u && th >= 64u && tw <= w && th <= h &&
+                                (tw != w || th != h);
+            const VkDeviceSize size = static_cast<VkDeviceSize>(shrink ? tw : w) * (shrink ? th : h) * 4u;
             if (!g_state->readback || g_state->readbackSize < size)
             {
                 Vulkan::BufferCreateInfo info = {};
@@ -1360,8 +1412,30 @@ namespace ps2x::pgs
             auto cmd = device.request_command_buffer();
             cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
-                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-            cmd->copy_image_to_buffer(*g_state->readback, *result.image, 0, {}, {w, h, 1}, 0, 0,
+                               VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            const Vulkan::Image *readFrom = result.image.get();
+            Vulkan::ImageHandle shrunk;
+            if (shrink)
+            {
+                auto shrunkInfo = Vulkan::ImageCreateInfo::immutable_2d_image(tw, th, VK_FORMAT_R8G8B8A8_UNORM);
+                shrunkInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                shrunkInfo.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                shrunk = device.create_image(shrunkInfo);
+                if (shrunk)
+                {
+                    cmd->image_barrier(*shrunk, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                    cmd->blit_image(*shrunk, *result.image, {0, 0, 0}, {int32_t(tw), int32_t(th), 1}, {0, 0, 0},
+                                    {int32_t(w), int32_t(h), 1}, 0, 0, 0, 0, 1, VK_FILTER_LINEAR);
+                    cmd->image_barrier(*shrunk, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                    readFrom = shrunk.get();
+                    w = tw;
+                    h = th;
+                }
+            }
+            cmd->copy_image_to_buffer(*g_state->readback, *readFrom, 0, {}, {w, h, 1}, 0, 0,
                                       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
             cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
@@ -1744,9 +1818,10 @@ namespace ps2x::pgs
         ParallelGS::GSOptions options = {};
         // PS2X_GS_SSAA=1/2/4/8/16 (default 1): samples per pixel (super-sampling anti-aliasing). From 4 on, the picture
         // is also scanned out at twice the width and height (high-resolution scanout, 1280 x 1024 for PAL), unless
-        // PS2X_GS_HIRES=0. PS2X_GS_SSAA_TEXTURES=1: also super-sample render targets used as textures (paraLLEl-GS
-        // super_sampled_textures; helps effects that draw into a texture first). Only the picture changes: what the
-        // game sees (signals, transfers) does not.
+        // PS2X_GS_HIRES=0; with 16 at four times (2560 x 2048, every sample a pixel: PatchParallelGs.cmake scanout-4x,
+        // real 1440p), unless PS2X_GS_HIRES=2 (2x, the 16 samples averaged as before). PS2X_GS_SSAA_TEXTURES=1: also
+        // super-sample render targets used as textures (paraLLEl-GS super_sampled_textures; helps effects that draw
+        // into a texture first). Only the picture changes: what the game sees (signals, transfers) does not.
         const uint32_t ssaa = watchBound("PS2X_GS_SSAA", 1u);
         options.super_sampling = ssaa >= 16u ? ParallelGS::SuperSampling::X16
                                  : ssaa >= 8u ? ParallelGS::SuperSampling::X8
@@ -1754,9 +1829,12 @@ namespace ps2x::pgs
                                  : ssaa >= 2u ? ParallelGS::SuperSampling::X2
                                               : ParallelGS::SuperSampling::X1;
         options.super_sampled_textures = watchBound("PS2X_GS_SSAA_TEXTURES", 0u) != 0u;
-        g_hiresScanout = ssaa >= 4u && watchBound("PS2X_GS_HIRES", 1u) != 0u;
+        const uint32_t hires = watchBound("PS2X_GS_HIRES", 1u);
+        g_hiresScanout = ssaa >= 4u && hires != 0u;
+        g_scanout4x = g_hiresScanout && ssaa >= 16u && hires != 2u;
         std::fprintf(stderr, "[pgs] super-sampling x%u%s%s\n", static_cast<unsigned>(options.super_sampling),
-                     g_hiresScanout ? ", high-resolution scanout" : "", options.super_sampled_textures ? ", super-sampled textures" : "");
+                     g_scanout4x ? ", high-resolution scanout x4" : g_hiresScanout ? ", high-resolution scanout x2" : "",
+                     options.super_sampled_textures ? ", super-sampled textures" : "");
         if (!state->gs->init(state->device.get(), options))
         {
             error = "paraLLEl-GS init failed on " + state->gpuName;
@@ -1976,6 +2054,12 @@ namespace ps2x::pgs
         return true;
     }
 
+    void setPresentationTarget(uint32_t width, uint32_t height)
+    {
+        const uint32_t packed = (width <= 0xFFFFu && height <= 0xFFFFu) ? (width << 16 | height) : 0u;
+        g_presentTarget.store(packed, std::memory_order_relaxed);
+    }
+
     std::string statsLine()
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
@@ -2052,6 +2136,7 @@ namespace ps2x::pgs
         return false;
     }
     std::string statsLine() { return {}; }
+    void setPresentationTarget(uint32_t, uint32_t) {}
     void requestCapture() {}
 }
 

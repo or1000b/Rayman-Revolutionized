@@ -1058,7 +1058,7 @@
     },
     {
       "name": "autosave_load",
-      "description": "Load an auto-save: a card that holds only the slot BESLES-50044jjjjjjjjj written by the auto-save (tests/fixtures/mc_auto/mc0, local, copied from an autosave_write run). MAIN MENU -> 600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10 -> the first slot -> YES must read it and start the level.",
+      "description": "Load an auto-save: a card that holds only the slot BESLES-50044jjjjjjjjj written by the auto-save (tests/fixtures/mc_auto/mc0, local, copied from an autosave_write run). MAIN MENU -> LOAD -> the first slot -> YES must read it and start the level.",
       "renderer": "gpu",
       "memcard": "fixtures\\mc_auto\\mc0",
       "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
@@ -1069,6 +1069,30 @@
         { "type": "log_present", "pattern": "GetDir port=0 'BESLES-50044jjjjjjjjj/BESLES-50044jjjjjjjjj'", "label": "the auto-save's progress file is read" },
         { "type": "log_present", "pattern": "Sync cmd=5 result=40316", "label": "all 40316 bytes read" },
         { "type": "shot", "tick": 5000, "min_variance": 300, "label": "a level shows after loading the auto-save" }
+      ]
+    },
+    {
+      "name": "glade_1440",
+      "description": "Real 1440p (PS2X_GS_SSAA=16: the 4x scanout, PatchParallelGs.cmake scanout-4x): glade_120_hd at the user's settings (a 2560 x 1440 window, 16:9) with 16 samples per pixel, scanned out at 2560 x 2048 (every sample a pixel) and shrunk on the GPU to the window's 2560 x 1440. Target: a steady 120. Checks of the 4x picture itself: PS2X_GS_SCALE_TO_WINDOW=0 reads it back whole, PS2X_GS_HIRES=2 gives the old 2x picture of the same samples (each pixel the average of 4): the 4x picture shrunk by 2 must equal it (0.23 on 2026-11-17).",
+      "renderer": "gpu",
+      "memcard": "fixtures\\mc_glade\\mc0",
+      "input": "600:start:10,1300:cross:10,2350:down:10,2450:cross:10,2650:cross:10,2750:left:10,2850:cross:10",
+      "frames": 9000,
+      "shots": [6000],
+      "env": {
+        "PS2X_FRAMERATE": "120",
+        "PS2X_GS_SSAA": "16",
+        "PS2X_WIDESCREEN": "16:9",
+        "PS2X_GFX_THREAD": "1",
+        "PS2X_HUD": "1",
+        "PS2X_WINDOW": "2560x1440"
+      },
+      "checks": [
+        { "type": "exit_code", "expect": 0, "label": "run ends by frame budget (no hang, no crash)" },
+        { "type": "log_present", "pattern": "\\[pgs\\] super-sampling x16, high-resolution scanout x4", "label": "16 samples, 4x scanout" },
+        { "type": "log_present", "pattern": "\\[test\\] shot tick=6000 .* size=2560x1440", "label": "the picture reaches the window at 2560 x 1440 (4x, shrunk on the GPU)" },
+        { "type": "shot", "tick": 6000, "min_variance": 300, "label": "the Fairy Glade shows" },
+        { "type": "fps", "after_tick": 4500, "min": 110, "label": "the Fairy Glade at 120 FPS with the 4x scanout (average game FPS)" }
       ]
     }
   ]

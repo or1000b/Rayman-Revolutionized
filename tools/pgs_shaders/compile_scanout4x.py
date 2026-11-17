@@ -1,0 +1,105 @@
+"""Compile ps2xRuntime/src/lib/gs/pgs/shaders/sample_circuit_4x.frag to SPIR-V (both variants, PROMOTED 0 / 1) and write
+sample_circuit_4x_spirv.h next to it, which PatchParallelGs.cmake hands to paraLLEl-GS (the 4x scanout,
+PS2X_GS_SSAA=16). paraLLEl-GS ships its shaders precompiled, and no GLSL compiler comes with this repository, so this
+uses the shaderc library through ctypes (any shaderc_shared.dll; PCSX2 ships one). Only needed when the shader changes:
+the generated header is committed.
+
+Usage: python tools/pgs_shaders/compile_scanout4x.py [--shaderc PATH] [--deps out/game/_deps]
+"""
+import argparse
+import ctypes
+import os
+import re
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+SHADER = os.path.join(ROOT, 'ps2xRuntime', 'src', 'lib', 'gs', 'pgs', 'shaders', 'sample_circuit_4x.frag')
+OUTPUT = os.path.join(os.path.dirname(SHADER), 'sample_circuit_4x_spirv.h')
+
+
+def inline_includes(path, search, seen):
+    out = []
+    for line in open(path, encoding='utf-8').read().splitlines():
+        m = re.match(r'\s*#include\s+"([^"]+)"', line)
+        if not m:
+            out.append(line)
+            continue
+        name = m.group(1)
+        for d in [os.path.dirname(path)] + search:
+            candidate = os.path.join(d, name)
+            if os.path.exists(candidate):
+                break
+        else:
+            sys.exit(f'include {name} not found (from {path})')
+        candidate = os.path.normpath(candidate)
+        if candidate not in seen:  # the headers have include guards; inline each once
+            seen.add(candidate)
+            out.append(inline_includes(candidate, search, seen))
+    return '\n'.join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--shaderc', default=r'D:\PCSX2\shaderc_shared.dll')
+    ap.add_argument('--deps', default=os.path.join(ROOT, 'out', 'game', '_deps'))
+    args = ap.parse_args()
+    search = [os.path.join(args.deps, 'ps2x_parallel_gs-src', 'gs', 'shaders'),
+              os.path.join(args.deps, 'ps2x_granite-src', 'assets', 'shaders', 'inc')]
+
+    sc = ctypes.CDLL(args.shaderc)
+    sc.shaderc_compiler_initialize.restype = ctypes.c_void_p
+    sc.shaderc_compile_options_initialize.restype = ctypes.c_void_p
+    sc.shaderc_compile_options_add_macro_definition.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+                                                                ctypes.c_char_p, ctypes.c_size_t]
+    sc.shaderc_compile_options_set_target_env.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32]
+    sc.shaderc_compile_options_set_target_spirv.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    sc.shaderc_compile_options_set_optimization_level.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    sc.shaderc_compile_options_release.argtypes = [ctypes.c_void_p]
+    sc.shaderc_compile_into_spv.restype = ctypes.c_void_p
+    sc.shaderc_compile_into_spv.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int,
+                                            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
+    sc.shaderc_result_get_compilation_status.argtypes = [ctypes.c_void_p]
+    sc.shaderc_result_get_length.restype = ctypes.c_size_t
+    sc.shaderc_result_get_length.argtypes = [ctypes.c_void_p]
+    sc.shaderc_result_get_bytes.restype = ctypes.c_void_p
+    sc.shaderc_result_get_bytes.argtypes = [ctypes.c_void_p]
+    sc.shaderc_result_get_error_message.restype = ctypes.c_char_p
+    sc.shaderc_result_get_error_message.argtypes = [ctypes.c_void_p]
+    sc.shaderc_result_release.argtypes = [ctypes.c_void_p]
+
+    source = inline_includes(SHADER, search, set()).encode('utf-8')
+    compiler = sc.shaderc_compiler_initialize()
+    arrays = []
+    for promoted in (0, 1):
+        opts = sc.shaderc_compile_options_initialize()
+        value = str(promoted).encode()
+        sc.shaderc_compile_options_add_macro_definition(opts, b'PROMOTED', 8, value, len(value))
+        sc.shaderc_compile_options_set_target_env(opts, 0, (1 << 22) | (1 << 12))  # Vulkan 1.1
+        sc.shaderc_compile_options_set_target_spirv(opts, 0x10300)                  # SPIR-V 1.3, like paraLLEl-GS's
+        sc.shaderc_compile_options_set_optimization_level(opts, 2)                  # performance
+        result = sc.shaderc_compile_into_spv(compiler, source, len(source), 1, b'sample_circuit_4x.frag', b'main', opts)
+        if sc.shaderc_result_get_compilation_status(result) != 0:
+            sys.exit('compile failed (PROMOTED=%d):\n%s' % (promoted, sc.shaderc_result_get_error_message(result).decode()))
+        n = sc.shaderc_result_get_length(result)
+        data = ctypes.string_at(sc.shaderc_result_get_bytes(result), n)
+        sc.shaderc_result_release(result)
+        sc.shaderc_compile_options_release(opts)
+        words = [int.from_bytes(data[i:i + 4], 'little') for i in range(0, n, 4)]
+        arrays.append(words)
+        print(f'PROMOTED={promoted}: {n} bytes of SPIR-V')
+
+    lines = ['// Generated by tools/pgs_shaders/compile_scanout4x.py from sample_circuit_4x.frag: do not edit.',
+             '// The 4x scanout shader (PS2X_GS_SSAA=16) for paraLLEl-GS, both variants (PROMOTED 0 / 1).',
+             '#pragma once', '#include <stdint.h>', '']
+    for i, words in enumerate(arrays):
+        lines.append(f'static const uint32_t ps2x_sample_circuit_4x_spirv{i}[{len(words)}] = {{')
+        for j in range(0, len(words), 8):
+            lines.append('\t' + ', '.join(f'0x{w:08x}u' for w in words[j:j + 8]) + ',')
+        lines.append('};')
+        lines.append('')
+    open(OUTPUT, 'w', newline='\n').write('\n'.join(lines))
+    print('wrote', OUTPUT)
+
+
+if __name__ == '__main__':
+    main()

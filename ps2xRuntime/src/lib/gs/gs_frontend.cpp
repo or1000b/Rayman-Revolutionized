@@ -633,7 +633,10 @@ void GS::latchHostPresentationFrame()
         {
             // The scanout as it is (any size: 640 x 512 for PAL, 1280 x 1024 with PS2X_GS_SSAA >= 4), rows packed at
             // its own width (copyLatchedHostPresentationFrame; the CPU renderer's frames keep a 640-pixel stride).
-            m_hostPresentationFrame.assign(s_scanout.begin(), s_scanout.begin() + static_cast<size_t>(w) * h * 4u);
+            // Handed over, not copied (a 4x picture is 21 MB): s_scanout gets the old buffer, which the next scanout
+            // fills again.
+            s_scanout.resize(static_cast<size_t>(w) * h * 4u);
+            m_hostPresentationFrame.swap(s_scanout);
             m_hostPresentationWidth = w;
             m_hostPresentationHeight = h;
             m_hostPresentationDisplayFbp = static_cast<uint32_t>(regs.dispfb2 & 0x1FFu);
@@ -730,6 +733,11 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     {
         // GPU renderer frames are packed at their own width; the CPU renderer's keep a 640-pixel stride.
         const size_t sourceRowBytes = static_cast<size_t>(g_pgs ? outWidth : kHostFrameWidth) * 4u;
+        if (sourceRowBytes == packedRowBytes && m_hostPresentationFrame.size() >= outPixels.size())
+        {
+            std::memcpy(outPixels.data(), m_hostPresentationFrame.data(), outPixels.size()); // one block, not row by row
+            return true;
+        }
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;

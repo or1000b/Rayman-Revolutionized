@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -3469,6 +3470,9 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        // The next pictures can come at this size (the 4x scanout is shrunk to it on the GPU: gs_pgs_bridge.h).
+        if (ps2x::pgs::active())
+            ps2x::pgs::setPresentationTarget(static_cast<uint32_t>(std::lround(dstWidth)), static_cast<uint32_t>(std::lround(dstHeight)));
         drawHudOverlay(dstRect);
         windowShotIfDue();
         static const bool showFps = []
