@@ -2129,7 +2129,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     }
 
     BranchTraceEntry &trace = t_branchTrace[t_branchTracePos++ % 64u];
-    trace = BranchTraceEntry{targetPc, sourcePc, getRegU32(ctx, 5), 0u, 0u, static_cast<int>(kind), '?'};
+    // Field by field: assigning a BranchTraceEntry{...} temporary built it on the stack with narrow stores and copied
+    // it with a 16-byte load, a store-forwarding stall on every guest call (~4% of the game thread, 2026-11-17).
+    trace.target = targetPc;
+    trace.source = sourcePc;
+    trace.a1Before = getRegU32(ctx, 5);
+    trace.pcAfter = 0u;
+    trace.v0After = 0u;
+    trace.kind = static_cast<int>(kind);
+    trace.outcome = '?';
     struct BranchTraceClose
     {
         BranchTraceEntry &entry;
@@ -2220,9 +2228,18 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         requestStop();
         return false;
     }
-    t_guestCallFrames[t_guestCallDepth] = GuestCallFrame{targetPc, sourcePc, getRegU32(ctx, 4), getRegU32(ctx, 5),
-                                                         getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 29),
-                                                         getRegU32(ctx, 31)};
+    {
+        // Field by field, like the trace entry above (no temporary copied with wide loads).
+        GuestCallFrame &frame = t_guestCallFrames[t_guestCallDepth];
+        frame.target = targetPc;
+        frame.source = sourcePc;
+        frame.a0 = getRegU32(ctx, 4);
+        frame.a1 = getRegU32(ctx, 5);
+        frame.a2 = getRegU32(ctx, 6);
+        frame.a3 = getRegU32(ctx, 7);
+        frame.sp = getRegU32(ctx, 29);
+        frame.ra = getRegU32(ctx, 31);
+    }
     // A destructor, because guest thread switches unwind the host stack with an exception (ee_scheduler.h).
     struct DepthScope
     {
