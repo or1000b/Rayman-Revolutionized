@@ -475,7 +475,9 @@ namespace
 
     void raymanInterpRestore(uint8_t *rdram); // PS2X_RAYMAN_INTERP, below
     void raymanInterpForget();                 // PS2X_RAYMAN_INTERP, below
+    void raymanInterpShadowsBack(uint8_t *rdram); // PS2X_RAYMAN_INTERP, below: the shadows' draw list as the game made it
     bool g_raymanRequestsValid = false; // the AI's draw requests kept for the draw-only frames (0x147C30, below)
+    uint64_t g_raymanShadowsMoved = 0u, g_raymanShadowsLeft = 0u;
     uint64_t g_raymanLastStepVsync = 0u;
 
     void raymanGameStepSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -492,6 +494,7 @@ namespace
             g_raymanNextStepLogic = true;
         }
         g_raymanDrawOnly = !g_raymanNextStepLogic && !raymanDemoPlayback(rdram, getRegU32(ctx, 28));
+        raymanInterpShadowsBack(rdram); // the shadows' draw list as 0x147C30 made it
         if (!g_raymanDrawOnly)
         {
             ++g_raymanLogicSteps;
@@ -702,6 +705,9 @@ namespace
     {
         uint64_t key = 0u;
         uint32_t node = 0u, matrix = 0u;
+        uint32_t type = 0u, data = 0u, parent = 0u, perso = 0u; // perso: the nearest type-2 node (itself for a perso)
+        uint32_t depth = 0u, occurrence = 0u;
+        uint64_t parentKey = 0u;
         float m[16] = {};
     };
     bool g_raymanInterp = false;
@@ -712,9 +718,11 @@ namespace
     bool g_raymanInterpNeedCapture = false; // the last logic step's final matrices are still to be taken
     std::vector<RaymanNodeMatrix> g_raymanInterpNow; // the logic step's objects, on its own frame
     std::unordered_map<uint64_t, uint32_t> g_raymanInterpCurIndex;
+    std::vector<int32_t> g_raymanInterpCurPair, g_raymanInterpNowPair; // Cur -> Prev, Now -> Cur (-1: none)
     struct RaymanInterpWrite
     {
-        uint32_t matrix = 0u;
+        uint32_t node = 0u, matrix = 0u;
+        bool lazy = false; // an object finished early (below): raymanLazyRestore puts it back
         float written[16] = {};
         float truth[16] = {};
     };
@@ -788,9 +796,10 @@ namespace
             uint32_t node;
             uint64_t key;
             uint32_t depth;
+            uint32_t perso;
         };
         std::vector<Item> stack;
-        stack.push_back({root, 0x9E3779B97F4A7C15ull, 0u});
+        stack.push_back({root, 0x9E3779B97F4A7C15ull, 0u, 0u});
         while (!stack.empty() && out.size() < 4096u)
         {
             const Item parent = stack.back();
@@ -813,20 +822,116 @@ namespace
                                                 : (parent.key * 0x100000001B3ull) ^ (static_cast<uint64_t>(occurrence) << 40) ^
                                                       (static_cast<uint64_t>(type) << 32) ^ data;
                 const uint32_t matrix = raymanRam32(rdram, child + 0x24u);
+                const uint32_t perso = type == 2u ? child : parent.perso;
                 if ((type == 2u || type == 8u) && raymanGuestPtr(matrix)) // persos and their parts only
                 {
                     RaymanNodeMatrix entry;
                     entry.key = key;
                     entry.node = child;
                     entry.matrix = matrix;
+                    entry.type = type;
+                    entry.data = data;
+                    entry.parent = parent.node;
+                    entry.perso = perso;
+                    entry.depth = parent.depth + 1u;
+                    entry.occurrence = occurrence;
+                    entry.parentKey = parent.key;
                     std::memcpy(entry.m, rdram + matrix, sizeof(entry.m));
                     out.push_back(entry);
                 }
                 if (parent.depth < 8u)
-                    stack.push_back({child, key, parent.depth + 1u});
+                    stack.push_back({child, key, parent.depth + 1u, perso});
                 child = raymanRam32(rdram, child + 0x14u);
             }
         }
+    }
+
+    // Pairs each object of `now` with one of `before` (pair[i] = its index there, -1 = none). By key first; the key of a
+    // part holds its geometry and its parents' (a hand or a foot gets another shape every few steps with the animation,
+    // and every part under it then gets another key too), so for the parts left (rayman_interp, Rayman walking: one or
+    // two of his parts on most pictures, drawn at the newest step while the body was still on its way there: the user's
+    // "most noticeable with Rayman"), with a part of the same perso that has no pair by key, the nearest (relative to the
+    // perso): first one with the same geometry within 0.5 units (the same part under a parent that changed: measured
+    // nearly all within 0.05), else one in the same place of the skeleton (same parent and depth) within 1 unit: the
+    // same bone in another shape (a foot every step or two while Rayman walks; the blend moved it up over the step,
+    // without it the foot stood still and jumped at each logic step: compared on burst pictures). A part of another
+    // shape under another parent is another part (measured 0.4 - 1 units away); such a part, and one with no pair at
+    // all, goes along with its perso (raymanInterpAttach).
+    void raymanInterpPair(const std::vector<RaymanNodeMatrix> &now, const std::vector<RaymanNodeMatrix> &before,
+                          const std::unordered_map<uint64_t, uint32_t> &beforeIndex, std::vector<int32_t> &pair)
+    {
+        pair.assign(now.size(), -1);
+        std::vector<uint8_t> used(before.size(), 0u);
+        std::vector<uint32_t> loose;
+        for (uint32_t i = 0; i < now.size(); ++i)
+        {
+            const auto it = beforeIndex.find(now[i].key);
+            if (it != beforeIndex.end() && !used[it->second])
+            {
+                pair[i] = static_cast<int32_t>(it->second);
+                used[it->second] = 1u;
+            }
+            else if (now[i].type == 8u)
+                loose.push_back(i);
+        }
+        static const bool s_fallback = []() { // PS2X_RAYMAN_INTERP_PAIR=0: by key only (research)
+            const char *e = std::getenv("PS2X_RAYMAN_INTERP_PAIR");
+            return !(e && std::strcmp(e, "0") == 0);
+        }();
+        if (loose.empty() || !s_fallback)
+            return;
+        // Each perso's translation in both lists (persos are paired by address).
+        std::unordered_map<uint32_t, const float *> persoNow, persoBefore;
+        for (const RaymanNodeMatrix &e : now)
+            if (e.type == 2u)
+                persoNow.emplace(e.node, e.m);
+        for (const RaymanNodeMatrix &e : before)
+            if (e.type == 2u)
+                persoBefore.emplace(e.node, e.m);
+        static const bool s_log = std::getenv("PS2X_RAYMAN_INTERP_PAIRLOG") != nullptr; // research
+        for (int pass = 0; pass < 2; ++pass)
+            for (const uint32_t i : loose)
+            {
+                if (pair[i] >= 0)
+                    continue;
+                const RaymanNodeMatrix &a = now[i];
+                const auto pa = persoNow.find(a.perso), pb = persoBefore.find(a.perso);
+                if (pa == persoNow.end() || pb == persoBefore.end())
+                    continue;
+                int32_t best = -1;
+                static const float s_swap = []() { // PS2X_RAYMAN_INTERP_SWAP=<units>: the "same parent" limit (research)
+                    const char *e = std::getenv("PS2X_RAYMAN_INTERP_SWAP");
+                    return e ? static_cast<float>(std::atof(e)) : 1.0f;
+                }();
+                float bestDistance = pass == 0 ? 0.5f * 0.5f : s_swap * s_swap; // squared
+                for (uint32_t j = 0; j < before.size(); ++j)
+                {
+                    const RaymanNodeMatrix &b = before[j];
+                    if (used[j] || b.type != 8u || b.perso != a.perso)
+                        continue;
+                    if (pass == 0 ? b.data != a.data : (b.parentKey != a.parentKey || b.depth != a.depth))
+                        continue;
+                    float d = 0.0f;
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        const float delta = (a.m[12 + c] - pa->second[12 + c]) - (b.m[12 + c] - pb->second[12 + c]);
+                        d += delta * delta;
+                    }
+                    if (d < bestDistance)
+                    {
+                        bestDistance = d;
+                        best = static_cast<int32_t>(j);
+                    }
+                }
+                if (best < 0)
+                    continue;
+                pair[i] = best;
+                used[best] = 1u;
+                if (s_log)
+                    std::fprintf(stderr, "[interp-pair] vsync %llu perso %x depth %u data %x <- %x distance %.3f (%s)\n",
+                                 static_cast<unsigned long long>(ps2xGuestVsync()), a.perso, a.depth, a.data, before[best].data,
+                                 std::sqrt(bestDistance), pass == 0 ? "same shape" : "same parent");
+            }
     }
 
     // Rows 0-2 hold the rotation (with scale), row 3 the translation.
@@ -882,28 +987,246 @@ namespace
         return true;
     }
 
+    // Objects whose global matrix the game finishes only while the frame draws (2026-11-18). A superobject's global
+    // matrix is stale when its stamp at +0x28 differs from the step counter gp-0x7120 (and is not -1); the counter moves
+    // once per logic step (0x14AC40). The drawing finishes a stale object when it walks the scene (0x14ACB8: global =
+    // local (+0x20) x the parent's matrix on the drawing's matrix stack 0x355448) or from 0x147E60 (0x14AF88: it and
+    // everything under it, from the parents' globals). So on a logic frame such objects were computed again after their
+    // in-between matrices were written: they showed the newest step on every logic frame and went back on the next (the
+    // user's "energy ball" and characters standing by: 13-16 matrices per logic frame in rayman_interp, a character
+    // beside Rayman and its parts and another one; the energy ball in shoot_split jumped ~14 pixels forward and ~9 back).
+    // Now, on a logic frame, 0x14AF88 first runs for the dynamic world like a guest call (returning to an unused word):
+    // every stale object's final matrix, from the game's own code (PS2X_RAYMAN_INTERP_LAZY=2 compares them with what the
+    // drawing computes itself: 90114 of 90114 identical in rayman_interp). Each such object then gets the counter as its
+    // stamp (so the drawing keeps what is written there) and either an in-between matrix or its final one. When the true
+    // matrices go back (0x141D20), each gets what the game would have had there: the final matrix and the counter if the
+    // drawing asked for it (0x14ACB8 or 0x14AF88 entered for it or a parent), else its old matrix and stamp.
+    // PS2X_RAYMAN_INTERP_LAZY=0: off (as before).
+    constexpr uint32_t kRaymanLazyMatrixAddr = 0x0014AF88u;
+    constexpr uint32_t kRaymanLazyChildrenAddr = 0x0014AF20u; // (superobject): its children's global matrices, always
+    constexpr uint32_t kRaymanLazyOneAddr = 0x0014ACB8u; // (superobject): its global matrix where stale, from the drawing's matrix stack
+    constexpr uint32_t kRaymanLazyReturnAddr = 0x0014AF84u;   // padding after 0x14AF20 (never executed)
+    constexpr uint32_t kRaymanMatrixBytes = 0x54u;            // 4x4 floats, 4 more, the matrix kind at +0x50
+    struct RaymanLazyNode
+    {
+        uint32_t node = 0u, matrix = 0u, stampBefore = 0u, stampAfter = 0u;
+        bool touched = false;
+        uint8_t before[kRaymanMatrixBytes] = {}, after[kRaymanMatrixBytes] = {};
+        uint8_t left[kRaymanMatrixBytes] = {}; // what the in-between pictures left there for the drawing
+    };
+    enum class RaymanLazyState
+    {
+        Idle,
+        Running, // 0x14AF88 runs for the dynamic world
+        Ready,   // this logic frame's final matrices are known
+    };
+    RaymanLazyState g_raymanLazyState = RaymanLazyState::Idle;
+    std::vector<RaymanLazyNode> g_raymanLazy;
+    std::unordered_map<uint32_t, uint32_t> g_raymanLazyIndex; // node -> index in g_raymanLazy
+    struct RaymanGuestRegs
+    {
+        __m128i r[32];
+        uint64_t hi = 0u, lo = 0u, hi1 = 0u, lo1 = 0u;
+        uint32_t sa = 0u, fcr31 = 0u;
+        float f[32] = {};
+        float facc = 0.0f;
+    };
+    RaymanGuestRegs g_raymanLazyRegs;
+    bool g_raymanLazyReentry = false; // 0x1174E0 is entered again after the early 0x14AF88
+    uint64_t g_raymanLazyFrames = 0u, g_raymanLazyCount = 0u, g_raymanLazyChanged = 0u, g_raymanLazySkipped = 0u;
+    uint64_t g_raymanLazyChecked = 0u, g_raymanLazyMismatch = 0u, g_raymanLazyChildrenCalls = 0u;
+    PS2Runtime::RecompiledFunction g_raymanLazyMatrix = nullptr, g_raymanLazyChildren = nullptr, g_raymanLazyOne = nullptr;
+
+    int raymanInterpLazyMode()
+    {
+        static const int mode = []() {
+            const char *e = std::getenv("PS2X_RAYMAN_INTERP_LAZY");
+            return e ? std::atoi(e) : 1;
+        }();
+        return mode;
+    }
+
+    void raymanSaveGuestRegs(const R5900Context *ctx, RaymanGuestRegs &s)
+    {
+        std::memcpy(s.r, ctx->r, sizeof(s.r));
+        s.hi = ctx->hi;
+        s.lo = ctx->lo;
+        s.hi1 = ctx->hi1;
+        s.lo1 = ctx->lo1;
+        s.sa = ctx->sa;
+        std::memcpy(s.f, ctx->f, sizeof(s.f));
+        s.facc = ctx->f_acc;
+        s.fcr31 = ctx->fcr31;
+    }
+
+    void raymanLoadGuestRegs(R5900Context *ctx, const RaymanGuestRegs &s)
+    {
+        std::memcpy(ctx->r, s.r, sizeof(s.r));
+        ctx->hi = s.hi;
+        ctx->lo = s.lo;
+        ctx->hi1 = s.hi1;
+        ctx->lo1 = s.lo1;
+        ctx->sa = s.sa;
+        std::memcpy(ctx->f, s.f, sizeof(s.f));
+        ctx->f_acc = s.facc;
+        ctx->fcr31 = s.fcr31;
+    }
+
+    // Every superobject under `top` (itself included), as 0x14AF88 walks them (first child +8, next +0x14).
+    template <typename F>
+    bool raymanForSubtree(const uint8_t *rdram, uint32_t top, F &&visit)
+    {
+        std::vector<uint32_t> stack;
+        stack.push_back(top);
+        uint32_t visited = 0u;
+        while (!stack.empty())
+        {
+            const uint32_t node = stack.back();
+            stack.pop_back();
+            if (++visited > 8192u)
+                return false;
+            visit(node);
+            for (uint32_t child = raymanRam32(rdram, node + 0x8u), n = 0u; raymanGuestPtr(child) && n < 4096u;
+                 child = raymanRam32(rdram, child + 0x14u), ++n)
+                stack.push_back(child);
+        }
+        return true;
+    }
+
+    // The true matrices back where the drawing is done: an object finished early gets what the game would have had.
+    void raymanLazyRestore(uint8_t *rdram)
+    {
+        if (g_raymanLazyState != RaymanLazyState::Ready)
+            return;
+        for (const RaymanLazyNode &l : g_raymanLazy)
+        {
+            if (raymanInterpLazyMode() == 2) // research: the drawing computed it itself; is the early value the same?
+            {
+                if (l.touched)
+                {
+                    ++g_raymanLazyChecked;
+                    if (std::memcmp(rdram + l.matrix, l.after, kRaymanMatrixBytes) != 0)
+                        ++g_raymanLazyMismatch;
+                }
+                continue;
+            }
+            if (std::memcmp(rdram + l.matrix, l.left, kRaymanMatrixBytes) != 0)
+            {
+                ++g_raymanLazyChanged; // the game wrote it meanwhile: keep the game's
+                continue;
+            }
+            const uint8_t *from = l.touched ? l.after : l.before;
+            std::memcpy(rdram + l.matrix, from, kRaymanMatrixBytes);
+            std::memcpy(rdram + l.node + 0x28u, l.touched ? &l.stampAfter : &l.stampBefore, 4u);
+        }
+        g_raymanLazy.clear();
+        g_raymanLazyIndex.clear();
+        g_raymanLazyState = RaymanLazyState::Idle;
+    }
+
+    // A perso's move in this picture as one matrix (row vectors, translation in row 3): from its true matrix a to the
+    // one drawn b, d = inverse(a) x b. A part with no in-between matrix of its own (new this step, or another shape and
+    // place after an animation change; or turned by 90 degrees or more) is drawn as part x d: its own pose, carried
+    // along with its perso's in-between place instead of standing at the newest step ahead of the body.
+    bool raymanPersoDelta(const float *a, const float *b, float *d)
+    {
+        const float c00 = a[5] * a[10] - a[6] * a[9], c01 = a[6] * a[8] - a[4] * a[10], c02 = a[4] * a[9] - a[5] * a[8];
+        const float det = a[0] * c00 + a[1] * c01 + a[2] * c02;
+        if (std::fabs(det) < 1e-9f)
+            return false;
+        const float k = 1.0f / det;
+        const float inv[3][3] = {
+            {c00 * k, (a[2] * a[9] - a[1] * a[10]) * k, (a[1] * a[6] - a[2] * a[5]) * k},
+            {c01 * k, (a[0] * a[10] - a[2] * a[8]) * k, (a[2] * a[4] - a[0] * a[6]) * k},
+            {c02 * k, (a[1] * a[8] - a[0] * a[9]) * k, (a[0] * a[5] - a[1] * a[4]) * k},
+        };
+        std::memset(d, 0, 16 * sizeof(float));
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                d[i * 4 + j] = inv[i][0] * b[0 * 4 + j] + inv[i][1] * b[1 * 4 + j] + inv[i][2] * b[2 * 4 + j];
+        for (int j = 0; j < 3; ++j)
+            d[12 + j] = b[12 + j] - (a[12] * d[0 * 4 + j] + a[13] * d[1 * 4 + j] + a[14] * d[2 * 4 + j]);
+        d[15] = 1.0f;
+        return true;
+    }
+
+    void raymanApplyPersoDelta(const float *part, const float *d, float *out)
+    {
+        std::memcpy(out, part, 16 * sizeof(float));
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j)
+                out[i * 4 + j] = part[i * 4 + 0] * d[0 * 4 + j] + part[i * 4 + 1] * d[1 * 4 + j] + part[i * 4 + 2] * d[2 * 4 + j] +
+                                 (i == 3 ? d[12 + j] : 0.0f);
+    }
+
+    uint64_t g_raymanInterpAttached = 0u;
+    bool raymanInterpAttachOn()
+    {
+        static const bool on = []() { // PS2X_RAYMAN_INTERP_ATTACH=0: off (research)
+            const char *e = std::getenv("PS2X_RAYMAN_INTERP_ATTACH");
+            return !(e && std::strcmp(e, "0") == 0);
+        }();
+        return on;
+    }
+
     // Writes a matrix and remembers what was there; raymanInterpRestore puts it back where the memory still holds
     // the value written.
-    void raymanInterpWrite(uint8_t *rdram, uint32_t matrix, const float *m)
+    void raymanInterpWrite(uint8_t *rdram, uint32_t node, uint32_t matrix, const float *m)
     {
         RaymanInterpWrite w;
+        w.node = node;
         w.matrix = matrix;
         std::memcpy(w.truth, rdram + matrix, sizeof(w.truth));
         std::memcpy(w.written, m, sizeof(w.written));
         std::memcpy(rdram + matrix, m, sizeof(w.written));
+        w.lazy = g_raymanLazyState == RaymanLazyState::Ready && raymanInterpLazyMode() == 1 && g_raymanLazyIndex.count(node) != 0u;
         g_raymanInterpWrites.push_back(w);
         g_raymanInterpWritten = true;
     }
 
+    // The parts of `list` left as they are (written[i] == 0) whose perso got an in-between matrix: carried along with it
+    // (raymanPersoDelta). persoTrue / persoDrawn: each written perso's true and drawn matrix.
+    int raymanInterpAttach(uint8_t *rdram, const std::vector<RaymanNodeMatrix> &list, const std::vector<uint8_t> &written,
+                           const std::unordered_map<uint32_t, std::pair<const float *, std::array<float, 16>>> &persos)
+    {
+        if (!raymanInterpAttachOn() || persos.empty())
+            return 0;
+        std::unordered_map<uint32_t, std::array<float, 16>> deltas;
+        for (const auto &p : persos)
+        {
+            std::array<float, 16> d;
+            if (raymanPersoDelta(p.second.first, p.second.second.data(), d.data()))
+                deltas.emplace(p.first, d);
+        }
+        int count = 0;
+        for (uint32_t i = 0; i < list.size(); ++i)
+        {
+            const RaymanNodeMatrix &e = list[i];
+            if (written[i] || e.type != 8u || raymanRam32(rdram, e.node + 0x24u) != e.matrix)
+                continue;
+            const auto it = deltas.find(e.perso);
+            if (it == deltas.end())
+                continue;
+            float out[16];
+            raymanApplyPersoDelta(e.m, it->second.data(), out);
+            raymanInterpWrite(rdram, e.node, e.matrix, out);
+            ++count;
+        }
+        g_raymanInterpAttached += static_cast<uint64_t>(count);
+        return count;
+    }
+
     void raymanInterpRestore(uint8_t *rdram)
     {
-        if (!g_raymanInterpWritten)
-            return;
-        g_raymanInterpWritten = false;
-        for (auto it = g_raymanInterpWrites.rbegin(); it != g_raymanInterpWrites.rend(); ++it)
-            if (std::memcmp(rdram + it->matrix, it->written, sizeof(it->written)) == 0)
-                std::memcpy(rdram + it->matrix, it->truth, sizeof(it->truth));
-        g_raymanInterpWrites.clear();
+        if (g_raymanInterpWritten)
+        {
+            g_raymanInterpWritten = false;
+            for (auto it = g_raymanInterpWrites.rbegin(); it != g_raymanInterpWrites.rend(); ++it)
+                if (!it->lazy && std::memcmp(rdram + it->matrix, it->written, sizeof(it->written)) == 0)
+                    std::memcpy(rdram + it->matrix, it->truth, sizeof(it->truth));
+            g_raymanInterpWrites.clear();
+        }
+        raymanLazyRestore(rdram); // after: an object finished early gets its whole matrix back
     }
 
     // Drop the snapshots without writing anything back (the objects may be gone).
@@ -917,6 +1240,12 @@ namespace
         g_raymanInterpNow.clear();
         g_raymanInterpPrevIndex.clear();
         g_raymanInterpCurIndex.clear();
+        g_raymanInterpCurPair.clear();
+        g_raymanInterpNowPair.clear();
+        g_raymanLazy.clear();
+        g_raymanLazyIndex.clear();
+        if (g_raymanLazyState == RaymanLazyState::Ready)
+            g_raymanLazyState = RaymanLazyState::Idle;
         g_raymanInterpPrevStep = 0u;
         g_raymanInterpCurStep = 0u;
         g_raymanViewPrev.address = 0u;
@@ -970,6 +1299,20 @@ namespace
             return e ? std::atoi(e) : 5;
         }();
         return parts;
+    }
+
+    // PS2X_RAYMAN_INTERP_TRACE="<first VSync>,<count>" (research): per frame, after the display lists, how many written
+    // matrices the drawing replaced, and the main character's translation as written and as drawn.
+    std::pair<uint64_t, uint64_t> raymanInterpTraceRange()
+    {
+        static const std::pair<uint64_t, uint64_t> s_range = []() {
+            const char *e = std::getenv("PS2X_RAYMAN_INTERP_TRACE");
+            char *end = nullptr;
+            const uint64_t first = e ? std::strtoull(e, &end, 10) : 0ull;
+            const uint64_t count = (e && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+            return std::make_pair(first, first + count);
+        }();
+        return s_range;
     }
 
     // RenderWare's camera: 0x1174E0 sets its frame from the game camera (0x14FE90) and then calls RwCameraBeginUpdate
@@ -1038,9 +1381,148 @@ namespace
                         std::memcpy(&m[word], rdram + modelling + word * 4u, 4u);
                     std::memcpy(rdram + modelling, m, sizeof(m));
                 }
+                const uint64_t vsync = ps2xGuestVsync();
+                const auto range = raymanInterpTraceRange();
+                if (vsync >= range.first && vsync < range.second)
+                {
+                    const float *f = reinterpret_cast<const float *>(rdram + modelling);
+                    std::fprintf(stderr, "[interp-cam] vsync %llu frame %x %s t %.3f right (%.4f %.4f %.4f) up (%.4f %.4f %.4f) at (%.4f %.4f %.4f) pos (%.3f %.3f %.3f)\n",
+                                 static_cast<unsigned long long>(vsync), modelling, write ? "written" : "live", t, f[0], f[1], f[2], f[4], f[5], f[6],
+                                 f[8], f[9], f[10], f[12], f[13], f[14]);
+                }
             }
         }
         g_raymanRwCameraBegin(rdram, ctx, runtime);
+    }
+
+    // On a logic frame, before the in-between matrices: the objects of the dynamic world whose global matrix is stale
+    // (the drawing would compute them later), with their matrix and stamp now; then 0x14AF88 for the whole dynamic
+    // world, like a guest call: the step's registers are kept, 0x14AF88 returns to an unused word whose hook
+    // (raymanLazyReturn) takes the final matrices, puts every object back as it was and enters 0x1174E0 again.
+    void raymanSetArg(R5900Context *ctx, int reg, uint32_t value); // below (the auto-save's guest call)
+
+    bool raymanLazyStart(uint8_t *rdram, R5900Context *ctx)
+    {
+        g_raymanLazy.clear();
+        g_raymanLazyIndex.clear();
+        g_raymanLazyState = RaymanLazyState::Idle;
+        if (!g_raymanLazyMatrix)
+            return false;
+        const uint32_t so = raymanRam32(rdram, kRaymanMainCharacterSoPtr);
+        const uint32_t root = raymanGuestPtr(so) ? raymanRam32(rdram, so + 0x1Cu) : 0u;
+        if (!raymanGuestPtr(root))
+            return false;
+        const uint32_t counter = raymanRam32(rdram, getRegU32(ctx, 28) - 0x7120u);
+        bool usable = true;
+        const bool complete = raymanForSubtree(rdram, root, [&](uint32_t node) {
+            const uint32_t stamp = raymanRam32(rdram, node + 0x28u);
+            if (stamp == counter || stamp == 0xFFFFFFFFu)
+                return;
+            const uint32_t parent = raymanRam32(rdram, node + 0x1Cu);
+            RaymanLazyNode l;
+            l.node = node;
+            l.matrix = raymanRam32(rdram, node + 0x24u);
+            l.stampBefore = stamp;
+            // 0x14AF88 writes the matrix from the local one and the parent's: all must be there. The dynamic world
+            // itself stale: the game updates its objects one by one (from their own superobject), not from the root.
+            if (node == root || !raymanGuestPtr(l.matrix) || !raymanGuestPtr(raymanRam32(rdram, node + 0x20u)) ||
+                !raymanGuestPtr(parent) || !raymanGuestPtr(raymanRam32(rdram, parent + 0x24u)))
+            {
+                usable = false;
+                return;
+            }
+            std::memcpy(l.before, rdram + l.matrix, kRaymanMatrixBytes);
+            g_raymanLazy.push_back(l);
+        });
+        if (usable && complete) // each matrix is saved and put back whole: two must not share bytes
+        {
+            std::vector<uint32_t> at;
+            at.reserve(g_raymanLazy.size());
+            for (const RaymanLazyNode &l : g_raymanLazy)
+                at.push_back(l.matrix);
+            std::sort(at.begin(), at.end());
+            for (size_t i = 1; i < at.size() && usable; ++i)
+                usable = at[i] - at[i - 1] >= kRaymanMatrixBytes;
+        }
+        if (!complete || !usable || g_raymanLazy.empty())
+        {
+            if (!complete || !usable)
+                ++g_raymanLazySkipped;
+            g_raymanLazy.clear();
+            return false;
+        }
+        raymanSaveGuestRegs(ctx, g_raymanLazyRegs);
+        raymanSetArg(ctx, 4, root);
+        raymanSetArg(ctx, 31, kRaymanLazyReturnAddr);
+        ctx->pc = kRaymanLazyMatrixAddr;
+        g_raymanLazyState = RaymanLazyState::Running;
+        return true;
+    }
+
+    // 0x14AF88 returned (to kRaymanLazyReturnAddr): take the final matrices, put the objects back, enter 0x1174E0 again.
+    void raymanLazyReturn(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        raymanLoadGuestRegs(ctx, g_raymanLazyRegs);
+        if (g_raymanLazyState == RaymanLazyState::Running)
+        {
+            for (uint32_t i = 0; i < g_raymanLazy.size(); ++i)
+            {
+                RaymanLazyNode &l = g_raymanLazy[i];
+                std::memcpy(l.after, rdram + l.matrix, kRaymanMatrixBytes);
+                std::memcpy(&l.stampAfter, rdram + l.node + 0x28u, 4u);
+                std::memcpy(rdram + l.matrix, l.before, kRaymanMatrixBytes);
+                std::memcpy(rdram + l.node + 0x28u, &l.stampBefore, 4u);
+                g_raymanLazyIndex.emplace(l.node, i);
+            }
+            g_raymanLazyState = RaymanLazyState::Ready;
+            ++g_raymanLazyFrames;
+            g_raymanLazyCount += g_raymanLazy.size();
+        }
+        g_raymanLazyReentry = true;
+        ctx->pc = kRaymanCameraUpdateAddr;
+    }
+
+    // 0x14AF88 entered by the game while this logic frame's matrices are known: the objects it updates are marked (the
+    // game would have had their final matrices from here on).
+    void raymanLazyMatrixHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_raymanLazyState == RaymanLazyState::Ready && !g_raymanLazy.empty())
+            raymanForSubtree(rdram, getRegU32(ctx, 4), [&](uint32_t node) {
+                const auto it = g_raymanLazyIndex.find(node);
+                if (it != g_raymanLazyIndex.end())
+                    g_raymanLazy[it->second].touched = true;
+            });
+        g_raymanLazyMatrix(rdram, ctx, runtime);
+    }
+
+    // 0x14ACB8 entered while this logic frame's matrices are known: the drawing walks the scene and finishes a stale
+    // object from its parent's matrix (the drawing's matrix stack 0x355448); the game would have had its final matrix.
+    void raymanLazyOneHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_raymanLazyState == RaymanLazyState::Ready && !g_raymanLazy.empty())
+        {
+            const auto it = g_raymanLazyIndex.find(getRegU32(ctx, 4));
+            if (it != g_raymanLazyIndex.end())
+                g_raymanLazy[it->second].touched = true;
+        }
+        g_raymanLazyOne(rdram, ctx, runtime);
+    }
+
+    // 0x14AF20 (the children's matrices, always computed): counted while this logic frame's matrices are known
+    // (research: it would compute children from an in-between parent).
+    void raymanLazyChildrenHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_raymanLazyState == RaymanLazyState::Ready)
+        {
+            ++g_raymanLazyChildrenCalls;
+            const uint64_t vsync = ps2xGuestVsync();
+            const auto range = raymanInterpTraceRange();
+            if (vsync >= range.first && vsync < range.second)
+                std::fprintf(stderr, "[interp-lazy] vsync %llu 0x14AF20 entered for %x from %x\n", static_cast<unsigned long long>(vsync),
+                             getRegU32(ctx, 4), getRegU32(ctx, 31));
+        }
+        g_raymanLazyChildren(rdram, ctx, runtime);
     }
 
     void raymanCameraUpdateInterp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1052,7 +1534,14 @@ namespace
             return;
         }
         const uint64_t vsync = ps2xGuestVsync();
-        raymanInterpRestore(rdram);
+        const bool reentry = g_raymanLazyReentry; // after the early 0x14AF88 (below): nothing written yet
+        g_raymanLazyReentry = false;
+        if (!reentry)
+        {
+            raymanInterpRestore(rdram);
+            if (!g_raymanDrawOnly && raymanInterpLazyMode() != 0 && (raymanInterpParts() & 1) && raymanLazyStart(rdram, ctx))
+                return; // 0x14AF88 runs first; this function is entered again after it
+        }
         // PS2X_RAYMAN_SPLIT_DUMP=<vsync> (research): EE RAM here (before the camera and the display lists) on the
         // first logic frame from that VSync and on the two draw-only frames after it (out/split_logic_<v>.bin,
         // split_draw_<v>.bin, split_draw2_<v>.bin). What the logic filled and the drawing emptied (and nothing filled
@@ -1085,30 +1574,57 @@ namespace
         if (!g_raymanDrawOnly) // logic step k: k's final matrices are not there yet; show k-2..k-1 in k's objects
         {
             g_raymanInterpNeedCapture = true;
-            raymanInterpSnapshot(rdram, g_raymanInterpNow); // this step's objects (their values are not final yet)
-            const bool haveLast = g_raymanInterpCurStep == k - 1u && g_raymanInterpCurStep != 0u;
-            const bool havePair = haveLast && g_raymanInterpPrevStep == k - 2u && g_raymanInterpPrevStep != 0u;
-            const float t = raymanInterpGridT(true);
-            if (haveLast && (raymanInterpParts() & 1))
-                for (const RaymanNodeMatrix &now : g_raymanInterpNow)
+            // The objects finished early (0x14AF88 above): their final matrices, with the counter as their stamp, so
+            // the drawing keeps them (an in-between matrix written below, or the final one).
+            const bool lazy = g_raymanLazyState == RaymanLazyState::Ready && raymanInterpLazyMode() == 1;
+            if (lazy)
+                for (const RaymanLazyNode &l : g_raymanLazy)
                 {
-                    const auto it = g_raymanInterpCurIndex.find(now.key);
-                    if (it == g_raymanInterpCurIndex.end())
+                    std::memcpy(rdram + l.matrix, l.after, kRaymanMatrixBytes);
+                    std::memcpy(rdram + l.node + 0x28u, &l.stampAfter, 4u);
+                }
+            raymanInterpSnapshot(rdram, g_raymanInterpNow); // this step's objects (not all final yet without the above)
+            const bool haveLast = g_raymanInterpCurStep == k - 1u && g_raymanInterpCurStep != 0u;
+            const bool havePair = haveLast && g_raymanInterpPrevStep == k - 2u && g_raymanInterpPrevStep != 0u &&
+                                  g_raymanInterpCurPair.size() == g_raymanInterpCur.size();
+            const float t = raymanInterpGridT(true);
+            // PS2X_RAYMAN_INTERP_LAZY=2 (research): the logic frame drawn from the true matrices, the early ones compared.
+            if (haveLast && (raymanInterpParts() & 1) && raymanInterpLazyMode() != 2)
+            {
+                raymanInterpPair(g_raymanInterpNow, g_raymanInterpCur, g_raymanInterpCurIndex, g_raymanInterpNowPair);
+                std::vector<uint8_t> written(g_raymanInterpNow.size(), 0u);
+                std::unordered_map<uint32_t, std::pair<const float *, std::array<float, 16>>> persos;
+                for (uint32_t i = 0; i < g_raymanInterpNow.size(); ++i)
+                {
+                    const RaymanNodeMatrix &now = g_raymanInterpNow[i];
+                    const int32_t j = g_raymanInterpNowPair[i];
+                    if (j < 0)
                         continue;
-                    const RaymanNodeMatrix &last = g_raymanInterpCur[it->second];
+                    const RaymanNodeMatrix &last = g_raymanInterpCur[j];
                     if (!raymanInterpMatrix(last.m, now.m, 0.0f, m)) // k-1 as it was, with the checks (jumps, sizes)
                         continue;
                     if (havePair)
                     {
-                        const auto before = g_raymanInterpPrevIndex.find(now.key);
+                        const int32_t before = g_raymanInterpCurPair[j];
                         float mixed[16];
-                        if (before != g_raymanInterpPrevIndex.end() &&
-                            raymanInterpMatrix(g_raymanInterpPrev[before->second].m, last.m, t, mixed))
+                        if (before >= 0 && raymanInterpMatrix(g_raymanInterpPrev[before].m, last.m, t, mixed))
                             std::memcpy(m, mixed, sizeof(m));
                     }
-                    raymanInterpWrite(rdram, now.matrix, m);
+                    raymanInterpWrite(rdram, now.node, now.matrix, m);
+                    written[i] = 1u;
+                    if (now.type == 2u)
+                    {
+                        std::array<float, 16> drawn;
+                        std::memcpy(drawn.data(), m, sizeof(m));
+                        persos.emplace(now.node, std::make_pair(now.m, drawn));
+                    }
                     ++pairedCount;
                 }
+                pairedCount += raymanInterpAttach(rdram, g_raymanInterpNow, written, persos);
+            }
+            if (lazy)
+                for (RaymanLazyNode &l : g_raymanLazy)
+                    std::memcpy(l.left, rdram + l.matrix, kRaymanMatrixBytes);
         }
         else
         {
@@ -1125,6 +1641,7 @@ namespace
                 g_raymanInterpCurIndex.clear();
                 for (uint32_t i = 0; i < g_raymanInterpCur.size(); ++i)
                     g_raymanInterpCurIndex.emplace(g_raymanInterpCur[i].key, i);
+                raymanInterpPair(g_raymanInterpCur, g_raymanInterpPrev, g_raymanInterpPrevIndex, g_raymanInterpCurPair);
             }
             if (g_raymanInterpCurStep == k && g_raymanInterpPrevStep == k - 1u && g_raymanInterpPrevStep != 0u &&
                 !g_raymanInterpPrev.empty() && (raymanInterpParts() & 1))
@@ -1143,23 +1660,50 @@ namespace
                     s_logged = true;
                     std::fprintf(stderr, "[interp-log] vsync %llu t %.3f, %zu objects (N-1: %zu)\n", static_cast<unsigned long long>(vsync), t,
                                  g_raymanInterpCur.size(), g_raymanInterpPrev.size());
+                    // The main character's parts in both steps (their structure as it was then).
+                    const uint32_t mainSo = raymanRam32(rdram, kRaymanMainCharacterSoPtr);
+                    for (int list = 0; list < 2; ++list)
+                        for (const RaymanNodeMatrix &e : list == 0 ? g_raymanInterpPrev : g_raymanInterpCur)
+                            if (e.perso == mainSo)
+                                std::fprintf(stderr, "[interp-tree] %s node %x type %u data %x parent %x depth %u occ %u key %016llx at (%.3f %.3f %.3f)\n",
+                                             list == 0 ? "N-1" : "N", e.node, e.type, e.data, e.parent, e.depth, e.occurrence,
+                                             static_cast<unsigned long long>(e.key), e.m[12], e.m[13], e.m[14]);
                 }
-                for (const RaymanNodeMatrix &cur : g_raymanInterpCur)
+                std::vector<uint8_t> written(g_raymanInterpCur.size(), 0u);
+                std::unordered_map<uint32_t, std::pair<const float *, std::array<float, 16>>> persos;
+                for (uint32_t i = 0; i < g_raymanInterpCur.size(); ++i)
                 {
-                    const auto it = g_raymanInterpPrevIndex.find(cur.key);
-                    const bool paired = it != g_raymanInterpPrevIndex.end();
+                    const RaymanNodeMatrix &cur = g_raymanInterpCur[i];
+                    const int32_t p = i < g_raymanInterpCurPair.size() ? g_raymanInterpCurPair[i] : -1;
+                    const bool paired = p >= 0;
                     const bool same = raymanRam32(rdram, cur.node + 0x24u) == cur.matrix;
-                    const bool done = paired && same && raymanInterpMatrix(g_raymanInterpPrev[it->second].m, cur.m, t, m);
+                    const bool done = paired && same && raymanInterpMatrix(g_raymanInterpPrev[p].m, cur.m, t, m);
                     if (log)
                     {
-                        const float *pm = paired ? g_raymanInterpPrev[it->second].m : cur.m;
+                        const float *pm = paired ? g_raymanInterpPrev[p].m : cur.m;
                         std::fprintf(stderr, "[interp-log] node %x type %u data %x parent %x %s N-1 (%.2f %.2f %.2f) N (%.2f %.2f %.2f) drawn (%.2f %.2f %.2f)\n",
                                      cur.node, raymanRam32(rdram, cur.node), raymanRam32(rdram, cur.node + 4u), raymanRam32(rdram, cur.node + 0x1Cu),
                                      !paired ? "unpaired" : (!same ? "moved" : (done ? "blend" : "kept")), pm[12], pm[13], pm[14], cur.m[12],
                                      cur.m[13], cur.m[14], done ? m[12] : cur.m[12], done ? m[13] : cur.m[13], done ? m[14] : cur.m[14]);
                     }
                     if (!paired)
+                    {
                         ++g_raymanInterpUnpaired;
+                        const auto range = raymanInterpTraceRange();
+                        if (vsync >= range.first && vsync < range.second)
+                        {
+                            // under the main character? (up to 8 parents)
+                            const uint32_t mainSo = raymanRam32(rdram, kRaymanMainCharacterSoPtr);
+                            bool underMain = false;
+                            uint32_t up = cur.node;
+                            for (int i = 0; i < 8 && raymanGuestPtr(up); ++i, up = raymanRam32(rdram, up + 0x1Cu))
+                                underMain = underMain || up == mainSo;
+                            std::fprintf(stderr, "[interp-unpaired] vsync %llu node %x type %u data %x parent %x %s at (%.2f %.2f %.2f)\n",
+                                         static_cast<unsigned long long>(vsync), cur.node, raymanRam32(rdram, cur.node),
+                                         raymanRam32(rdram, cur.node + 4u), raymanRam32(rdram, cur.node + 0x1Cu), underMain ? "main" : "other",
+                                         cur.m[12], cur.m[13], cur.m[14]);
+                        }
+                    }
                     if (paired && same && !done)
                     {
                         ++g_raymanInterpJumps;
@@ -1172,7 +1716,7 @@ namespace
                         if (s_keptLeft > 0)
                         {
                             --s_keptLeft;
-                            const float *a = g_raymanInterpPrev[it->second].m, *b = cur.m;
+                            const float *a = g_raymanInterpPrev[p].m, *b = cur.m;
                             const float dist = std::sqrt((b[12] - a[12]) * (b[12] - a[12]) + (b[13] - a[13]) * (b[13] - a[13]) +
                                                          (b[14] - a[14]) * (b[14] - a[14]));
                             float minCos = 1.0f, maxRatio = 1.0f;
@@ -1203,22 +1747,167 @@ namespace
                     }
                     if (!done)
                         continue;
-                    raymanInterpWrite(rdram, cur.matrix, m);
+                    raymanInterpWrite(rdram, cur.node, cur.matrix, m);
+                    written[i] = 1u;
+                    if (cur.type == 2u)
+                    {
+                        std::array<float, 16> drawn;
+                        std::memcpy(drawn.data(), m, sizeof(m));
+                        persos.emplace(cur.node, std::make_pair(cur.m, drawn));
+                    }
                     ++pairedCount;
                 }
+                pairedCount += raymanInterpAttach(rdram, g_raymanInterpCur, written, persos);
             }
         }
         g_raymanInterpObjects += static_cast<uint64_t>(pairedCount);
         if (++g_raymanInterpFrames % 600u == 0u)
-            std::fprintf(stderr, "[hle] Rayman: in-between pictures: %llu frames, %.1f objects interpolated per frame, %llu jumps kept, %llu unpaired\n",
+            std::fprintf(stderr, "[hle] Rayman: in-between pictures: %llu frames, %.1f objects interpolated per frame, %llu jumps kept, %llu unpaired, "
+                                 "%llu parts carried with their perso; finished early: %llu logic frames, %.1f objects each, %llu skipped, "
+                                 "%llu changed by the game, 0x14AF20 %llu, checked %llu, differ %llu; shadows moved %llu, left %llu\n",
                          static_cast<unsigned long long>(g_raymanInterpFrames),
                          static_cast<double>(g_raymanInterpObjects) / static_cast<double>(g_raymanInterpFrames),
-                         static_cast<unsigned long long>(g_raymanInterpJumps), static_cast<unsigned long long>(g_raymanInterpUnpaired));
+                         static_cast<unsigned long long>(g_raymanInterpJumps), static_cast<unsigned long long>(g_raymanInterpUnpaired),
+                         static_cast<unsigned long long>(g_raymanInterpAttached),
+                         static_cast<unsigned long long>(g_raymanLazyFrames),
+                         g_raymanLazyFrames ? static_cast<double>(g_raymanLazyCount) / static_cast<double>(g_raymanLazyFrames) : 0.0,
+                         static_cast<unsigned long long>(g_raymanLazySkipped), static_cast<unsigned long long>(g_raymanLazyChanged),
+                         static_cast<unsigned long long>(g_raymanLazyChildrenCalls), static_cast<unsigned long long>(g_raymanLazyChecked),
+                         static_cast<unsigned long long>(g_raymanLazyMismatch), static_cast<unsigned long long>(g_raymanShadowsMoved),
+                         static_cast<unsigned long long>(g_raymanShadowsLeft));
         g_raymanCameraUpdate(rdram, ctx, runtime);
+    }
+
+    // Shadows in between (2026-11-18). A shadow is a draw request the AI makes in the logic step (0x147AE8, +0 the
+    // superobject); 0x147C30 turns each one into an entry of the shadows' draw list (count gp-0x71A0, entries of 0xCC
+    // bytes at 0x3311D8: +0x00 a world -> shadow transform, rows 0-2 and its translation at +0x30; +0x84 the world centre;
+    // the rest sizes), from the step's own bounding box, and 0x141D20 builds and draws the shadow from the entry. A
+    // draw-only frame replays the step's requests, so the entries were the same on every picture of a step: every shadow
+    // stood at the newest step while its object moved in between (under a walking Rayman it slid back ~2.5 pixels a
+    // picture at 640 x 512 and jumped ~10 forward at each logic step, 25 times a second). Now, when 0x141D20 is entered,
+    // each entry is moved with the perso nearest to its centre by that perso's in-between move this picture (drawn minus
+    // true translation, from this frame's writes), and the entries go back as they were when the next step is entered.
+    // Writing the persos' in-between matrices while 0x147C30 ran did not move them (it uses the step's bounding box).
+    constexpr uint32_t kRaymanShadowListAddr = 0x003311D8u;
+    constexpr uint32_t kRaymanShadowEntryBytes = 0xCCu;
+    std::vector<std::pair<uint32_t, std::array<uint8_t, kRaymanShadowEntryBytes>>> g_raymanShadowSaved;
+
+    bool raymanInterpShadowsOn()
+    {
+        static const bool on = []() { // PS2X_RAYMAN_INTERP_SHADOWS=0: off (research)
+            const char *e = std::getenv("PS2X_RAYMAN_INTERP_SHADOWS");
+            return !(e && std::strcmp(e, "0") == 0);
+        }();
+        return on;
+    }
+
+    void raymanInterpShadowsBack(uint8_t *rdram)
+    {
+        for (const auto &saved : g_raymanShadowSaved)
+            std::memcpy(rdram + saved.first, saved.second.data(), kRaymanShadowEntryBytes);
+        g_raymanShadowSaved.clear();
+    }
+
+    void raymanInterpShadows(uint8_t *rdram, R5900Context *ctx)
+    {
+        raymanInterpShadowsBack(rdram);
+        if (!g_raymanInterp || !raymanInterpShadowsOn() || !(raymanInterpParts() & 1) || g_raymanInterpWrites.empty())
+            return;
+        const uint32_t count = raymanRam32(rdram, getRegU32(ctx, 28) - 0x71A0u);
+        for (uint32_t e = 0; e < count && e < 20u; ++e)
+        {
+            const uint32_t entry = kRaymanShadowListAddr + e * kRaymanShadowEntryBytes;
+            float centre[3];
+            std::memcpy(centre, rdram + entry + 0x84u, sizeof(centre));
+            // The perso this shadow belongs to: the written perso whose true place is nearest the centre (within 4 units).
+            const RaymanInterpWrite *best = nullptr;
+            float bestDistance = 4.0f * 4.0f;
+            for (const RaymanInterpWrite &w : g_raymanInterpWrites)
+            {
+                if (raymanRam32(rdram, w.node) != 2u)
+                    continue;
+                float d = 0.0f;
+                for (int c = 0; c < 3; ++c)
+                    d += (w.truth[12 + c] - centre[c]) * (w.truth[12 + c] - centre[c]);
+                if (d < bestDistance)
+                {
+                    bestDistance = d;
+                    best = &w;
+                }
+            }
+            if (!best)
+            {
+                ++g_raymanShadowsLeft;
+                continue;
+            }
+            float delta[3];
+            for (int c = 0; c < 3; ++c)
+                delta[c] = best->written[12 + c] - best->truth[12 + c];
+            std::array<uint8_t, kRaymanShadowEntryBytes> keep;
+            std::memcpy(keep.data(), rdram + entry, kRaymanShadowEntryBytes);
+            g_raymanShadowSaved.emplace_back(entry, keep);
+            float *f = reinterpret_cast<float *>(rdram + entry);
+            for (int c = 0; c < 3; ++c)
+            {
+                f[0x84 / 4 + c] += delta[c]; // the centre
+                // the transform: p x R + T for the moved shadow = (p - delta) x R + T
+                f[0x30 / 4 + c] -= delta[0] * f[0x00 / 4 + c] + delta[1] * f[0x10 / 4 + c] + delta[2] * f[0x20 / 4 + c];
+            }
+            ++g_raymanShadowsMoved;
+        }
     }
 
     void raymanAfterDisplayInterp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        raymanInterpShadows(rdram, ctx); // before the true matrices go back: it reads this frame's writes
+        const uint64_t vsync = ps2xGuestVsync();
+        const auto range = raymanInterpTraceRange();
+        if (vsync >= range.first && vsync < range.second)
+        {
+            const uint32_t so = raymanRam32(rdram, kRaymanMainCharacterSoPtr);
+            const uint32_t mainMatrix = raymanGuestPtr(so) ? raymanRam32(rdram, so + 0x24u) : 0u;
+            uint32_t replaced = 0u;
+            const float *written = nullptr;
+            for (const RaymanInterpWrite &w : g_raymanInterpWrites)
+            {
+                if (std::memcmp(rdram + w.matrix, w.written, sizeof(w.written)) != 0)
+                {
+                    ++replaced;
+                    const float *d = reinterpret_cast<const float *>(rdram + w.matrix);
+                    bool underMain = false;
+                    uint32_t up = w.node;
+                    for (int i = 0; i < 8 && raymanGuestPtr(up); ++i, up = raymanRam32(rdram, up + 0x1Cu))
+                        underMain = underMain || up == so;
+                    std::fprintf(stderr, "[interp-replaced] vsync %llu %s matrix %x node %x type %u data %x parent %x stamp %x counter %x written (%.3f %.3f %.3f) drawn (%.3f %.3f %.3f) truth (%.3f %.3f %.3f)\n",
+                                 static_cast<unsigned long long>(vsync), underMain ? "main" : "other", w.matrix, w.node, raymanRam32(rdram, w.node), raymanRam32(rdram, w.node + 4u),
+                                 raymanRam32(rdram, w.node + 0x1Cu), raymanRam32(rdram, w.node + 0x28u), raymanRam32(rdram, getRegU32(ctx, 28) - 0x7120u),
+                                 w.written[12], w.written[13], w.written[14], d[12], d[13], d[14], w.truth[12], w.truth[13], w.truth[14]);
+                }
+                if (w.matrix == mainMatrix)
+                    written = w.written;
+            }
+            float drawn[16] = {};
+            if (raymanGuestPtr(mainMatrix))
+                std::memcpy(drawn, rdram + mainMatrix, sizeof(drawn));
+            std::fprintf(stderr, "[interp-trace] vsync %llu %s t %.3f writes %zu replaced %u main %s (%.3f %.3f %.3f) drawn (%.3f %.3f %.3f)\n",
+                         static_cast<unsigned long long>(vsync), g_raymanDrawOnly ? "draw" : "logic", raymanInterpGridT(!g_raymanDrawOnly),
+                         g_raymanInterpWrites.size(), replaced, written ? "written" : "not-written", written ? written[12] : 0.0f,
+                         written ? written[13] : 0.0f, written ? written[14] : 0.0f, drawn[12], drawn[13], drawn[14]);
+            // Every part of the main character as drawn, relative to it: geometry and offset.
+            std::string parts;
+            char item[96];
+            raymanForSubtree(rdram, so, [&](uint32_t node) {
+                const uint32_t matrix = raymanRam32(rdram, node + 0x24u);
+                if (node == so || raymanRam32(rdram, node) != 8u || !raymanGuestPtr(matrix))
+                    return;
+                const float *pm = reinterpret_cast<const float *>(rdram + matrix);
+                std::snprintf(item, sizeof(item), " %x:%.4f,%.4f,%.4f", raymanRam32(rdram, node + 4u), pm[12] - drawn[12], pm[13] - drawn[13],
+                              pm[14] - drawn[14]);
+                parts += item;
+            });
+            std::fprintf(stderr, "[interp-parts] vsync %llu %s%s\n", static_cast<unsigned long long>(vsync), g_raymanDrawOnly ? "draw" : "logic",
+                         parts.c_str());
+        }
         raymanInterpRestore(rdram);
         g_raymanAfterDisplay(rdram, ctx, runtime);
     }
@@ -1242,6 +1931,28 @@ namespace
             runtime.registerFunction(kRaymanRwCameraBeginAddr, &raymanRwCameraBeginInterp);
         }
         runtime.registerFunction(kRaymanAfterDisplayAddr, &raymanAfterDisplayInterp);
+        // The objects the drawing finishes (raymanLazyStart): 0x14AF88 and 0x14ACB8 (addiu sp,sp,-0x20; lw v0,-0x7120(gp)),
+        // 0x14AF20 (addiu sp,sp,-0x30) and the unused word after it.
+        if (raymanInterpLazyMode() != 0)
+        {
+            if (raymanRam32(rdram, kRaymanLazyMatrixAddr) == 0x27BDFFE0u && raymanRam32(rdram, kRaymanLazyMatrixAddr + 4u) == 0x8F828EE0u &&
+                raymanRam32(rdram, kRaymanLazyChildrenAddr) == 0x27BDFFD0u && raymanRam32(rdram, kRaymanLazyReturnAddr) == 0u &&
+                raymanRam32(rdram, kRaymanLazyOneAddr) == 0x27BDFFE0u && raymanRam32(rdram, kRaymanLazyOneAddr + 4u) == 0x8F828EE0u &&
+                runtime.hasFunction(kRaymanLazyMatrixAddr) && runtime.hasFunction(kRaymanLazyChildrenAddr) &&
+                runtime.hasFunction(kRaymanLazyOneAddr) && !runtime.hasFunction(kRaymanLazyReturnAddr))
+            {
+                g_raymanLazyMatrix = runtime.lookupFunction(kRaymanLazyMatrixAddr);
+                g_raymanLazyChildren = runtime.lookupFunction(kRaymanLazyChildrenAddr);
+                g_raymanLazyOne = runtime.lookupFunction(kRaymanLazyOneAddr);
+                runtime.registerFunction(kRaymanLazyMatrixAddr, &raymanLazyMatrixHook);
+                runtime.registerFunction(kRaymanLazyChildrenAddr, &raymanLazyChildrenHook);
+                runtime.registerFunction(kRaymanLazyOneAddr, &raymanLazyOneHook);
+                if (!runtime.registerFunction(kRaymanLazyReturnAddr, &raymanLazyReturn))
+                    g_raymanLazyMatrix = nullptr;
+            }
+            else
+                std::cerr << "[hle] Rayman: PS2X_RAYMAN_INTERP: the matrix update 0x14AF88 not found: objects the drawing finishes are not interpolated on logic frames" << std::endl;
+        }
         g_raymanInterp = true;
         std::cerr << "[hle] Rayman: in-between pictures on (PS2X_RAYMAN_INTERP, experiment)" << std::endl;
     }

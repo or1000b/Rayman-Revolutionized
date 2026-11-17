@@ -202,6 +202,61 @@ shown exactly once (0 of 600 in most 5 s windows); repeats only while booting an
 shrinking to nothing (size ratio over 1.25 per step, the guard against an effect appearing), a few turns over 90
 degrees; ~0.5 a frame unpaired (new parts).
 
+## Rayman, the energy ball and the characters still stuttered (2026-11-18)
+
+The user, after the grid fix: "most noticeable with Rayman when he's given a command to move. You can also see it
+slightly with the energy ball Rayman shoots, and with the characters he talks to, like Sssam. On the other hand, the
+environment looks good." The camera and Rayman's own place were smooth (`PS2X_RAYMAN_INTERP_TRACE="<vsync>,<count>"`
+logs, per frame, the main character's translation as written and as drawn: 0.078 units every picture while walking).
+Three things were not:
+
+1. **Objects the drawing finishes.** A superobject's global matrix is stale when its stamp (+0x28) differs from the step
+   counter gp-0x7120 (moved once per logic step by 0x14AC40). The drawing finishes stale objects itself: 0x14ACB8 while
+   it walks the scene (global = local x the parent's matrix on its matrix stack 0x355448) and 0x14AF88 (an object and
+   everything under it) from the shadow requests. On a logic frame that came after the in-between matrices were written,
+   so those objects showed the newest step and went back on the next picture: 13-16 matrices per logic frame in
+   `rayman_interp` (a character flying beside Rayman and its parts, another one), the energy ball in `shoot_split`
+   (tracked on burst pictures: ~14 pixels forward on every logic picture, ~9 back on the next). Fix (main.cpp
+   `raymanLazyStart`): on a logic frame, before the in-between matrices, 0x14AF88 runs for the whole dynamic world like a
+   guest call (the step's registers kept, returning to the unused word 0x14AF84) and gives every stale object's final
+   matrix with the game's own code; each gets the counter as its stamp, so the drawing keeps what is written. At 0x141D20
+   each one gets what the game would have had: the final matrix and the counter where the drawing asked for it (0x14ACB8
+   or 0x14AF88 entered for it or a parent), else its old matrix and stamp. Checked with `PS2X_RAYMAN_INTERP_LAZY=2`
+   (the logic frame drawn from the true matrices, the drawing's own results compared with the early ones): 90114 of
+   90114 identical. After: 0 matrices replaced on logic frames (3957 before in 1300 pictures); the ball moves the same
+   ~2.5 pixels on every picture.
+2. **Parts that change shape.** Rayman's hands and feet get another geometry every step or two while he walks (the
+   animation swaps the object of a bone; the parts are made again each step from a pool). The pairing key held the
+   geometry, and the parent's (so every part under a swapped one got a new key too), so such a part had no pair: it was
+   drawn at the newest step, standing still in the world while the body caught up (768 such parts in 1029 walking
+   pictures). Now (`raymanInterpPair`) a part without a pair by key is paired with a part of the same perso that has
+   none either: first one with the same geometry within 0.5 units (the same part under a changed parent: measured nearly
+   all within 0.05), else one at the same place of the skeleton (same parent and depth) within 1 unit (the same bone in
+   another shape). Burst pictures decided the second rule: with it a foot rises over the 4-5 pictures of a step; without
+   it the foot stood still and jumped at each logic picture. Parts of other shapes under other parents measured 0.4-1
+   units apart: different parts, not blended. A part still without a pair, or one kept by the checks (a turn of 90
+   degrees, a size jump), now goes along with its perso (`raymanInterpAttach`: part x inverse(perso true) x perso drawn)
+   instead of standing at the newest step ahead of the body.
+3. **Shadows.** A shadow is a draw request the AI makes in the logic step (0x147AE8, +0 the superobject); 0x147C30 turns
+   it into an entry of the shadows' draw list (count gp-0x71A0, 0xCC bytes each at 0x3311D8: +0x00 a world -> shadow
+   transform with its translation at +0x30, +0x84 the world centre, then sizes) from the step's bounding box, and
+   0x141D20 builds the shadow from the entry. Draw-only frames replay the step's requests, so the entries were the same
+   on every picture of a step: under a walking Rayman the shadow slid back ~2.5 pixels (640 x 512) a picture and jumped
+   6-14 forward at each logic picture (a saw-tooth 25 times a second, right under the character). Writing the in-between
+   matrix while 0x147C30 ran changed nothing (it uses the bounding box). Now (`raymanInterpShadows`), when 0x141D20 is
+   entered, each entry moves with the written perso nearest its centre by that perso's in-between move (centre + d,
+   translation - d x rows); the entries go back when the next step is entered. After: the shadow's movement per picture
+   std 4.5 -> 1.6 pixels (what remains: its size and shape change with the animation at the steps).
+
+Measured on Rayman's parts relative to his body (`[interp-parts]` lines, scratch tool): per-picture jumps over 0.2
+units 388 -> about 100 in 1300 pictures; the rest are shape swaps of other parts, which a matrix measure counts as jumps
+whatever the picture shows. Research switches: `PS2X_RAYMAN_INTERP_LAZY` (0 off, 2 compare), `PS2X_RAYMAN_INTERP_PAIR=0`,
+`PS2X_RAYMAN_INTERP_SWAP=<units>`, `PS2X_RAYMAN_INTERP_ATTACH=0`, `PS2X_RAYMAN_INTERP_SHADOWS=0`,
+`PS2X_RAYMAN_INTERP_PAIRLOG=1`, `PS2X_RAYMAN_INTERP_TRACE`.
+
+Still at the logic rate, as on the console: particles (Murfy's sparkles: the picture around him changes twice as much on
+logic pictures), texture animation, a part's change of shape itself (it happens at the step).
+
 ## Next steps
 
 1. More flicker checks (effects, other levels); the user's impression.
