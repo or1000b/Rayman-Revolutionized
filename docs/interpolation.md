@@ -257,6 +257,28 @@ whatever the picture shows. Research switches: `PS2X_RAYMAN_INTERP_LAZY` (0 off,
 Still at the logic rate, as on the console: particles (Murfy's sparkles: the picture around him changes twice as much on
 logic pictures), texture animation, a part's change of shape itself (it happens at the step).
 
+## Particles were drawn on logic pictures only (2026-11-18)
+
+The user: "the flickers also exist in the game itself when I'm playing" (after the menu / loading screen fixes, issue
+25). Captured with `PS2X_WINDOW_BURST` (every window frame as drawn) where Rayman stands still at the shop save point
+(shop_walk_split, VSync 8400-8550): pixels that change and come back in the next picture ("blinks") were the bubbles in
+the water, the flame and lantern, sparkles, the butterfly, Rayman's outline. The bubbles were in one picture of five
+(the logic pictures: 8443, 8449, 8453, ...): the particles were not interpolated at 25 Hz, they were missing from the
+in-between pictures altogether, i.e. blinking 25 times a second.
+
+Cause: the step's last call 0x13EA68 moves and draws the particle systems and was in the list of logic calls skipped
+on draw-only frames. It does: f20 = the frame's time step (0x14B900, a getter: [[gp-0x7108]+0x2C]); visibility of
+each system (0x13E568, from the main character's sector and the systems' boxes); then for each system of the list
+gp-0x722C (next at +0x194; skipped when +0x164 has bit 0 or 2) the move 0x13E708(system, f12 = time step) and the draw
+0x13E8A8(system, a0, a1) (the drawing's matrices via 0x14ACB8 / 0x11AA40, the geometry via 0x149810; no random numbers).
+
+Fix (main.cpp `raymanParticleMoveSplit`): 0x13EA68 is no longer in the skipped list; 0x13E708 returns at once when
+called from 0x13EA68 on a draw-only frame (`particle moves skipped` in the `logic split` log line). The particles
+move 25 times a second as on the console and are in every picture. The blinks counted in that scene: 1411 -> 657;
+what is left changes at the step and stays (the lantern's and the butterfly's texture animation, Rayman's parts
+changing shape), not a blink. A particle sits where the last step put it, so one belonging to a moving object can
+be up to one step ahead of the object drawn in between (the energy ball's glow measured the same as before).
+
 ## Next steps
 
 1. More flicker checks (effects, other levels); the user's impression.

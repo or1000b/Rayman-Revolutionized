@@ -649,6 +649,31 @@ namespace
         g_raymanLogicCalls[I].original(rdram, ctx, runtime);
     }
 
+    // Particles (2026-11-18, user report: "the flickers also exist in the game itself"). The step's last call 0x13EA68
+    // moves and draws the particle systems: f20 = the frame's time step (0x14B900), visibility of each system
+    // (0x13E568), then for each system of the list gp-0x722C (next at +0x194; skipped when +0x164 has bit 0 or 2) the
+    // move 0x13E708(system, f12 = time step) and the draw 0x13E8A8(system, a0, a1). It was skipped on draw-only frames
+    // as a logic call, so bubbles, flames, sparkles and glows were drawn on logic frames only: 25 times a second, one
+    // picture in five. Now 0x13EA68 runs on every frame and only the move is skipped on draw-only frames: the
+    // particles move 25 times a second as on the console and are drawn in every picture.
+    constexpr uint32_t kRaymanParticlesAddr = 0x0013EA68u;
+    constexpr uint32_t kRaymanParticlesEnd = 0x0013EB08u;
+    constexpr uint32_t kRaymanParticleMoveAddr = 0x0013E708u;
+    PS2Runtime::RecompiledFunction g_raymanParticleMove = nullptr;
+    uint64_t g_raymanParticleMovesSkipped = 0u;
+
+    void raymanParticleMoveSplit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = getRegU32(ctx, 31);
+        if (g_raymanDrawOnly && ra >= kRaymanParticlesAddr && ra < kRaymanParticlesEnd)
+        {
+            ++g_raymanParticleMovesSkipped;
+            ctx->pc = ra; // not moved in a draw-only frame; drawn by the call after it
+            return;
+        }
+        g_raymanParticleMove(rdram, ctx, runtime);
+    }
+
     template <uint32_t... I>
     constexpr std::array<PS2Runtime::RecompiledFunction, sizeof...(I)> raymanLogicCallSplits(std::integer_sequence<uint32_t, I...>)
     {
@@ -688,8 +713,9 @@ namespace
         g_raymanLastLogicSlot = slot;
         static uint64_t s_clockCalls = 0u;
         if (++s_clockCalls % 250u == 0u)
-            std::fprintf(stderr, "[hle] Rayman: logic split: %llu steps, %llu of them draw-only\n",
-                         static_cast<unsigned long long>(g_raymanSteps), static_cast<unsigned long long>(g_raymanDrawOnlySteps));
+            std::fprintf(stderr, "[hle] Rayman: logic split: %llu steps, %llu of them draw-only; %llu particle moves skipped\n",
+                         static_cast<unsigned long long>(g_raymanSteps), static_cast<unsigned long long>(g_raymanDrawOnlySteps),
+                         static_cast<unsigned long long>(g_raymanParticleMovesSkipped));
         g_raymanFrameClockCall(rdram, ctx, runtime);
     }
 
@@ -778,14 +804,25 @@ namespace
         }
         // The step's logic calls (the step does not use their results): 0x20C518, 0x15BD30, 0x14AC40, 0x101828 (sector
         // change), 0x112270, 0x1497A0, 0x10C0D8 / 0x106680 (the actors and their AI), 0x11A2D0 (f12 = n: animation),
-        // 0x11B348 (a0 = game ms), and after the display lists 0x13EA68. PS2X_RAYMAN_LOGIC_CALLS="addr,..." replaces
-        // the list (experiments). The AI's draw requests (0x147C30, 0x141D20, above) and the calls before them that
-        // they need (0x147968, 0x154700, 0x14C2B8: without them 0x147C30 on a draw-only frame crashed the game thread
-        // in RenderWare's camera update) run on every frame.
+        // 0x11B348 (a0 = game ms). PS2X_RAYMAN_LOGIC_CALLS="addr,..." replaces the list (experiments). The AI's draw
+        // requests (0x147C30, 0x141D20, above) and the calls before them that they need (0x147968, 0x154700, 0x14C2B8:
+        // without them 0x147C30 on a draw-only frame crashed the game thread in RenderWare's camera update) run on
+        // every frame. The particles after the display lists (0x13EA68) run on every frame too, without their move on
+        // draw-only frames (raymanParticleMoveSplit; until 2026-11-18 the whole call was skipped).
+        // jal 0x13E708 (move) and jal 0x13E8A8 (draw) in 0x13EA68
+        bool particleSplit = false;
+        if (raymanRam32(rdram, 0x0013EAC8u) == 0x0C04F9C2u && raymanRam32(rdram, 0x0013EAD8u) == 0x0C04FA2Au &&
+            runtime.hasFunction(kRaymanParticleMoveAddr))
+        {
+            g_raymanParticleMove = runtime.lookupFunction(kRaymanParticleMoveAddr);
+            particleSplit = g_raymanParticleMove && runtime.registerFunction(kRaymanParticleMoveAddr, &raymanParticleMoveSplit);
+        }
+        if (!particleSplit)
+            std::cerr << "[hle] Rayman: particle move 0x13E708 not found: particles only on logic frames" << std::endl;
         const char *listEnv = std::getenv("PS2X_RAYMAN_LOGIC_CALLS");
         const std::string list = listEnv ? std::string(listEnv)
-                                         : std::string("20c518,15bd30,14ac40,101828,112270,1497a0,10c0d8,106680,11a2d0,11b348,"
-                                                       "13ea68");
+                                         : std::string("20c518,15bd30,14ac40,101828,112270,1497a0,10c0d8,106680,11a2d0,11b348") +
+                                               (particleSplit ? "" : ",13ea68");
         static constexpr auto kSplits = raymanLogicCallSplits(std::make_integer_sequence<uint32_t, kRaymanLogicCallMax>{});
         const char *p = list.c_str();
         while (*p && g_raymanLogicCallCount < kRaymanLogicCallMax)
