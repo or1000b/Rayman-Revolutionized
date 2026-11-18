@@ -297,3 +297,15 @@ code per image: from the profiled entries, following branches and the profiled J
   run once per frame in one place (around position -130, -30, 80; 47046 runs in one session) and a few VU1 JR targets
   (14 in the last session).
 
+## The last VU0 routine (2026-11-18)
+
+- The user's sessions since 2026-11-17 (out/vu0prof) show one VU0 code image still on the interpreter:
+  8d8492f3aafbc287, entry 0x0FD0 (23820 runs in a 24-minute session, once per frame in the place around -130, -30, 80
+  that only the user's play reaches; no test scenario goes there) with JR targets 0x0FB8 (from 0x0A68) and 0x0FE0 (from
+  0x0FC0); plus image d6ca94c29438b8e9 (6 runs). VU1 was fully covered in that session (not_covered 0, jr 0).
+- `python tools/vu1aot/vu1gen.py --unit 0 --with-flags`: e09ad6f75847 unchanged (the collision library, 510 pairs);
+  the program for image 8d8492f3aafbc287 is now 690b1a1df768 (149 pairs, with the new entry and JR targets) instead
+  of 63f357489401 (145 pairs). The old files are kept in out/vu0aot_backup_2026-11-18.
+- Checked with the test suite (native) and `PS2X_VU0AOT=diff` runs (every VU0 run on both, compared). The new entry
+  itself only runs in the user's play, where the runtime's sampled self-check (`compared` / `mismatches` in the
+  `[vu0aot]` lines) switches off an entry that differs.
