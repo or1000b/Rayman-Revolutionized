@@ -1205,8 +1205,10 @@ extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uin
 // The monitor's refresh rate for full screen (ps2_runtime.cpp; user report 2026-11-18: "the whole screen pulses in
 // brightness when the camera moves" at 120 FPS on a 280 Hz monitor). 280 / 120 = 2.33: each picture stayed on screen
 // for 2, 2, then 3 refreshes, an uneven rhythm seen only in motion. When the current refresh rate is not a multiple of
-// the window's rate, the monitor goes to the highest refresh rate at the same resolution that is (2560 x 1440: 240 Hz
-// for 120 FPS, each picture exactly 2 refreshes), as a temporary change (CDS_FULLSCREEN: Windows puts the user's
+// the window's rate, the monitor goes to the lowest refresh rate at the same resolution that is (2560 x 1440: 120 Hz for
+// 120 FPS, each picture one refresh; the user's idea, 2026-11-18: measured over 12600 pictures in a level, 4 off by a
+// refresh at 120 Hz against 27 at 240 Hz, where the window has half the time per refresh), as a temporary change
+// (CDS_FULLSCREEN: Windows puts the user's
 // setting back when the game ends, also after a crash). Returns the refresh rate the window presents to (the window
 // then presents on every n-th refresh), 0 = no change and no vsync. PS2X_DISPLAY_HZ=0: off; =<Hz>: that rate.
 extern "C" uint32_t ps2xDisplayMatchRefresh(uint32_t windowHz)
@@ -1234,7 +1236,7 @@ extern "C" uint32_t ps2xDisplayMatchRefresh(uint32_t windowHz)
         if (mode.dmPelsWidth != current.dmPelsWidth || mode.dmPelsHeight != current.dmPelsHeight || mode.dmBitsPerPel != current.dmBitsPerPel)
             continue;
         const uint32_t hz = mode.dmDisplayFrequency;
-        if (wanted ? hz == wanted : (hz % windowHz == 0u && hz > best))
+        if (wanted ? hz == wanted : (hz % windowHz == 0u && (best == 0u || hz < best)))
             best = hz;
     }
     if (best == 0u)

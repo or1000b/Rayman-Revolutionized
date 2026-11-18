@@ -688,6 +688,28 @@ static void noteDisplayPresent()
         return;
     const int64_t gap = now - last;
     const int64_t expected = 1000000000ll / std::max<int64_t>(1, static_cast<int64_t>(std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz())));
+    // PS2X_PRESENT_STATS=1 (research): how many of the monitor's refreshes each picture stayed on screen, every 600.
+    static const bool s_stats = []
+    {
+        const char *e = std::getenv("PS2X_PRESENT_STATS");
+        return e && *e && *e != '0';
+    }();
+    if (s_stats && g_displayHz)
+    {
+        static uint64_t s_refreshes[5] = {}; // 1, 2, 3, 4, more
+        static uint64_t s_count = 0;
+        const double refresh = 1e9 / static_cast<double>(g_displayHz);
+        const int n = static_cast<int>(static_cast<double>(gap) / refresh + 0.5);
+        ++s_refreshes[std::clamp(n, 1, 5) - 1];
+        if (++s_count % 600u == 0u)
+        {
+            std::fprintf(stderr, "[present] 600 pictures at %u Hz on screen for 1/2/3/4/more refreshes: %llu %llu %llu %llu %llu\n",
+                         g_displayHz, static_cast<unsigned long long>(s_refreshes[0]), static_cast<unsigned long long>(s_refreshes[1]),
+                         static_cast<unsigned long long>(s_refreshes[2]), static_cast<unsigned long long>(s_refreshes[3]),
+                         static_cast<unsigned long long>(s_refreshes[4]));
+            std::fill(std::begin(s_refreshes), std::end(s_refreshes), 0ull);
+        }
+    }
     if (gap < expected / 2 || gap > expected * 2) // a missed or doubled present: not a measure of the monitor
         return;
     const int64_t period = g_presentPeriodNs.load(std::memory_order_relaxed);

@@ -339,11 +339,14 @@ The rhythm on the screen was the problem: 120 pictures a second on 280 refreshes
 monitor showed them for 2, 2, 3, 2, 2, 3 refreshes: even motion looked uneven, only when things move.
 
 - `ps2xDisplayMatchRefresh` (ps2_test_harness.cpp): in full screen (normal play), when the current refresh rate is not
-  a multiple of the window's rate, the monitor goes to the highest refresh rate at the same resolution that is (the
-  user's monitor offers 59, 60, 120, 140, 240, 280 Hz: 240 for 120 FPS), as a temporary change (CDS_FULLSCREEN:
-  Windows puts 280 Hz back when the game ends, checked). `PS2X_DISPLAY_HZ=0`: off; `=<Hz>`: that rate.
-- ps2_runtime.cpp: the window then presents on every n-th refresh (`glfwSwapInterval(240 / 120)`: GLFW waits for the
-  desktop compositor twice before each present in a borderless window) instead of its own pacer.
+  a multiple of the window's rate, the monitor goes to the lowest refresh rate at the same resolution that is (the
+  user's monitor offers 59, 60, 120, 140, 240, 280 Hz: 120 for 120 FPS; first 240, then the user's idea: over 12600
+  pictures in a level 4 were on screen a refresh too long or short at 120 Hz, 27 at 240 Hz, where the window has half
+  the time per refresh), as a temporary change (CDS_FULLSCREEN: Windows puts 280 Hz back when the game ends,
+  checked). `PS2X_DISPLAY_HZ=0`: off; `=<Hz>`: that rate. `PS2X_PRESENT_STATS=1` also counts how many refreshes
+  each picture stayed on screen.
+- ps2_runtime.cpp: the window then presents on every n-th refresh (`glfwSwapInterval(refresh / 120)`: GLFW waits
+  for the desktop compositor that many times before each present in a borderless window) instead of its own pacer.
 - Alone, that made it worse in places: the game's VBlanks run on the PC's clock (120.000 Hz), the monitor's "240 Hz" a
   little slower; where the two met, the window caught a frame twice or not at all (15-20% of frames for seconds). Now
   the EE scheduler moves each VBlank's host time by at most 0.2 ms toward the middle between two presents
