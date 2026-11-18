@@ -23,6 +23,12 @@ at screen resolution, with AI-upscaled textures.
   game's 512 x 512 screen space, with its textures decoded on the CPU (PSMT8 / PSMT4 + PSMCT32 CLUT, PSMCT32) and keyed
   by an FNV-1a hash of the decoded RGBA; paraLLEl-GS gets a copy where those vertices have ADC = 1 (no drawing kick;
   A+D XYZ2 -> XYZ3). A texture that cannot be decoded leaves the packet with paraLLEl-GS (`kept` in the stats).
+- Fades stay with paraLLEl-GS (2026-11-18, `fades` in the stats): a packet that is only untextured, see-through quads
+  over the whole screen. After a menu choice the game fades to black by drawing one such quad (black, alpha 36 of 128)
+  over the last picture every frame without drawing the scene again, so the buffers get darker each time they are drawn
+  into. Taken by the window, the quad darkened the picture once and never added up, and the two buffers (one already
+  cleared) alternated: the screen flickered between black and the menu. The menus' dimmed background is such a quad
+  too (drawn every frame, also in the smooth mode's in-between frames).
 - Frames: the 2D is kept per frame buffer (FRAME.FBP). Switching from a displayed buffer to another starts a new frame
   there; a colour-writing non-2D draw into a buffer that has 2D also starts over (`late` in the stats: seen when a
   frame starts after an offscreen draw, harmless). At each scanout the displayed buffer's 2D (DISPFB of the enabled
@@ -34,7 +40,12 @@ at screen resolution, with AI-upscaled textures.
   else the decoded original, bilinear.
 - Settings: `PS2X_HUD` (unset: on in normal play, off in test mode, where run_tests compares the GS picture; 1 / 0),
   `PS2X_HUD_DUMP=1` (originals to `hud_dump/<key>.png`), `PS2X_HUD_LOG=<n>` (the first n published frames, batch by
-  batch), `PS2X_WINDOW_SHOTS=1` (with every test_shot also the window as drawn, `out/window_shot_<tick>.png`).
+  batch), `PS2X_WINDOW_SHOTS=1` (with every test_shot also the window as drawn, `out/window_shot_<tick>.png`),
+  `PS2X_WINDOW_BURST="<first VSync>,<count>"` (research: every window frame of that range as drawn,
+  `out/wburst_<vsync>_<n>.bmp`, plus log lines for that range: `[hud-pub]` each published frame with the display
+  registers and its first batch, `[hud-draw]` draw buffer changes, `[gs-reg]` FRAME / XYOFFSET writes, `[hud-fade]`
+  fades, `[dispfb]` the game's stores to PMODE / DISPFB1 / DISPFB2, `[hle-disp]` the HLE sceGsPutDispEnv /
+  sceGsSwapDBuff(Dc) calls).
   `run_rayman_hd.bat` sets PS2X_HUD=1 and PS2X_HUD_DUMP=1.
 - Upscaling: `upscale_hud.bat` -> `tools/hud_upscale.py`: Real-ESRGAN (realesrgan-ncnn-vulkan, model
   realesrgan-x4plus-anime) on the dumped textures not done yet, x4 into `hud_textures/`. The tool lives in

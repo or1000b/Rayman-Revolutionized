@@ -862,7 +862,9 @@
           "type": "exit_code",
           "expect": 0,
           "label": "run ends by frame budget (no hang, no crash)"
-        }
+        },
+        { "type": "log_present", "pattern": "loading screen shows the buffer it draws into", "label": "loading screen flicker fix installed (2026-11-18)" },
+        { "type": "log_present", "pattern": "hud packets=[0-9]+ .* fades=[1-9]", "label": "menu fades stay in the GS picture, not the HUD layer (2026-11-18)" }
       ]
     },
     {

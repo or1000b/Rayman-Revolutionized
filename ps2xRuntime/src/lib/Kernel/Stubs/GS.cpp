@@ -5,6 +5,29 @@
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <utility>
+
+extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
+
+// PS2X_WINDOW_BURST="<first VSync>,<count>" (research, flicker while loading): the HLE display calls in that range.
+static void traceHleDisplay(const char *fn, const R5900Context *ctx, uint64_t dispfb, uint32_t which)
+{
+    static const std::pair<uint64_t, uint64_t> range = []
+    {
+        const char *env = std::getenv("PS2X_WINDOW_BURST");
+        char *end = nullptr;
+        const uint64_t first = env ? std::strtoull(env, &end, 10) : 0ull;
+        const uint64_t count = (env && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+        return std::make_pair(first, first + count);
+    }();
+    const uint64_t vsync = ps2xGuestVsync();
+    if (vsync >= range.first && vsync < range.second)
+        std::fprintf(stderr, "[hle-disp] vsync %llu %s which %u dispfb fbp %llu ra %x\n", static_cast<unsigned long long>(vsync), fn, which,
+                     static_cast<unsigned long long>(dispfb & 0x1FFu), getRegU32(ctx, 31));
+}
+
 namespace ps2_stubs
 {
     namespace
@@ -767,6 +790,7 @@ namespace ps2_stubs
             return;
         }
         applyGsDispEnv(runtime, env);
+        traceHleDisplay("sceGsPutDispEnv", ctx, env.dispfb, 0u);
         setReturnS32(ctx, 0);
     }
 
@@ -1151,6 +1175,7 @@ namespace ps2_stubs
         }
 
         applyGsDispEnv(runtime, db.disp[which]);
+        traceHleDisplay("sceGsSwapDBuffDc", ctx, db.disp[which].dispfb, which);
         static uint32_t s_swapDbuffLogCount = 0u;
         if (s_swapDbuffLogCount < 32u)
         {
@@ -1209,6 +1234,7 @@ namespace ps2_stubs
         }
 
         applyGsDispEnv(runtime, db.disp[which]);
+        traceHleDisplay("sceGsSwapDBuff", ctx, db.disp[which].dispfb, which);
         if (which == 0u)
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);

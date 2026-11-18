@@ -419,6 +419,116 @@ namespace
         g_raymanPointInGeo(rdram, ctx, runtime);
     }
 
+    // ------------------------------------------------------------------
+    // PS2X_RAYMAN_FLIP_TRACE="<first VSync>,<count>" (research: the screen flickered while loading, 2026-11-18). The
+    // engine's VBlank handler 0x1AA808 (a0 = 2; its gp from 0x377E00) flips the display (DISPFB1 / DISPLAY1 from
+    // 0x377EC0 / 0x377ED0 by the index gp-0x6690, then index ^= 1) when a flip is requested (gp-0x6BA4) or the
+    // repeat mode gp-0x6BA0 is set; 0x1A9F20, 0x1AAFC8, 0x1AB1C8, 0x1AB6E0 set those flags. Logs each call in the range.
+    constexpr uint32_t kRaymanFlipTraceAddrs[5] = {0x001AA808u, 0x001A9F20u, 0x001AAFC8u, 0x001AB1C8u, 0x001AB6E0u};
+    PS2Runtime::RecompiledFunction g_raymanFlipTraceOriginal[5] = {};
+
+    template <int I>
+    void raymanFlipTraceHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const std::pair<uint64_t, uint64_t> range = []() {
+            const char *e = std::getenv("PS2X_RAYMAN_FLIP_TRACE");
+            char *end = nullptr;
+            const uint64_t first = e ? std::strtoull(e, &end, 10) : 0ull;
+            const uint64_t count = (e && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+            return std::make_pair(first, first + count);
+        }();
+        const uint64_t vsync = ps2xGuestVsync();
+        if (vsync >= range.first && vsync < range.second)
+        {
+            const uint32_t gp = raymanRam32(rdram, 0x00377E00u);
+            std::fprintf(stderr, "[flip] vsync %llu fn %06x ra %06x a0 %x a1 %x a2 %x | req %u repeat %u field %u index %u gp-6B38 %u gp-6B34 %u\n",
+                         static_cast<unsigned long long>(vsync), kRaymanFlipTraceAddrs[I], getRegU32(ctx, 31), getRegU32(ctx, 4),
+                         getRegU32(ctx, 5), getRegU32(ctx, 6), raymanRam32(rdram, gp - 0x6BA4u), raymanRam32(rdram, gp - 0x6BA0u),
+                         raymanRam32(rdram, gp - 0x6B7Cu), raymanRam32(rdram, gp - 0x6690u), raymanRam32(rdram, gp - 0x6B38u),
+                         raymanRam32(rdram, gp - 0x6B34u));
+        }
+        g_raymanFlipTraceOriginal[I](rdram, ctx, runtime);
+    }
+
+    void installRaymanFlipTrace(PS2Runtime &runtime)
+    {
+        if (!std::getenv("PS2X_RAYMAN_FLIP_TRACE"))
+            return;
+        const PS2Runtime::RecompiledFunction hooks[5] = {&raymanFlipTraceHook<0>, &raymanFlipTraceHook<1>, &raymanFlipTraceHook<2>,
+                                                         &raymanFlipTraceHook<3>, &raymanFlipTraceHook<4>};
+        for (int i = 0; i < 5; ++i)
+            if (runtime.hasFunction(kRaymanFlipTraceAddrs[i]))
+            {
+                g_raymanFlipTraceOriginal[i] = runtime.lookupFunction(kRaymanFlipTraceAddrs[i]);
+                runtime.registerFunction(kRaymanFlipTraceAddrs[i], hooks[i]);
+            }
+        std::cerr << "[hle] Rayman: flip trace on (PS2X_RAYMAN_FLIP_TRACE)" << std::endl;
+    }
+
+    // ------------------------------------------------------------------
+    // The loading screen flickered (user report 2026-11-18, every frame rate, also at 25 FPS and with the CPU renderer).
+    // While a level loads, the loading screen's frame 0x215508 runs once per VBlank: it builds two draw packets (the
+    // second one line lower: interlace), shows display environment [idx] (sceGsPutDispEnv 0x1C0090 on one of the two
+    // sceGsDispEnv at 0x3784D0, 0x28 bytes each, DISPFB at +0x10), waits for the VBlank, sends packet [idx] and
+    // returns 1 - idx (the caller keeps it in gp-0x6808). The packets set no FRAME: both draw into the buffer
+    // RenderWare left as its back buffer, so the loading picture is only ever in that buffer while the display
+    // alternates between it and the other buffer every VBlank. On a TV that is interlaced: one field's lines from each
+    // buffer, woven into one picture. A port shows each buffer whole, so the picture alternated with the other buffer's
+    // old contents (black, or the last menu picture). Now that call shows the buffer the loading screen draws into:
+    // RenderWare's back buffer, whose DISPFB its VBlank handler 0x1AA808 keeps at 0x377EC0 / 0x377ED0 by its buffer
+    // index (handler gp from 0x377E00, index at gp-0x6690), only while RenderWare is not flipping itself (gp-0x6BA4
+    // flip requested, gp-0x6BA0 repeat). Only the call's argument changes; the game's memory stays as it was.
+    constexpr uint32_t kRaymanPutDispEnvAddr = 0x001C0090u;   // sceGsPutDispEnv (HLE stub)
+    constexpr uint32_t kRaymanLoadingPutDispRa = 0x002155B4u; // its call in the loading screen's frame 0x215508
+    constexpr uint32_t kRaymanLoadingDispEnvs = 0x003784D0u;  // the loading screen's two sceGsDispEnv
+    constexpr uint32_t kRaymanRwGpAddr = 0x00377E00u;         // the VBlank handler's gp
+    constexpr uint32_t kRaymanRwDispfb[2] = {0x00377EC0u, 0x00377ED0u};
+    PS2Runtime::RecompiledFunction g_raymanPutDispEnv = nullptr;
+    uint64_t g_raymanLoadingShown = 0u;
+
+    void raymanSetArg(R5900Context *ctx, int reg, uint32_t value); // below
+
+    void raymanPutDispEnvLoading(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (getRegU32(ctx, 31) == kRaymanLoadingPutDispRa)
+        {
+            const uint32_t rwGp = raymanRam32(rdram, kRaymanRwGpAddr);
+            if (raymanGuestDataPointer(rwGp - 0x6BA4u) && raymanRam32(rdram, rwGp - 0x6BA4u) == 0u &&
+                raymanRam32(rdram, rwGp - 0x6BA0u) == 0u)
+            {
+                const uint32_t index = raymanRam32(rdram, rwGp - 0x6690u) & 1u;
+                const uint32_t drawFbp = raymanRam32(rdram, kRaymanRwDispfb[index]) & 0x1FFu;
+                for (uint32_t k = 0; k < 2u; ++k)
+                {
+                    const uint32_t env = kRaymanLoadingDispEnvs + k * 0x28u;
+                    if ((raymanRam32(rdram, env + 0x10u) & 0x1FFu) == drawFbp)
+                    {
+                        if (getRegU32(ctx, 4) != env)
+                            raymanSetArg(ctx, 4, env);
+                        ++g_raymanLoadingShown;
+                        break;
+                    }
+                }
+            }
+        }
+        g_raymanPutDispEnv(rdram, ctx, runtime);
+    }
+
+    void installRaymanLoadingScreenFix(PS2Runtime &runtime, uint8_t *rdram)
+    {
+        // The call site: lui a0,0x38 / addiu a0,a0,-0x7b30 / jal 0x1c0090 / addu a0,v0,a0; the frame's first word.
+        if (raymanRam32(rdram, 0x002155A0u) != 0x3C040038u || raymanRam32(rdram, 0x002155A8u) != 0x248484D0u ||
+            raymanRam32(rdram, 0x002155ACu) != 0x0C070024u || raymanRam32(rdram, 0x00215508u) != 0x27BDFFB0u ||
+            !runtime.hasFunction(kRaymanPutDispEnvAddr))
+        {
+            std::cerr << "[hle] Rayman: loading screen code not found, its flicker fix is off" << std::endl;
+            return;
+        }
+        g_raymanPutDispEnv = runtime.lookupFunction(kRaymanPutDispEnvAddr);
+        if (g_raymanPutDispEnv && runtime.registerFunction(kRaymanPutDispEnvAddr, &raymanPutDispEnvLoading))
+            std::cerr << "[hle] Rayman: loading screen shows the buffer it draws into (no flicker)" << std::endl;
+    }
+
     void installRaymanShopZoneFix(PS2Runtime &runtime, uint8_t *rdram)
     {
         if (raymanRam32(rdram, kRaymanPointInGeoAddr) != 0x27BDFF30u || !runtime.hasFunction(kRaymanPointInGeoAddr)) // addiu sp,sp,-0xd0
@@ -554,6 +664,16 @@ namespace
         const uint64_t slot = g_raymanClockVsync * g_raymanLogicHz / g_raymanFrameRate;
         if (!g_raymanStepSinceClock) // a frame without a game step (menu, loading): its 2D is a logic frame's
             ps2xHudFrameMark(0);
+        static const std::pair<uint64_t, uint64_t> s_burst = []() { // PS2X_TEST_BURST (research): the clock calls too
+            const char *e = std::getenv("PS2X_TEST_BURST");
+            char *end = nullptr;
+            const uint64_t first = e ? std::strtoull(e, &end, 10) : 0ull;
+            const uint64_t count = (e && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+            return std::make_pair(first, first + count);
+        }();
+        if (g_raymanClockVsync >= s_burst.first && g_raymanClockVsync < s_burst.second)
+            std::fprintf(stderr, "[split] vsync %llu clock%s\n", static_cast<unsigned long long>(g_raymanClockVsync),
+                         g_raymanStepSinceClock ? "" : " (no step since the last clock)");
         bool logicNext = true;
         if (!raymanDemoPlayback(rdram, getRegU32(ctx, 28)))
             logicNext = slot != g_raymanLastLogicSlot;
@@ -3292,6 +3412,8 @@ namespace
 
         installRaymanFramerate(runtime, rdram);
         installRaymanWidescreen(runtime, rdram);
+        installRaymanFlipTrace(runtime);
+        installRaymanLoadingScreenFix(runtime, rdram);
 
         uint32_t evalEntryWord = 0u;
         std::memcpy(&evalEntryWord, rdram + kRaymanEvalTreeAddr, sizeof(evalEntryWord));

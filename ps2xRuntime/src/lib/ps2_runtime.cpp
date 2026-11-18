@@ -630,6 +630,40 @@ namespace
         ExportImage(image, path);
         RL_FREE(pixels);
     }
+
+    // PS2X_WINDOW_BURST="<first VSync>,<count>" (research, e.g. flicker in menus): every window frame while the guest
+    // VSync is in [first, first + count), as drawn (picture + 2D layer), to out/wburst_<vsync>_<n>.bmp (n counts the
+    // window frames of that VSync).
+    void windowBurstIfDue()
+    {
+        static const std::pair<uint64_t, uint64_t> range = []
+        {
+            const char *env = std::getenv("PS2X_WINDOW_BURST");
+            char *end = nullptr;
+            const uint64_t first = env ? std::strtoull(env, &end, 10) : 0ull;
+            const uint64_t count = (env && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+            return std::make_pair(first, first + count);
+        }();
+        if (range.second == 0u)
+            return;
+        const uint64_t vsync = ps2xGuestVsync();
+        if (vsync < range.first || vsync >= range.second)
+            return;
+        static uint64_t s_vsync = ~0ull;
+        static int s_n = 0;
+        s_n = vsync == s_vsync ? s_n + 1 : 0;
+        s_vsync = vsync;
+        rlDrawRenderBatchActive();
+        const int w = GetRenderWidth(), h = GetRenderHeight();
+        unsigned char *pixels = rlReadScreenPixels(w, h);
+        if (!pixels)
+            return;
+        Image image{pixels, w, h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        char path[96];
+        std::snprintf(path, sizeof(path), "out/wburst_%llu_%d.bmp", static_cast<unsigned long long>(vsync), s_n);
+        ExportImage(image, path);
+        RL_FREE(pixels);
+    }
 }
 
 // Normal play: the window's own frame rate (ps2xWindowPace), 0 = raylib's SetTargetFPS.
@@ -3009,9 +3043,12 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
 }
 
+static void traceDisplayWrite(const R5900Context *ctx, uint32_t vaddr, uint64_t value, const char *op);
+
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
+    traceDisplayWrite(ctx, vaddr, value, "sw");
     try
     {
         m_memory.write32(vaddr, value);
@@ -3023,9 +3060,30 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
 }
 
+// PS2X_WINDOW_BURST="<first VSync>,<count>" (research): the game's writes to DISPFB1 / DISPFB2 in that range.
+static void traceDisplayWrite(const R5900Context *ctx, uint32_t vaddr, uint64_t value, const char *op)
+{
+    if ((vaddr & ~0x4u) != 0x12000070u && (vaddr & ~0x4u) != 0x12000090u && (vaddr & ~0x4u) != 0x12000000u) // DISPFB1/2, PMODE
+        return;
+    static const std::pair<uint64_t, uint64_t> range = []
+    {
+        const char *env = std::getenv("PS2X_WINDOW_BURST");
+        char *end = nullptr;
+        const uint64_t first = env ? std::strtoull(env, &end, 10) : 0ull;
+        const uint64_t count = (env && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+        return std::make_pair(first, first + count);
+    }();
+    const uint64_t vsync = ps2xGuestVsync();
+    if (vsync >= range.first && vsync < range.second)
+        std::fprintf(stderr, "[dispfb] vsync %llu %s %08x fbp %llu value %llx pc %x ra %x\n", static_cast<unsigned long long>(vsync), op,
+                     vaddr, static_cast<unsigned long long>(value & 0x1FFu),
+                     static_cast<unsigned long long>(value), ctx ? ctx->pc : 0u, ctx ? getRegU32(ctx, 31) : 0u);
+}
+
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
+    traceDisplayWrite(ctx, vaddr, value, "sd");
     try
     {
         m_memory.write64(vaddr, value);
@@ -3041,6 +3099,7 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
+    traceDisplayWrite(ctx, vaddr, _parts[0], "sq");
     try
     {
         m_memory.write128(vaddr, value);
@@ -3520,6 +3579,7 @@ void PS2Runtime::run()
             ps2x::pgs::setPresentationTarget(static_cast<uint32_t>(std::lround(dstWidth)), static_cast<uint32_t>(std::lround(dstHeight)));
         drawHudOverlay(dstRect);
         windowShotIfDue();
+        windowBurstIfDue();
         static const bool showFps = []
         {
             const char *env = std::getenv("PS2X_SHOW_FPS");

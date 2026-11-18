@@ -8,6 +8,10 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <string>
+#include <utility>
+
+extern "C" uint64_t ps2xGuestVsync(); // ps2_test_harness.cpp
 
 namespace ps2x::hud
 {
@@ -82,7 +86,7 @@ namespace ps2x::hud
         std::mutex g_pubMutex;
         Frame g_published;
 
-        uint64_t g_packets = 0, g_frames = 0, g_undecodable = 0, g_lateDraws = 0, g_held = 0;
+        uint64_t g_packets = 0, g_frames = 0, g_undecodable = 0, g_lateDraws = 0, g_held = 0, g_fades = 0;
         bool g_markDrawOnly = false; // the last markFrame (GS thread): the drawing since then belongs to that frame
 
         // The vertex queue of the primitive being built (GS thread).
@@ -346,6 +350,22 @@ namespace ps2x::hud
         void writeReg(uint32_t reg, uint64_t v)
         {
             reg &= 0xFFu;
+            if (reg == 0x4C || reg == 0x4D || reg == 0x18 || reg == 0x19) // FRAME_1/2, XYOFFSET_1/2 (research, PS2X_WINDOW_BURST)
+            {
+                static const std::pair<uint64_t, uint64_t> s_burst = []
+                {
+                    const char *env = std::getenv("PS2X_WINDOW_BURST");
+                    char *end = nullptr;
+                    const uint64_t first = env ? std::strtoull(env, &end, 10) : 0ull;
+                    const uint64_t count = (env && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+                    return std::make_pair(first, first + count);
+                }();
+                const uint64_t vsync = ps2xGuestVsync();
+                if (vsync >= s_burst.first && vsync < s_burst.second && g_regs[reg] != v)
+                    std::fprintf(stderr, "[gs-reg] vsync %llu %s = %llx%s\n", static_cast<unsigned long long>(vsync),
+                                 reg == 0x4C ? "FRAME_1" : reg == 0x4D ? "FRAME_2" : reg == 0x18 ? "XYOFFSET_1" : "XYOFFSET_2",
+                                 static_cast<unsigned long long>(v), reg >= 0x4C ? (std::string(" fbp ") + std::to_string(v & 0x1FFu)).c_str() : "");
+            }
             g_regs[reg] = v;
             switch (reg)
             {
@@ -411,6 +431,18 @@ namespace ps2x::hud
             g_lastFrame = &f;
             if (fbp != g_lastDrawFbp)
             {
+                static const std::pair<uint64_t, uint64_t> s_burst = [] // PS2X_WINDOW_BURST (research): draw buffer changes
+                {
+                    const char *env = std::getenv("PS2X_WINDOW_BURST");
+                    char *end = nullptr;
+                    const uint64_t first = env ? std::strtoull(env, &end, 10) : 0ull;
+                    const uint64_t count = (env && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+                    return std::make_pair(first, first + count);
+                }();
+                const uint64_t vsync = ps2xGuestVsync();
+                if (vsync >= s_burst.first && vsync < s_burst.second)
+                    std::fprintf(stderr, "[hud-draw] vsync %llu draws into fbp %u (was %u)%s\n", static_cast<unsigned long long>(vsync), fbp,
+                                 g_lastDrawFbp, hud ? " 2D" : "");
                 const bool flip = g_lastDrawFbp == kNoFbp || isDisplay(g_lastDrawFbp);
                 g_lastDrawFbp = fbp;
                 if (flip)
@@ -816,6 +848,48 @@ namespace ps2x::hud
                 noteDraw(hud.fbp, true);
             return;
         }
+        // A fade (2026-11-18): an untextured, see-through quad over the whole screen. The game fades to black after a
+        // menu choice by drawing one such quad (black, alpha 36 of 128) over the last picture every frame without
+        // drawing the scene again, so each buffer gets darker every time it is drawn into. Drawn by the window on top
+        // of the picture it darkened once and never added up, and the two buffers (one already cleared) alternated:
+        // the screen flickered between black and the menu. It stays with paraLLEl-GS, as on the console.
+        if (hud.x0 <= 1.0f && hud.x1 >= 511.0f)
+        {
+            bool fade = true, seeThrough = false;
+            float y0 = 1e9f, y1 = -1e9f;
+            for (const Batch &b : hud.batches)
+            {
+                if (b.texture != 0u)
+                {
+                    fade = false;
+                    break;
+                }
+                for (const Vertex &v : b.vertices)
+                {
+                    y0 = std::min(y0, v.y);
+                    y1 = std::max(y1, v.y);
+                    seeThrough = seeThrough || v.a < 255u;
+                }
+            }
+            if (fade && seeThrough && y0 <= 1.0f && y1 >= 447.0f)
+            {
+                ++g_fades;
+                static const std::pair<uint64_t, uint64_t> s_burst = [] // PS2X_WINDOW_BURST (research): the fades drawn
+                {
+                    const char *env = std::getenv("PS2X_WINDOW_BURST");
+                    char *end = nullptr;
+                    const uint64_t first = env ? std::strtoull(env, &end, 10) : 0ull;
+                    const uint64_t count = (env && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+                    return std::make_pair(first, first + count);
+                }();
+                const uint64_t vsync = ps2xGuestVsync();
+                if (vsync >= s_burst.first && vsync < s_burst.second)
+                    std::fprintf(stderr, "[hud-fade] vsync %llu fbp %u alpha %u\n", static_cast<unsigned long long>(vsync), hud.fbp,
+                                 static_cast<unsigned>(hud.batches.front().vertices.front().a));
+                noteDraw(hud.fbp, true);
+                return;
+            }
+        }
         adc.insert(adc.end(), hud.patchAdc.begin(), hud.patchAdc.end());
         ad.insert(ad.end(), hud.patchAd.begin(), hud.patchAd.end());
         const bool fullWidth = hud.x0 <= 1.0f && hud.x1 >= 511.0f;
@@ -913,6 +987,42 @@ namespace ps2x::hud
                              v.u, v.v, v.r, v.g, v.b, v.a);
             }
         }
+        // PS2X_WINDOW_BURST="<first VSync>,<count>" (research, ps2_runtime.cpp): each published frame of that range.
+        static const std::pair<uint64_t, uint64_t> s_burst = []
+        {
+            const char *env = std::getenv("PS2X_WINDOW_BURST");
+            char *end = nullptr;
+            const uint64_t first = env ? std::strtoull(env, &end, 10) : 0ull;
+            const uint64_t count = (env && end && *end == ',') ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+            return std::make_pair(first, first + count);
+        }();
+        if (s_burst.second != 0u)
+        {
+            const uint64_t vsync = ps2xGuestVsync();
+            if (vsync >= s_burst.first && vsync < s_burst.second)
+            {
+                size_t tris = 0u;
+                for (const Batch &b : copy.batches)
+                    tris += b.vertices.size() / 3u;
+                std::fprintf(stderr, "[hud-pub] vsync %llu fbp %u batches %zu tris %zu %s pmode %llx dispfb1 %llx dispfb2 %llx",
+                             static_cast<unsigned long long>(vsync), fbp, copy.batches.size(), tris, copy.drawOnly ? "held" : "shown",
+                             static_cast<unsigned long long>(pmode), static_cast<unsigned long long>(dispfb1),
+                             static_cast<unsigned long long>(dispfb2));
+                if (!copy.batches.empty() && !copy.batches.front().vertices.empty())
+                {
+                    const Batch &b = copy.batches.front();
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                    for (const Vertex &v : b.vertices)
+                    {
+                        x0 = std::min(x0, v.x); y0 = std::min(y0, v.y); x1 = std::max(x1, v.x); y1 = std::max(y1, v.y);
+                    }
+                    const Vertex &v = b.vertices.front();
+                    std::fprintf(stderr, " | tex %016llx blend %d rgba %u %u %u %u box %.0f,%.0f-%.0f,%.0f",
+                                 static_cast<unsigned long long>(b.texture), b.blend, v.r, v.g, v.b, v.a, x0, y0, x1, y1);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
         if (copy.drawOnly) // no game logic in that frame: keep the last logic frame's 2D (markFrame)
         {
             ++g_held;
@@ -954,10 +1064,10 @@ namespace ps2x::hud
             textures = g_textures.size();
         }
         char line[192];
-        std::snprintf(line, sizeof(line), " | hud packets=%llu frames=%llu textures=%zu kept=%llu late=%llu held=%llu",
+        std::snprintf(line, sizeof(line), " | hud packets=%llu frames=%llu textures=%zu kept=%llu late=%llu held=%llu fades=%llu",
                       static_cast<unsigned long long>(g_packets), static_cast<unsigned long long>(g_frames), textures,
                       static_cast<unsigned long long>(g_undecodable), static_cast<unsigned long long>(g_lateDraws),
-                      static_cast<unsigned long long>(g_held));
+                      static_cast<unsigned long long>(g_held), static_cast<unsigned long long>(g_fades));
         return line;
     }
 }
