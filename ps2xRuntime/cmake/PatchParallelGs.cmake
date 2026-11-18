@@ -231,3 +231,34 @@ foreach(_pair
     string(REGEX MATCH "PS2RECOMP-PATCH scanout-4x-[a-z0-9-]+" _marker "${_replacement}")
     ps2x_patch_source("${_ps2x_gsr}" "${_anchor}" "${_replacement}" "${_marker}")
 endforeach()
+
+# Billboards at full resolution (2026-11-18, the user: glows, sparkles and Rayman's energy balls looked pixelated at
+# quality 16). With super-sampling, triangle_setup.comp takes a primitive with the same Z at all three vertices and no
+# change of Q for flat UI and snaps its attribute interpolation to the PS2 pixel; camera-facing billboards are just as
+# flat, so they came out in blocks of one PS2 pixel. Rayman draws all its 2D at Z = 0xFFFF: only that counts as flat UI.
+# paraLLEl-GS ships its shaders precompiled, so tools/pgs_shaders/compile_triangle_setup.py applies the change to its
+# triangle_setup.comp and compiles it (ps2xRuntime/src/lib/gs/pgs/shaders/triangle_setup_spirv.h); the program is
+# swapped in with the original's reflection layout (same bindings). PS2X_PGS_FLAT_UI_Z=0: paraLLEl-GS's own shader.
+ps2x_require_near("${ps2x_parallel_gs_SOURCE_DIR}/gs/shaders/slangmosh.hpp"
+    "layout.unserialize(reflection_bank + 1740, 348);" "this->triangle_setup = device.request_program(")
+configure_file("${CMAKE_CURRENT_LIST_DIR}/../src/lib/gs/pgs/shaders/triangle_setup_spirv.h"
+    "${ps2x_parallel_gs_SOURCE_DIR}/gs/shaders/ps2x_triangle_setup_spirv.h" COPYONLY)
+ps2x_patch_source("${_ps2x_gsr}"
+    [==[#include "shaders/ps2x_sample_circuit_4x_spirv.h" /* PS2RECOMP-PATCH scanout-4x-include */]==]
+    [==[#include "shaders/ps2x_sample_circuit_4x_spirv.h" /* PS2RECOMP-PATCH scanout-4x-include */
+#include "shaders/ps2x_triangle_setup_spirv.h" /* PS2RECOMP-PATCH flat-ui-z-include */]==]
+    "PS2RECOMP-PATCH flat-ui-z-include")
+ps2x_patch_source("${_ps2x_gsr}"
+    [==[weave_quad = device_->request_program(shaders.quad, shaders.weave);]==]
+    [==[{ /* PS2RECOMP-PATCH flat-ui-z-program: triangle setup where only Z = 0xFFFF is flat UI (billboards super-sampled) */
+		const char *ps2x_flat = getenv("PS2X_PGS_FLAT_UI_Z");
+		if (!(ps2x_flat && ps2x_flat[0] == '0'))
+		{
+			Vulkan::ResourceLayout ps2x_ts_layout;
+			ps2x_ts_layout.unserialize(reflection_bank + 1740, 348);
+			if (auto *ps2x_ts = device_->request_program(ps2x_triangle_setup_spirv, sizeof(ps2x_triangle_setup_spirv), &ps2x_ts_layout))
+				shaders.triangle_setup = ps2x_ts;
+		}
+	}
+	weave_quad = device_->request_program(shaders.quad, shaders.weave);]==]
+    "PS2RECOMP-PATCH flat-ui-z-program")
