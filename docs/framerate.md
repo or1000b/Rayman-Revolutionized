@@ -328,3 +328,28 @@ level was tuned to the 25 FPS spot, that can break a script. Known and fixed:
   8.51 when PS2X_FRAMERATE is set (main.cpp `raymanPointInGeoShopFix`); scenario `shop_exit`.
 - Tools to find the next one: `PS2X_RAYMAN_RATE_SWITCH` (replay the same moment at 120 / divisor FPS),
   `PS2X_RAYMAN_AI_WATCH`, `PS2X_RAYMAN_TRACK`, and `record_for_claude.bat` for the user's recordings.
+
+## Full screen in step with the monitor (2026-11-18)
+
+The user: "all of the screen flickers when I play ... brightness pulses ... when the camera moves" (smooth mode, full
+screen, quality 16, monitor 2560 x 1440 at 280 Hz; G-Sync unknown). Every picture the game drew was steady
+(`PS2X_WINDOW_BURST` captures in normal play, full screen: no frame-to-frame brightness pulse, none between logic and
+in-between frames) and the window showed each game frame once (`PS2X_PRESENT_STATS=1`: 0-2 repeats per 600 frames).
+The rhythm on the screen was the problem: 120 pictures a second on 280 refreshes is 2.33 refreshes each, so the
+monitor showed them for 2, 2, 3, 2, 2, 3 refreshes: even motion looked uneven, only when things move.
+
+- `ps2xDisplayMatchRefresh` (ps2_test_harness.cpp): in full screen (normal play), when the current refresh rate is not
+  a multiple of the window's rate, the monitor goes to the highest refresh rate at the same resolution that is (the
+  user's monitor offers 59, 60, 120, 140, 240, 280 Hz: 240 for 120 FPS), as a temporary change (CDS_FULLSCREEN:
+  Windows puts 280 Hz back when the game ends, checked). `PS2X_DISPLAY_HZ=0`: off; `=<Hz>`: that rate.
+- ps2_runtime.cpp: the window then presents on every n-th refresh (`glfwSwapInterval(240 / 120)`: GLFW waits for the
+  desktop compositor twice before each present in a borderless window) instead of its own pacer.
+- Alone, that made it worse in places: the game's VBlanks run on the PC's clock (120.000 Hz), the monitor's "240 Hz" a
+  little slower; where the two met, the window caught a frame twice or not at all (15-20% of frames for seconds). Now
+  the EE scheduler moves each VBlank's host time by at most 0.2 ms toward the middle between two presents
+  (EeScheduler.cpp `displayPhaseCorrection`, `PS2X_DISPLAY_PHASE` = that point as a share of the period): the game's
+  frames stay in step with the monitor. The game's clock follows the EE's cycles, the IOP keeps real time on its own.
+- Measured in normal play, full screen, quality 16, smooth mode, walking by the shop: repeats / skips back to 0-4 per
+  600 frames, in-level FPS 119.7 average (5% low 119.8). Windowed play and test runs are unchanged.
+- Considered and dropped: 140 FPS for 280 Hz (2 refreshes each) held 139 by the shop but the window missed up to 22% of
+  the frames in places: not enough headroom at quality 16.

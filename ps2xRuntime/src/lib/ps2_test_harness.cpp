@@ -1202,6 +1202,68 @@ extern "C" void ps2xTestOnGuestVSync(uint64_t vsync, uint64_t eeCycle, const uin
 
 // Calling thread (the game thread, at start): keeps 256 KiB of stack in reserve, so after a stack overflow the
 // crash handler above still has room to print the report instead of faulting itself.
+// The monitor's refresh rate for full screen (ps2_runtime.cpp; user report 2026-11-18: "the whole screen pulses in
+// brightness when the camera moves" at 120 FPS on a 280 Hz monitor). 280 / 120 = 2.33: each picture stayed on screen
+// for 2, 2, then 3 refreshes, an uneven rhythm seen only in motion. When the current refresh rate is not a multiple of
+// the window's rate, the monitor goes to the highest refresh rate at the same resolution that is (2560 x 1440: 240 Hz
+// for 120 FPS, each picture exactly 2 refreshes), as a temporary change (CDS_FULLSCREEN: Windows puts the user's
+// setting back when the game ends, also after a crash). Returns the refresh rate the window presents to (the window
+// then presents on every n-th refresh), 0 = no change and no vsync. PS2X_DISPLAY_HZ=0: off; =<Hz>: that rate.
+extern "C" uint32_t ps2xDisplayMatchRefresh(uint32_t windowHz)
+{
+#if defined(_WIN32)
+    const char *env = std::getenv("PS2X_DISPLAY_HZ");
+    if ((env && std::strcmp(env, "0") == 0) || windowHz == 0u)
+        return 0u;
+    const uint32_t wanted = (env && *env && std::strcmp(env, "auto") != 0) ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 0u;
+    DEVMODEA current{};
+    current.dmSize = sizeof(current);
+    if (!EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &current) || current.dmDisplayFrequency < 2u)
+        return 0u;
+    const uint32_t now = current.dmDisplayFrequency;
+    if (wanted == 0u && now % windowHz == 0u)
+    {
+        std::fprintf(stderr, "[window] display at %u Hz: each picture %u refreshes (PS2X_DISPLAY_HZ)\n", now, now / windowHz);
+        return now;
+    }
+    uint32_t best = 0u;
+    DEVMODEA mode{};
+    mode.dmSize = sizeof(mode);
+    for (DWORD i = 0; EnumDisplaySettingsA(nullptr, i, &mode); ++i)
+    {
+        if (mode.dmPelsWidth != current.dmPelsWidth || mode.dmPelsHeight != current.dmPelsHeight || mode.dmBitsPerPel != current.dmBitsPerPel)
+            continue;
+        const uint32_t hz = mode.dmDisplayFrequency;
+        if (wanted ? hz == wanted : (hz % windowHz == 0u && hz > best))
+            best = hz;
+    }
+    if (best == 0u)
+    {
+        std::fprintf(stderr, "[window] display at %u Hz: no refresh rate at %lux%lu is a multiple of %u (PS2X_DISPLAY_HZ)\n", now,
+                     current.dmPelsWidth, current.dmPelsHeight, windowHz);
+        return 0u;
+    }
+    if (best != now)
+    {
+        DEVMODEA change = current;
+        change.dmDisplayFrequency = best;
+        change.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+        const LONG result = ChangeDisplaySettingsExA(nullptr, &change, nullptr, CDS_FULLSCREEN, nullptr);
+        if (result != DISP_CHANGE_SUCCESSFUL)
+        {
+            std::fprintf(stderr, "[window] display: changing %u Hz -> %u Hz failed (%ld)\n", now, best, static_cast<long>(result));
+            return 0u;
+        }
+    }
+    std::fprintf(stderr, "[window] display %lux%lu at %u Hz (was %u, back when the game ends): each picture %u refreshes (PS2X_DISPLAY_HZ=0: off)\n",
+                 current.dmPelsWidth, current.dmPelsHeight, best, now, best / windowHz);
+    return best;
+#else
+    (void)windowHz;
+    return 0u;
+#endif
+}
+
 // The window's frame pacing in normal play (ps2_runtime.cpp; PS2X_WINDOW_PACER=0: raylib's own). raylib sleeps with
 // Sleep() for most of the frame and busy-waits the rest; with every core busy (the bridge in the Minisaurus Plain) the
 // window thread woke ~2 ms late, so it drew ~100 pictures a second while the game made 110-120 (2026-11-17). Here:

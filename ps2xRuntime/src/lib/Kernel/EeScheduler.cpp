@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -19,8 +20,41 @@
 // `[threads]` line turns it into `game busy=N%` (ps2_runtime.cpp), next to the GS and graphics threads' busy shares.
 static std::atomic<uint64_t> g_eeIdleNs{0};
 extern "C" uint64_t ps2xGameIdleNs() { return g_eeIdleNs.load(std::memory_order_relaxed); }
+extern "C" bool ps2xDisplayPresentClock(int64_t *lastPresentNs, int64_t *periodNs); // ps2_runtime.cpp
 namespace
 {
+    // Full screen in step with the monitor (ps2_runtime.cpp, 2026-11-18): the next VBlank's host time is moved by at
+    // most 0.2 ms toward a fixed point between two presents (PS2X_DISPLAY_PHASE: that point as a share of the present
+    // period after a present, default 0.5), so the game's frames stay in step with the monitor's refreshes instead of
+    // drifting against them. The game's clock follows the EE's cycles, not this host time: only the pacing moves.
+    std::chrono::nanoseconds displayPhaseCorrection(std::chrono::steady_clock::time_point next, std::chrono::nanoseconds period)
+    {
+        int64_t lastPresent = 0, presentPeriod = 0;
+        if (!ps2xDisplayPresentClock(&lastPresent, &presentPeriod) || presentPeriod <= 0)
+            return std::chrono::nanoseconds{0};
+        const int64_t periodNs = period.count();
+        if (std::llabs(presentPeriod - periodNs) > periodNs / 50) // the window does not present at the game's rate
+            return std::chrono::nanoseconds{0};
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - lastPresent > 100000000ll) // no present for 100 ms (minimized, a long stall)
+            return std::chrono::nanoseconds{0};
+        static const double phase = []
+        {
+            const char *e = std::getenv("PS2X_DISPLAY_PHASE");
+            const double v = e ? std::atof(e) : 0.5;
+            return (v >= 0.0 && v < 1.0) ? v : 0.5;
+        }();
+        const int64_t target = lastPresent + static_cast<int64_t>(phase * static_cast<double>(presentPeriod));
+        const int64_t nextNs = std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count();
+        int64_t error = (nextNs - target) % presentPeriod;
+        if (error < 0)
+            error += presentPeriod;
+        if (error >= presentPeriod / 2)
+            error -= presentPeriod; // now in [-period/2, period/2)
+        const int64_t step = std::clamp<int64_t>(-error / 8, -200000ll, 200000ll);
+        return std::chrono::nanoseconds{step};
+    }
+
     struct EeIdleScope
     {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -2316,8 +2350,11 @@ void EeScheduler::processDueDeadlines()
                                          static_cast<unsigned long long>(g_paceSkippedPeriods));
                     }
                 }
+                auto nextHost = scheduled.hostDeadline + skipHost + period.host;
+                if (realTimePacing())
+                    nextHost += displayPhaseCorrection(nextHost, std::chrono::duration_cast<std::chrono::nanoseconds>(period.host));
                 scheduleEvent(scheduled.deadlineCycle + skipCycles + period.cycles,
-                              scheduled.hostDeadline + skipHost + period.host,
+                              nextHost,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

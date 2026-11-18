@@ -57,6 +57,8 @@ extern "C" void ps2xTestHarnessFrame(const uint8_t *rgba, uint32_t width, uint32
 extern "C" bool ps2xTestBurstActive(); // ps2_test_harness.cpp (PS2X_TEST_BURST)
 extern "C" bool ps2xWindowPacerWanted();       // ps2_test_harness.cpp: the window's own frame pacing
 extern "C" void ps2xWindowPace(uint32_t hz);
+extern "C" uint32_t ps2xDisplayMatchRefresh(uint32_t windowHz); // ps2_test_harness.cpp: full screen refresh rate
+extern "C" void glfwSwapInterval(int interval);                 // GLFW inside raylib
 extern "C" uint64_t ps2xTestLastShotTick();     // ps2_test_harness.cpp: the tick of the last test_shot (0 = none)
 void ps2xInstallIopToEeRpcHooks(PS2Runtime *runtime);       // Kernel/Syscalls/RPC.cpp
 void ps2xInstallIopCdReader(bool install);                  // Kernel/Stubs/CD.cpp
@@ -668,6 +670,39 @@ namespace
 
 // Normal play: the window's own frame rate (ps2xWindowPace), 0 = raylib's SetTargetFPS.
 static uint32_t g_windowPacerHz = 0u;
+// Full screen: the monitor's refresh rate the window presents to in step (ps2xDisplayMatchRefresh), 0 = not.
+static uint32_t g_displayHz = 0u;
+
+// The presents' clock (full screen in step with the monitor): the last present's time and the average time between
+// presents, for the EE scheduler, which keeps the game's VBlanks at a fixed point between two presents
+// (EeScheduler.cpp). Without it the game's 120.000 Hz (the PC's clock) drifted against the monitor's ~119.98 (240 Hz / 2):
+// where the two met, the window caught a game frame twice or not at all, up to 20% of the frames for seconds at a time.
+static std::atomic<int64_t> g_presentLastNs{0};
+static std::atomic<int64_t> g_presentPeriodNs{0};
+
+static void noteDisplayPresent()
+{
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t last = g_presentLastNs.exchange(now, std::memory_order_relaxed);
+    if (last == 0)
+        return;
+    const int64_t gap = now - last;
+    const int64_t expected = 1000000000ll / std::max<int64_t>(1, static_cast<int64_t>(std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz())));
+    if (gap < expected / 2 || gap > expected * 2) // a missed or doubled present: not a measure of the monitor
+        return;
+    const int64_t period = g_presentPeriodNs.load(std::memory_order_relaxed);
+    g_presentPeriodNs.store(period == 0 ? gap : period + (gap - period) / 64, std::memory_order_relaxed);
+}
+
+extern "C" bool ps2xDisplayPresentClock(int64_t *lastPresentNs, int64_t *periodNs)
+{
+    const int64_t period = g_presentPeriodNs.load(std::memory_order_relaxed);
+    if (!g_displayHz || period == 0)
+        return false;
+    *lastPresentNs = g_presentLastNs.load(std::memory_order_relaxed);
+    *periodNs = period;
+    return true;
+}
 
 static int HostTextureFilter()
 {
@@ -1161,7 +1196,12 @@ bool PS2Runtime::initialize(const char *title)
             const char *full = std::getenv("PS2X_FULLSCREEN");
             const char *testMode = std::getenv("PS2X_TEST_MODE");
             if (full && std::strcmp(full, "1") == 0 && !(testMode && std::atoi(testMode) != 0))
+            {
+                // A refresh rate that is a multiple of the window's (ps2_test_harness.cpp ps2xDisplayMatchRefresh): every
+                // picture the same number of refreshes; the window then presents on every n-th refresh (below).
+                g_displayHz = ps2xDisplayMatchRefresh(std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz()));
                 ToggleBorderlessWindowed();
+            }
             // raylib closes the window on ESC by default, but ESC is the keyboard's Circle (ps2_pad.cpp: back in
             // menus): only the window's close button ends the game.
             SetExitKey(KEY_NULL);
@@ -1200,7 +1240,18 @@ bool PS2Runtime::initialize(const char *title)
             // only in test runs and when PS2X_WINDOW_PACER=0.
             const uint32_t windowHz = std::max<uint32_t>(60u, ps2xVBlankRateOverrideHz());
             g_windowPacerHz = (!testRun && !ps2xTestBurstActive() && ps2xWindowPacerWanted()) ? windowHz : 0u;
-            SetTargetFPS(ps2xTestBurstActive() || g_windowPacerHz ? 0 : testRun ? 60 : static_cast<int>(windowHz));
+            if (g_displayHz != 0u && !testRun && !ps2xTestBurstActive())
+            {
+                // Full screen at a refresh rate that is a multiple of windowHz: present on every n-th refresh (GLFW waits
+                // for the desktop compositor n times before each present in a borderless window), instead of the pacer's
+                // own clock, which drifted against the monitor's refreshes.
+                const int interval = static_cast<int>(std::max<uint32_t>(1u, g_displayHz / windowHz));
+                glfwSwapInterval(interval);
+                g_windowPacerHz = 0u;
+                std::cerr << "[window] presenting with the monitor: every " << interval << " refreshes at " << g_displayHz << " Hz"
+                          << std::endl;
+            }
+            SetTargetFPS(ps2xTestBurstActive() || g_windowPacerHz || g_displayHz ? 0 : testRun ? 60 : static_cast<int>(windowHz));
             ThreadNaming::SetCurrentThreadName("WindowThread"); // PS2X_NATIVE_PROF_THREAD=WindowThread
         }
         if (m_debugUiInitCallback)
@@ -3608,6 +3659,8 @@ void PS2Runtime::run()
         EndDrawing();
         if (g_windowPacerHz)
             ps2xWindowPace(g_windowPacerHz);
+        if (g_displayHz)
+            noteDisplayPresent(); // the game's VBlanks keep in step with these (ps2xDisplayPresentClock)
 
         if (WindowShouldClose())
         {
