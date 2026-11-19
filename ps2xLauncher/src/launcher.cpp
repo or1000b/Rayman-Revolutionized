@@ -709,8 +709,6 @@ void main()
 
     void drawGraphics(Rectangle r)
     {
-        panel(r);
-        heading("Graphics", {r.x + 26, r.y + 14}, 32);
         Settings &s = g_app.settings;
         const bool locked = g_app.busy != Busy::None;
         float y = r.y + 66;
@@ -737,6 +735,359 @@ void main()
         y += 130;
         row("FPS counter", "Shows the game's frames per second in the corner of the picture.", kOnOff, s.fpsCounter, true);
     }
+
+    // ---------------------------------------------------------------- controls (the user's request, 2026-11-19)
+    // controls.ini in the port's folder, read by the game at start (ps2xRuntime/src/lib/ps2_pad.cpp): one line per
+    // action, "name=key1,key2,pad". key: a raylib key, 1000 + n = mouse button n, 0 = none; pad: a raylib gamepad
+    // button (Xbox layout), 0 = none, -1 = not mappable (a controller's sticks and D-pad always work as themselves).
+    constexpr int kMouseBase = 1000;
+    struct ControlRow
+    {
+        const char *name;
+        const char *label;
+        int keys[2];
+        int pad; // -1: fixed
+        const char *fixedPad;
+    };
+    const ControlRow kDefaultControls[] = {
+        {"move_up", "Move up", {KEY_UP, 0}, -1, "Left stick"},
+        {"move_down", "Move down", {KEY_DOWN, 0}, -1, "Left stick"},
+        {"move_left", "Move left", {KEY_LEFT, 0}, -1, "Left stick"},
+        {"move_right", "Move right", {KEY_RIGHT, 0}, -1, "Left stick"},
+        {"camera_up", "Camera up", {0, 0}, -1, "Right stick"},
+        {"camera_down", "Camera down", {0, 0}, -1, "Right stick"},
+        {"camera_left", "Camera left", {0, 0}, -1, "Right stick"},
+        {"camera_right", "Camera right", {0, 0}, -1, "Right stick"},
+        {"cross", "Jump (Cross)", {KEY_A, KEY_X}, GAMEPAD_BUTTON_RIGHT_FACE_DOWN, nullptr},
+        {"square", "Shoot (Square)", {KEY_SPACE, KEY_Z}, GAMEPAD_BUTTON_RIGHT_FACE_LEFT, nullptr},
+        {"circle", "Circle", {KEY_C, KEY_ESCAPE}, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, nullptr},
+        {"triangle", "Triangle", {KEY_V, KEY_KP_1}, GAMEPAD_BUTTON_RIGHT_FACE_UP, nullptr},
+        {"l1", "L1", {KEY_Q, 0}, GAMEPAD_BUTTON_LEFT_TRIGGER_1, nullptr},
+        {"r1", "R1", {KEY_E, 0}, GAMEPAD_BUTTON_RIGHT_TRIGGER_1, nullptr},
+        {"l2", "L2", {KEY_ONE, 0}, GAMEPAD_BUTTON_LEFT_TRIGGER_2, nullptr},
+        {"r2", "R2", {KEY_THREE, 0}, GAMEPAD_BUTTON_RIGHT_TRIGGER_2, nullptr},
+        {"start", "Start (pause)", {KEY_ENTER, 0}, GAMEPAD_BUTTON_MIDDLE_RIGHT, nullptr},
+        {"select", "Select", {KEY_TAB, KEY_RIGHT_SHIFT}, GAMEPAD_BUTTON_MIDDLE_LEFT, nullptr},
+        {"l3", "L3", {0, 0}, GAMEPAD_BUTTON_LEFT_THUMB, nullptr},
+        {"r3", "R3", {0, 0}, GAMEPAD_BUTTON_RIGHT_THUMB, nullptr},
+    };
+    constexpr int kControlRows = static_cast<int>(sizeof(kDefaultControls) / sizeof(kDefaultControls[0]));
+    std::vector<ControlRow> g_controls(std::begin(kDefaultControls), std::end(kDefaultControls));
+    int g_tab = 0; // 0 = Graphics, 1 = Controls
+    int g_captureRow = -1, g_captureCol = -1;
+    double g_captureSince = 0.0;
+    bool g_captureArmed = false;
+
+    std::string controlsPath() { return g_root + "\\controls.ini"; }
+
+    void loadControls()
+    {
+        const std::string text = "\n" + readTextFile(controlsPath());
+        for (ControlRow &row : g_controls)
+        {
+            const std::string key = std::string("\n") + row.name + "=";
+            const size_t at = text.find(key);
+            if (at == std::string::npos)
+                continue;
+            int k1 = 0, k2 = 0, pad = 0;
+            if (std::sscanf(text.c_str() + at + key.size(), "%d,%d,%d", &k1, &k2, &pad) >= 2)
+            {
+                row.keys[0] = k1;
+                row.keys[1] = k2;
+                if (row.pad >= 0)
+                    row.pad = pad;
+            }
+        }
+    }
+
+    void saveControls()
+    {
+        std::string text = "# Rayman Revolution controls, written by the launcher's Controls tab and read by the game when it starts.\n"
+                           "# name=key1,key2,pad  (key: raylib key code, 1000+n = mouse button n, 0 = none; pad: raylib gamepad button, -1 = the stick)\n";
+        for (const ControlRow &row : g_controls)
+        {
+            char line[96];
+            std::snprintf(line, sizeof(line), "%s=%d,%d,%d\n", row.name, row.keys[0], row.keys[1], row.pad);
+            text += line;
+        }
+        writeTextFile(controlsPath(), text);
+    }
+
+    std::string keyName(int code)
+    {
+        if (code <= 0)
+            return "-";
+        switch (code)
+        {
+        case kMouseBase + MOUSE_BUTTON_LEFT: return "Mouse left";
+        case kMouseBase + MOUSE_BUTTON_RIGHT: return "Mouse right";
+        case kMouseBase + MOUSE_BUTTON_MIDDLE: return "Mouse middle";
+        case kMouseBase + MOUSE_BUTTON_SIDE: return "Mouse 4";
+        case kMouseBase + MOUSE_BUTTON_EXTRA: return "Mouse 5";
+        case KEY_SPACE: return "Space";
+        case KEY_ESCAPE: return "Esc";
+        case KEY_ENTER: return "Enter";
+        case KEY_TAB: return "Tab";
+        case KEY_BACKSPACE: return "Backspace";
+        case KEY_INSERT: return "Insert";
+        case KEY_DELETE: return "Delete";
+        case KEY_RIGHT: return "Right";
+        case KEY_LEFT: return "Left";
+        case KEY_DOWN: return "Down";
+        case KEY_UP: return "Up";
+        case KEY_PAGE_UP: return "Page up";
+        case KEY_PAGE_DOWN: return "Page down";
+        case KEY_HOME: return "Home";
+        case KEY_END: return "End";
+        case KEY_CAPS_LOCK: return "Caps lock";
+        case KEY_LEFT_SHIFT: return "L Shift";
+        case KEY_LEFT_CONTROL: return "L Ctrl";
+        case KEY_LEFT_ALT: return "L Alt";
+        case KEY_RIGHT_SHIFT: return "R Shift";
+        case KEY_RIGHT_CONTROL: return "R Ctrl";
+        case KEY_RIGHT_ALT: return "R Alt";
+        case KEY_KP_ENTER: return "Num Enter";
+        case KEY_KP_ADD: return "Num +";
+        case KEY_KP_SUBTRACT: return "Num -";
+        case KEY_KP_MULTIPLY: return "Num *";
+        case KEY_KP_DIVIDE: return "Num /";
+        case KEY_KP_DECIMAL: return "Num .";
+        default: break;
+        }
+        if (code >= KEY_A && code <= KEY_Z)
+            return std::string(1, static_cast<char>(code));
+        if (code >= KEY_ZERO && code <= KEY_NINE)
+            return std::string(1, static_cast<char>(code));
+        if (code >= KEY_KP_0 && code <= KEY_KP_9)
+            return "Num " + std::to_string(code - KEY_KP_0);
+        if (code >= KEY_F1 && code <= KEY_F12)
+            return "F" + std::to_string(code - KEY_F1 + 1);
+        if (code < 128 && code > 32)
+            return std::string(1, static_cast<char>(code));
+        return "Key " + std::to_string(code);
+    }
+
+    std::string padName(int code)
+    {
+        switch (code)
+        {
+        case GAMEPAD_BUTTON_RIGHT_FACE_UP: return "Y / Triangle";
+        case GAMEPAD_BUTTON_RIGHT_FACE_RIGHT: return "B / Circle";
+        case GAMEPAD_BUTTON_RIGHT_FACE_DOWN: return "A / Cross";
+        case GAMEPAD_BUTTON_RIGHT_FACE_LEFT: return "X / Square";
+        case GAMEPAD_BUTTON_LEFT_TRIGGER_1: return "LB / L1";
+        case GAMEPAD_BUTTON_LEFT_TRIGGER_2: return "LT / L2";
+        case GAMEPAD_BUTTON_RIGHT_TRIGGER_1: return "RB / R1";
+        case GAMEPAD_BUTTON_RIGHT_TRIGGER_2: return "RT / R2";
+        case GAMEPAD_BUTTON_MIDDLE_LEFT: return "Back / Select";
+        case GAMEPAD_BUTTON_MIDDLE: return "Guide";
+        case GAMEPAD_BUTTON_MIDDLE_RIGHT: return "Start";
+        case GAMEPAD_BUTTON_LEFT_THUMB: return "L-stick press";
+        case GAMEPAD_BUTTON_RIGHT_THUMB: return "R-stick press";
+        default: return code > 0 ? "Button " + std::to_string(code) : "-";
+        }
+    }
+
+    int firstGamepad()
+    {
+        for (int i = 0; i < 4; ++i)
+            if (IsGamepadAvailable(i))
+                return i;
+        return -1;
+    }
+
+    // Puts code into (row, col) and takes it away from any other action of the same kind (keyboard / mouse or
+    // controller), so one key never does two things.
+    void bindControl(int row, int col, int code)
+    {
+        const std::string label = g_controls[static_cast<size_t>(row)].label;
+        if (code > 0)
+        {
+            for (int r = 0; r < kControlRows; ++r)
+            {
+                ControlRow &other = g_controls[static_cast<size_t>(r)];
+                for (int c = 0; c < 2; ++c)
+                    if (col < 2 && other.keys[c] == code && !(r == row && c == col))
+                    {
+                        other.keys[c] = 0;
+                        g_app.say(keyName(code) + " was " + other.label + ", it is " + label + " now.", kWarn);
+                    }
+                if (col == 2 && other.pad == code && r != row)
+                {
+                    other.pad = 0;
+                    g_app.say(padName(code) + " was " + other.label + ", it is " + label + " now.", kWarn);
+                }
+            }
+        }
+        if (col < 2)
+            g_controls[static_cast<size_t>(row)].keys[col] = code;
+        else
+            g_controls[static_cast<size_t>(row)].pad = code;
+        g_captureRow = g_captureCol = -1;
+        saveControls();
+    }
+
+    void pollCapture()
+    {
+        if (g_captureRow < 0)
+            return;
+        if (GetTime() - g_captureSince > 8.0)
+        {
+            g_captureRow = g_captureCol = -1;
+            return;
+        }
+        if (IsKeyPressed(KEY_BACKSPACE))
+        {
+            bindControl(g_captureRow, g_captureCol, 0);
+            return;
+        }
+        if (g_captureCol < 2)
+        {
+            if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+                g_captureArmed = true;
+            const int key = GetKeyPressed();
+            if (key == KEY_F10 || key == KEY_F11)
+            {
+                g_app.say("F10 (full screen) and F11 (graphics capture) are used by the game.", kWarn);
+                return;
+            }
+            if (key > 0)
+            {
+                bindControl(g_captureRow, g_captureCol, key);
+                return;
+            }
+            if (g_captureArmed)
+                for (int b = MOUSE_BUTTON_LEFT; b <= MOUSE_BUTTON_EXTRA; ++b)
+                    if (IsMouseButtonPressed(b))
+                    {
+                        bindControl(g_captureRow, g_captureCol, kMouseBase + b);
+                        return;
+                    }
+        }
+        else
+        {
+            const int pad = firstGamepad();
+            if (pad < 0)
+                return;
+            for (int b = GAMEPAD_BUTTON_LEFT_FACE_UP; b <= GAMEPAD_BUTTON_RIGHT_THUMB; ++b)
+                if (IsGamepadButtonPressed(pad, b))
+                {
+                    if (b <= GAMEPAD_BUTTON_LEFT_FACE_LEFT)
+                        g_app.say("The controller's D-pad always works as the D-pad.", kWarn);
+                    else
+                        bindControl(g_captureRow, g_captureCol, b);
+                    return;
+                }
+        }
+    }
+
+    void drawControls(Rectangle r, float t)
+    {
+        const bool locked = g_app.busy != Busy::None;
+        const float c0 = r.x + 28, c1 = r.x + 184, c2 = r.x + 294, c3 = r.x + 404;
+        const float w12 = 104, w3 = r.x + r.width - 28 - c3;
+        float y = r.y + 70;
+        DrawTextEx(g_font.label, "Action", {c0, y}, 18, 0, kGoldLight);
+        DrawTextEx(g_font.label, "Key / mouse", {c1 + 6, y}, 18, 0, kGoldLight);
+        DrawTextEx(g_font.label, "Second", {c2 + 6, y}, 18, 0, kGoldLight);
+        DrawTextEx(g_font.label, "Controller", {c3 + 4, y}, 18, 0, kGoldLight);
+        y += 26;
+        auto box = [&](Rectangle b, const std::string &text, bool active, bool clickable) -> bool {
+            const bool over = clickable && !locked && hovered(b);
+            if (over)
+                g_handCursor = true;
+            Color fill = over ? Color{58, 34, 112, 255} : kPillFill;
+            Color border = Fade(kPanelBorder, over ? 0.9f : 0.4f);
+            if (active)
+            {
+                const float pulse = 0.5f + 0.5f * std::sin(t * 7.0f);
+                fill = {70, 40, 130, 255};
+                border = ColorLerp(kGoldDeep, kGoldLight, pulse);
+            }
+            DrawRectangleRounded(b, roundness(b, 8), 8, clickable ? fill : Fade(kPillFill, 0.5f));
+            DrawRectangleRoundedLinesEx(b, roundness(b, 8), 8, active ? 2.0f : 1.0f, clickable ? border : Fade(kPanelBorder, 0.15f));
+            const std::string shown = active ? std::string("Press...") : text;
+            const float size = 15.0f;
+            const float tw = textWidth(g_font.label, shown.c_str(), size, 0);
+            const Color color = !clickable ? Fade(kTextDim, 0.7f) : (active ? kGoldLight : (text == "-" ? Fade(kTextDim, 0.6f) : kText));
+            DrawTextEx(g_font.label, shown.c_str(), {b.x + (b.width - tw) / 2.0f, b.y + (b.height - size) / 2.0f - 1.0f}, size, 0, color);
+            return over && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
+        };
+        for (int i = 0; i < kControlRows; ++i)
+        {
+            ControlRow &row = g_controls[static_cast<size_t>(i)];
+            DrawTextEx(g_font.body, row.label, {c0, y + 2}, 17, 0, kText);
+            for (int c = 0; c < 2; ++c)
+                if (box({c == 0 ? c1 : c2, y, w12, 22}, keyName(row.keys[c]), g_captureRow == i && g_captureCol == c, true))
+                {
+                    g_captureRow = i;
+                    g_captureCol = c;
+                    g_captureSince = GetTime();
+                    g_captureArmed = false;
+                    while (GetKeyPressed() != 0)
+                    {
+                    }
+                }
+            const bool fixed = row.pad < 0;
+            if (box({c3, y, w3, 22}, fixed ? row.fixedPad : padName(row.pad), g_captureRow == i && g_captureCol == 2, !fixed))
+            {
+                g_captureRow = i;
+                g_captureCol = 2;
+                g_captureSince = GetTime();
+            }
+            y += 26;
+        }
+        y += 6;
+        const int pad = firstGamepad();
+        const std::string padLine = pad >= 0 ? std::string("Controller: ") + GetGamepadName(pad) : std::string("No controller connected (plug one in to map its buttons).");
+        DrawTextEx(g_font.body, "Click a box, then press a key, a mouse button or a controller button.", {c0, y}, 15, 0, kTextDim);
+        DrawTextEx(g_font.body, "Backspace = none. Changes are used the next time you press PLAY.", {c0, y + 18}, 15, 0, kTextDim);
+        DrawTextEx(g_font.body, padLine.c_str(), {c0, y + 36}, 15, 0, pad >= 0 ? kOk : kTextDim);
+        if (button({r.x + r.width - 28 - 190, r.y + r.height - 46, 190, 32}, "RESET TO DEFAULTS", Style::Purple, !locked, g_font.blackSmall, 15))
+        {
+            g_controls.assign(std::begin(kDefaultControls), std::end(kDefaultControls));
+            g_captureRow = g_captureCol = -1;
+            saveControls();
+            g_app.say("The controls are back to the defaults.", kOk);
+        }
+    }
+
+    // The settings panel: tabs (Graphics / Controls) in the game's lettering, then the chosen page.
+    void drawSettings(Rectangle r, float t)
+    {
+        panel(r);
+        const char *names[2] = {"Graphics", "Controls"};
+        float x = r.x + 26;
+        for (int i = 0; i < 2; ++i)
+        {
+            const float size = 32.0f;
+            const float w = textWidth(g_font.brush, names[i], size, 1);
+            const Rectangle hit{x - 6, r.y + 10, w + 12, 44};
+            const bool over = hovered(hit) && g_tab != i;
+            if (over)
+                g_handCursor = true;
+            if (g_tab == i)
+            {
+                heading(names[i], {x, r.y + 14}, size);
+                DrawRectangleRounded({x, r.y + 54, w, 4}, 1.0f, 6, kGold);
+            }
+            else
+            {
+                textOutline(g_font.brush, names[i], {x, r.y + 14}, size, 1, Fade(BLACK, 0.6f), 2.0f);
+                DrawTextEx(g_font.brush, names[i], {x, r.y + 14}, size, 1, over ? kText : kTextDim);
+            }
+            if (over && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+            {
+                g_tab = i;
+                g_captureRow = g_captureCol = -1;
+            }
+            x += w + 40;
+        }
+        if (g_tab == 0)
+            drawGraphics(r);
+        else
+            drawControls(r, t);
+    }
 }
 
 int main(int argc, char **argv)
@@ -749,6 +1100,8 @@ int main(int argc, char **argv)
             screenshot = argv[i + 1];
         else if (std::strcmp(argv[i], "--play") == 0) // start the game at once with the saved settings
             playNow = true;
+        else if (std::strcmp(argv[i], "--controls") == 0) // open on the Controls tab
+            g_tab = 1;
         else if ((std::strcmp(argv[i], "--check-iso") == 0 || std::strcmp(argv[i], "--extract") == 0) && i + 1 < argc)
         {
             // Without a window (tests): list and check a disc image, and with --extract <iso> <folder> copy it.
@@ -802,6 +1155,7 @@ int main(int argc, char **argv)
 
     initBackground();
     g_app.settings = loadSettings();
+    loadControls();
     g_app.version = gitVersion();
     idleMessage();
     if (playNow && gameInstalled() && portBuilt())
@@ -840,7 +1194,8 @@ int main(int argc, char **argv)
         if (button({287, 364, 213, 58}, "UPDATE", Style::Purple, idle, g_font.blackSmall, 22))
             startUpdate();
         drawStatus({58, 440, 442, 296}, t);
-        drawGraphics({536, 34, 526, 702});
+        pollCapture();
+        drawSettings({536, 34, 526, 702}, t);
 
         const char *footer = "Needs your own Rayman Revolution PAL disc image. Nothing of the game is included.";
         const float fw = textWidth(g_font.body, footer, 16, 0);

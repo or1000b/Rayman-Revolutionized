@@ -58,3 +58,4 @@ __pycache__/
 
 # The launcher's saved settings (local)
 /launcher.ini
+/controls.ini

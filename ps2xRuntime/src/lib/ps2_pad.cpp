@@ -42,6 +42,116 @@ namespace
         outX = toByte(x);
         outY = toByte(y);
     }
+
+    // ------------------------------------------------------------------ the player's controls (2026-11-19)
+    // The launcher's Controls tab writes controls.ini in the port's folder (PS2X_CONTROLS=<file> for another one):
+    // one line per action, "name=key1,key2,pad". key: a raylib KeyboardKey, 1000 + n = mouse button n, 0 = none;
+    // pad: a raylib GamepadButton (Xbox layout), 0 = none, -1 = not mappable (the sticks). Without the file every
+    // control is as before. Move = the left stick and the D-pad (the game moves Rayman with the stick, its menus use
+    // the D-pad); Camera = the right stick. A controller's sticks and D-pad always work as themselves.
+    enum ControlAction
+    {
+        kMoveUp, kMoveDown, kMoveLeft, kMoveRight,
+        kCamUp, kCamDown, kCamLeft, kCamRight,
+        kCross, kSquare, kCircle, kTriangle, kL1, kR1, kL2, kR2, kStart, kSelect, kL3, kR3,
+        kActionCount
+    };
+    constexpr const char *kActionNames[kActionCount] = {
+        "move_up", "move_down", "move_left", "move_right", "camera_up", "camera_down", "camera_left", "camera_right",
+        "cross", "square", "circle", "triangle", "l1", "r1", "l2", "r2", "start", "select", "l3", "r3"};
+    constexpr uint16_t kActionBits[kActionCount] = {
+        0x0010u, 0x0040u, 0x0080u, 0x0020u, 0u, 0u, 0u, 0u,
+        0x4000u, 0x8000u, 0x2000u, 0x1000u, 0x0400u, 0x0800u, 0x0100u, 0x0200u, 0x0008u, 0x0001u, 0x0002u, 0x0004u};
+    constexpr int kMouseBase = 1000;
+    constexpr int kKeysPerAction = 3;
+
+    struct ControlBinding
+    {
+        int keys[kKeysPerAction];
+        int pad;
+    };
+
+    struct ControlTable
+    {
+        ControlBinding action[kActionCount];
+    };
+
+    // The controls before the Controls tab (the user's mapping, 2026-11-11): arrows move, A jumps, Space shoots.
+    ControlTable defaultControls()
+    {
+        ControlTable t{};
+        auto set = [&](ControlAction a, int k1, int k2, int k3, int pad) { t.action[a] = {{k1, k2, k3}, pad}; };
+        set(kMoveUp, KEY_UP, 0, 0, -1);
+        set(kMoveDown, KEY_DOWN, 0, 0, -1);
+        set(kMoveLeft, KEY_LEFT, 0, 0, -1);
+        set(kMoveRight, KEY_RIGHT, 0, 0, -1);
+        set(kCamUp, 0, 0, 0, -1);
+        set(kCamDown, 0, 0, 0, -1);
+        set(kCamLeft, 0, 0, 0, -1);
+        set(kCamRight, 0, 0, 0, -1);
+        set(kCross, KEY_A, KEY_X, 0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
+        set(kSquare, KEY_SPACE, KEY_Z, KEY_KP_0, GAMEPAD_BUTTON_RIGHT_FACE_LEFT);
+        set(kCircle, KEY_C, KEY_ESCAPE, 0, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT);
+        set(kTriangle, KEY_V, KEY_KP_1, 0, GAMEPAD_BUTTON_RIGHT_FACE_UP);
+        set(kL1, KEY_Q, 0, 0, GAMEPAD_BUTTON_LEFT_TRIGGER_1);
+        set(kR1, KEY_E, 0, 0, GAMEPAD_BUTTON_RIGHT_TRIGGER_1);
+        set(kL2, KEY_ONE, 0, 0, GAMEPAD_BUTTON_LEFT_TRIGGER_2);
+        set(kR2, KEY_THREE, 0, 0, GAMEPAD_BUTTON_RIGHT_TRIGGER_2);
+        set(kStart, KEY_ENTER, 0, 0, GAMEPAD_BUTTON_MIDDLE_RIGHT);
+        set(kSelect, KEY_TAB, KEY_RIGHT_SHIFT, 0, GAMEPAD_BUTTON_MIDDLE_LEFT);
+        set(kL3, 0, 0, 0, GAMEPAD_BUTTON_LEFT_THUMB);
+        set(kR3, 0, 0, 0, GAMEPAD_BUTTON_RIGHT_THUMB);
+        return t;
+    }
+
+    ControlTable loadControls()
+    {
+        ControlTable t = defaultControls();
+        const char *env = std::getenv("PS2X_CONTROLS");
+        const char *path = (env && *env) ? env : "controls.ini";
+        std::FILE *f = std::fopen(path, "r");
+        if (!f)
+            return t;
+        char line[256];
+        int read = 0;
+        while (std::fgets(line, sizeof(line), f))
+        {
+            char *eq = std::strchr(line, '=');
+            if (!eq || line[0] == '#')
+                continue;
+            *eq = '\0';
+            for (int a = 0; a < kActionCount; ++a)
+            {
+                if (std::strcmp(line, kActionNames[a]) != 0)
+                    continue;
+                int k1 = 0, k2 = 0, pad = 0;
+                if (std::sscanf(eq + 1, "%d,%d,%d", &k1, &k2, &pad) >= 2)
+                {
+                    t.action[a] = {{k1, k2, 0}, kActionBits[a] ? pad : -1};
+                    ++read;
+                }
+            }
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[pad] controls from %s (%d actions)\n", path, read);
+        return t;
+    }
+
+    const ControlTable &controls()
+    {
+        static const ControlTable t = loadControls();
+        return t;
+    }
+
+    bool controlDown(const ControlBinding &b)
+    {
+        for (int code : b.keys)
+        {
+            if (code >= kMouseBase && code < kMouseBase + 8 ? IsMouseButtonDown(code - kMouseBase) : (code > 0 && IsKeyDown(code)))
+                return true;
+        }
+        return false;
+    }
 }
 
 // Xbox controllers (XInput) and PlayStation 3 / 4 / 5 controllers (DirectInput, through GLFW's built-in SDL
@@ -73,28 +183,22 @@ extern "C" bool ps2xHostGamepadRead(uint16_t *buttons, uint8_t axes[4])
         int raylib;
         uint16_t ps2;
     };
-    static constexpr ButtonMap kMap[] = {
-        {GAMEPAD_BUTTON_LEFT_FACE_UP, 0x0010u},     // Up
-        {GAMEPAD_BUTTON_LEFT_FACE_RIGHT, 0x0020u},  // Right
-        {GAMEPAD_BUTTON_LEFT_FACE_DOWN, 0x0040u},   // Down
-        {GAMEPAD_BUTTON_LEFT_FACE_LEFT, 0x0080u},   // Left
-        {GAMEPAD_BUTTON_RIGHT_FACE_UP, 0x1000u},    // Triangle (Y)
-        {GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, 0x2000u}, // Circle (B)
-        {GAMEPAD_BUTTON_RIGHT_FACE_DOWN, 0x4000u},  // Cross (A)
-        {GAMEPAD_BUTTON_RIGHT_FACE_LEFT, 0x8000u},  // Square (X)
-        {GAMEPAD_BUTTON_LEFT_TRIGGER_1, 0x0400u},   // L1
-        {GAMEPAD_BUTTON_RIGHT_TRIGGER_1, 0x0800u},  // R1
-        {GAMEPAD_BUTTON_LEFT_TRIGGER_2, 0x0100u},   // L2 (raylib: trigger past 10%)
-        {GAMEPAD_BUTTON_RIGHT_TRIGGER_2, 0x0200u},  // R2
-        {GAMEPAD_BUTTON_MIDDLE_LEFT, 0x0001u},      // Select
-        {GAMEPAD_BUTTON_MIDDLE_RIGHT, 0x0008u},     // Start
-        {GAMEPAD_BUTTON_LEFT_THUMB, 0x0002u},       // L3
-        {GAMEPAD_BUTTON_RIGHT_THUMB, 0x0004u},      // R3
+    static constexpr ButtonMap kDpad[] = {
+        {GAMEPAD_BUTTON_LEFT_FACE_UP, 0x0010u},    // Up
+        {GAMEPAD_BUTTON_LEFT_FACE_RIGHT, 0x0020u}, // Right
+        {GAMEPAD_BUTTON_LEFT_FACE_DOWN, 0x0040u},  // Down
+        {GAMEPAD_BUTTON_LEFT_FACE_LEFT, 0x0080u},  // Left
     };
     uint16_t pressed = 0u;
-    for (const ButtonMap &m : kMap)
+    for (const ButtonMap &m : kDpad)
         if (IsGamepadButtonDown(pad, m.raylib))
             pressed |= m.ps2;
+    // The other buttons as the player mapped them (controls.ini; by default A / Cross, B / Circle, X / Square,
+    // Y / Triangle, LB / L1, RB / R1, LT / L2 (raylib: trigger past 10%), RT / R2, Back / Select, Start, stick clicks).
+    const ControlTable &table = controls();
+    for (int a = kCross; a < kActionCount; ++a)
+        if (table.action[a].pad > 0 && IsGamepadButtonDown(pad, table.action[a].pad))
+            pressed |= kActionBits[a];
     *buttons = static_cast<uint16_t>(~pressed);
     stickToBytes(GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_X), GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_Y),
                  axes[0], axes[1]);
@@ -155,14 +259,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             data[7] = axes[3];
         }
     }
-    // Keyboard is always read too (not only when no gamepad is detected), so a
-    // connected-but-idle controller does not silently disable the keyboard.
-    // Rayman Revolution (user's mapping, 2026-11-11): arrows = move, A = jump (Cross), Space = shoot (Square).
-    // The game moves Rayman with the left analog stick only (the D-pad does not move him in a level) and its
-    // menus use the D-pad, so the arrows drive both. Z / X / C / V stay Square / Cross / Circle / Triangle.
+    // Keyboard and mouse are always read too (not only when no gamepad is detected), so a connected-but-idle
+    // controller does not silently disable them. As the player mapped them (controls.ini, the launcher's Controls
+    // tab); by default the user's mapping of 2026-11-11: arrows = move, A = jump (Cross), Space = shoot (Square),
+    // Z / X / C / V = Square / Cross / Circle / Triangle. The game moves Rayman with the left analog stick only (the
+    // D-pad does not move him in a level) and its menus use the D-pad, so Move drives both.
     {
-        const bool up = IsKeyDown(KEY_UP), down = IsKeyDown(KEY_DOWN);
-        const bool left = IsKeyDown(KEY_LEFT), right = IsKeyDown(KEY_RIGHT);
+        const ControlTable &table = controls();
+        const bool up = controlDown(table.action[kMoveUp]), down = controlDown(table.action[kMoveDown]);
+        const bool left = controlDown(table.action[kMoveLeft]), right = controlDown(table.action[kMoveRight]);
         if (up)
             clearBit(PAD_UP);
         if (down)
@@ -171,7 +276,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_LEFT);
         if (right)
             clearBit(PAD_RIGHT);
-        // Arrows = left analog stick (full deflection) as well
+        // Move = left analog stick (full deflection) as well
         {
             const int ax = (right ? 1 : 0) - (left ? 1 : 0);
             const int ay = (down ? 1 : 0) - (up ? 1 : 0);
@@ -180,26 +285,18 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             if (ay != 0)
                 data[7] = static_cast<uint8_t>(ay > 0 ? 0xFF : 0x00);
         }
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_A))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_ONE))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_THREE))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_RIGHT_SHIFT) || IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
+        // Camera = right analog stick (full deflection)
+        {
+            const int cx = (controlDown(table.action[kCamRight]) ? 1 : 0) - (controlDown(table.action[kCamLeft]) ? 1 : 0);
+            const int cy = (controlDown(table.action[kCamDown]) ? 1 : 0) - (controlDown(table.action[kCamUp]) ? 1 : 0);
+            if (cx != 0)
+                data[4] = static_cast<uint8_t>(cx > 0 ? 0xFF : 0x00);
+            if (cy != 0)
+                data[5] = static_cast<uint8_t>(cy > 0 ? 0xFF : 0x00);
+        }
+        for (int a = kCross; a < kActionCount; ++a)
+            if (controlDown(table.action[a]))
+                clearBit(kActionBits[a]);
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
