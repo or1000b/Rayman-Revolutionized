@@ -55,3 +55,6 @@ __pycache__/
 *.chd
 *.cue
 *.ecm
+
+# The launcher's saved settings (local)
+/launcher.ini
