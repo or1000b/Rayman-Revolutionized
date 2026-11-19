@@ -24,7 +24,7 @@ using namespace launcher;
 namespace
 {
     constexpr int kWidth = 1120;
-    constexpr int kHeight = 700;
+    constexpr int kHeight = 800;
 
     // ---------------------------------------------------------------- palette
     const Color kNightTop{8, 22, 56, 255};
@@ -198,18 +198,19 @@ void main()
             const float a = 0.35f + 0.65f * (0.5f + 0.5f * std::sin(t * s.speed + s.phase));
             DrawCircleV({s.x, s.y}, s.size, Fade(WHITE, a * 0.8f));
         }
-        hill(470, 26, 0.006f, 0.4f, {24, 46, 92, 255});
-        hill(520, 30, 0.009f, 2.1f, {16, 58, 74, 255});
-        hill(585, 22, 0.012f, 4.0f, {10, 52, 48, 255});
-        hill(640, 16, 0.016f, 1.0f, {6, 34, 30, 255});
+        const float h = static_cast<float>(kHeight);
+        hill(h - 230, 26, 0.006f, 0.4f, {24, 46, 92, 255});
+        hill(h - 180, 30, 0.009f, 2.1f, {16, 58, 74, 255});
+        hill(h - 115, 22, 0.012f, 4.0f, {10, 52, 48, 255});
+        hill(h - 60, 16, 0.016f, 1.0f, {6, 34, 30, 255});
         // leaves in the corners, swaying a little
         const float sway = std::sin(t * 0.8f) * 0.025f;
-        leaf({-20, 720}, -1.05f, 300, 52, {12, 74, 44, 255}, sway);
-        leaf({-30, 640}, -0.55f, 260, 44, {18, 92, 52, 255}, -sway);
-        leaf({40, 740}, -1.45f, 240, 40, {10, 60, 38, 255}, sway * 0.6f);
-        leaf({1140, 720}, -2.10f, 300, 52, {12, 74, 44, 255}, -sway);
-        leaf({1150, 630}, -2.60f, 250, 42, {18, 92, 52, 255}, sway);
-        leaf({1080, 745}, -1.75f, 230, 40, {10, 60, 38, 255}, -sway * 0.6f);
+        leaf({-20, h + 20}, -1.05f, 300, 52, {12, 74, 44, 255}, sway);
+        leaf({-30, h - 60}, -0.55f, 260, 44, {18, 92, 52, 255}, -sway);
+        leaf({40, h + 40}, -1.45f, 240, 40, {10, 60, 38, 255}, sway * 0.6f);
+        leaf({1140, h + 20}, -2.10f, 300, 52, {12, 74, 44, 255}, -sway);
+        leaf({1150, h - 70}, -2.60f, 250, 42, {18, 92, 52, 255}, sway);
+        leaf({1080, h + 45}, -1.75f, 230, 40, {10, 60, 38, 255}, -sway * 0.6f);
         for (const Lum &lum : g_lums)
         {
             const float x = lum.x + std::sin(t * 0.25f * lum.speed + lum.phase) * 26.0f;
@@ -390,6 +391,7 @@ void main()
         int rate = 3;       // 120 FPS
         int ssaa = 3;       // x16
         int smooth = 1;     // on
+        int fpsCounter = 1; // on (the game's FPS in the corner)
     };
 
     std::string g_root;
@@ -414,6 +416,7 @@ void main()
         get("rate", s.rate, 3);
         get("ssaa", s.ssaa, 3);
         get("smooth", s.smooth, 1);
+        get("fps_counter", s.fpsCounter, 1);
         return s;
     }
 
@@ -421,8 +424,8 @@ void main()
     {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-                      "# Rayman Revolution launcher settings (indexes into the launcher's choices)\nresolution=%d\ndisplay=%d\nrate=%d\nssaa=%d\nsmooth=%d\n",
-                      s.resolution, s.display, s.rate, s.ssaa, s.smooth);
+                      "# Rayman Revolution launcher settings (indexes into the launcher's choices)\nresolution=%d\ndisplay=%d\nrate=%d\nssaa=%d\nsmooth=%d\nfps_counter=%d\n",
+                      s.resolution, s.display, s.rate, s.ssaa, s.smooth, s.fpsCounter);
         writeTextFile(settingsPath(), buf);
     }
 
@@ -441,7 +444,7 @@ void main()
             {"PS2X_FILTER", "bilinear"},
             {"PS2X_HUD", "1"},
             {"PS2X_HUD_DUMP", "1"},
-            {"PS2X_SHOW_FPS", "1"},
+            {"PS2X_SHOW_FPS", s.fpsCounter == 1 ? "1" : "0"},
             {"PS2X_AUTOSAVE", "1"},
             {"PS2X_VU1_PROFILE", "1"},
             {"PS2X_VU0_PROFILE", "1"},
@@ -731,6 +734,8 @@ void main()
         const char *note = "Smooth mode is available only at 120 FPS.";
         const Color noteColor = smoothAvailable ? Fade(kTextDim, 0.8f) : kWarn;
         DrawTextEx(g_font.label, note, {r.x + 28, y + 98}, 19, 0, noteColor);
+        y += 130;
+        row("FPS counter", "Shows the game's frames per second in the corner of the picture.", kOnOff, s.fpsCounter, true);
     }
 }
 
@@ -834,12 +839,12 @@ int main(int argc, char **argv)
         }
         if (button({287, 364, 213, 58}, "UPDATE", Style::Purple, idle, g_font.blackSmall, 22))
             startUpdate();
-        drawStatus({58, 440, 442, 196}, t);
-        drawGraphics({536, 34, 526, 602});
+        drawStatus({58, 440, 442, 296}, t);
+        drawGraphics({536, 34, 526, 702});
 
         const char *footer = "Needs your own Rayman Revolution PAL disc image. Nothing of the game is included.";
         const float fw = textWidth(g_font.body, footer, 16, 0);
-        DrawTextEx(g_font.body, footer, {(kWidth - fw) / 2.0f, 668}, 16, 0, Fade(kTextDim, 0.85f));
+        DrawTextEx(g_font.body, footer, {(kWidth - fw) / 2.0f, kHeight - 32.0f}, 16, 0, Fade(kTextDim, 0.85f));
 
         SetMouseCursor(g_handCursor ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
         EndDrawing();
